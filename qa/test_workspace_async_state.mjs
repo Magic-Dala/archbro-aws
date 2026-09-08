@@ -63,22 +63,33 @@ test('same-context refresh keeps last good optional data while marking refreshin
   assert.deepEqual(JSON.parse(JSON.stringify(result)), {status:'ready', refreshing:true, current:true});
 });
 
-test('core project load does not depend on Canvas or Code Truth', async () => {
+test('core project load uses bootstrap v2 without running optional projections', async () => {
   const block = markedBlock('// WORKSPACE_CORE_LOADER_START', '// WORKSPACE_CORE_LOADER_END');
   const calls = [];
   const result = await runInNewContext(`${block}; loadProjectCoreContext('project-A')`, {
     api: async (path) => {
       calls.push(path);
       if (path.includes('code-architecture') || path.includes('architecture/canvas')) throw new Error('optional resource should not be in core load');
-      if (path.endsWith('/architecture')) return {version:3, components:[]};
-      if (path.endsWith('/tasks') || path.endsWith('/architecture/proposals') || path.includes('/events?')) return [];
-      return {id:'project-A'};
+      assert.match(path, /workspace-bootstrap\?reading_mode=FULL/);
+      return {
+        schema:'archbro.workspace-bootstrap.v2',
+        project:{id:'project-A'},
+        tasks:[],
+        architecture:{version:3,components:[]},
+        proposals:[],
+        activity:[],
+        resources:{
+          canvas:{status:'DEFERRED',href:'/projects/project-A/architecture/canvas?expected_architecture_version=3&reading_mode=FULL'},
+          project_diagram:{status:'DEFERRED',href:'/projects/project-A/architecture/diagram?expected_architecture_version=3&reading_mode=MAP'},
+        },
+      };
     },
   });
   assert.equal(result.project.id, 'project-A');
   assert.equal(result.architecture.version, 3);
-  assert.equal(calls.some((path) => path.includes('code-architecture')), false);
-  assert.equal(calls.some((path) => path.includes('architecture/canvas')), false);
+  assert.equal(result.deferredArchitectureResources.canvas.status, 'DEFERRED');
+  assert.equal(result.deferredArchitectureResources.project_diagram.status, 'DEFERRED');
+  assert.deepEqual(calls, ['/projects/project-A/workspace-bootstrap?reading_mode=FULL']);
 });
 
 test('failed workspace restoration exposes explicit recovery instead of leaving the restoring screen', () => {

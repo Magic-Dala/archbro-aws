@@ -1,3 +1,6 @@
+import hashlib
+from pathlib import Path
+import re
 from typing import cast
 
 import pytest
@@ -90,3 +93,77 @@ def test_local_mode_does_not_trust_popup_only_origins(
 
     assert "https://apis.google.com" not in policy
     assert "frame-src 'none'" in policy
+
+
+def test_static_assets_require_exact_content_version_for_immutable_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARCHBRO_ENV", "test")
+    monkeypatch.setenv("ARCHBRO_AUTH_MODE", "local")
+
+    client = TestClient(
+        create_app(
+            _repository_not_used_by_runtime_config(),
+            FakeModelProvider(),
+        )
+    )
+    asset_path = Path(__file__).resolve().parents[1] / "frontend" / "web" / "app.js"
+    current_version = hashlib.sha256(asset_path.read_bytes()).hexdigest()[:16]
+    index = client.get("/")
+    versioned = client.get(f"/static/app.js?v={current_version}")
+    wrong = client.get("/static/app.js?v=" + "0" * 64)
+    unversioned = client.get("/static/app.js")
+
+    assert f'/static/app.js?v={current_version}' in index.text
+    assert versioned.status_code == 200
+    assert versioned.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert wrong.status_code == 200
+    assert wrong.headers["cache-control"] == "no-store, max-age=0"
+    assert unversioned.status_code == 200
+    assert unversioned.headers["cache-control"] == "no-store, max-age=0"
+
+
+@pytest.mark.parametrize("asset", ["/static/app.js", "/runtime-config.js"])
+def test_versioned_asset_authorization_errors_are_never_immutable(monkeypatch, asset):
+    monkeypatch.setenv("ARCHBRO_ENV", "test")
+    monkeypatch.setenv("ARCHBRO_AUTH_MODE", "local")
+    monkeypatch.setenv("ARCHBRO_EDGE_GUARD", "required")
+    monkeypatch.setenv("ARCHBRO_EDGE_TOKEN", "disposable-cache-test-token")
+    with TestClient(create_app(_repository_not_used_by_runtime_config(), FakeModelProvider())) as client:
+        index = client.get("/", headers={"X-ArchBro-Edge-Token": "disposable-cache-test-token"})
+        assert index.status_code == 200
+        match = re.search(re.escape(asset) + r'\?v=([0-9a-f]{16})', index.text)
+        assert match is not None
+        denied = client.get(match.group(0))
+    assert denied.status_code == 403
+    assert denied.headers["cache-control"] == "no-store, max-age=0"
+
+
+def test_runtime_config_exact_content_version_is_immutable_but_unversioned_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARCHBRO_ENV", "test")
+    monkeypatch.setenv("ARCHBRO_AUTH_MODE", "local")
+    client = TestClient(
+        create_app(
+            _repository_not_used_by_runtime_config(),
+            FakeModelProvider(),
+        )
+    )
+
+    index = client.get("/")
+    match = re.search(r'src="(/runtime-config\.js\?v=([0-9a-f]{16}))"', index.text)
+    assert match is not None
+    versioned = client.get(match.group(1))
+    unversioned = client.get("/runtime-config.js")
+    wrong = client.get("/runtime-config.js?v=0000000000000000")
+
+    assert versioned.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert unversioned.headers["cache-control"] == "no-store, max-age=0"
+    assert wrong.headers["cache-control"] == "no-store, max-age=0"
+
+    monkeypatch.setenv("ARCHBRO_MCP_SERVERS_JSON", '[{"id":"github"}]')
+    changed_index = client.get("/")
+    changed = re.search(r'/runtime-config\.js\?v=([0-9a-f]{16})', changed_index.text)
+    assert changed is not None
+    assert changed.group(1) != match.group(2)

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from archbro.backend.api.routes import build_router
@@ -169,6 +169,13 @@ def create_app(
     frontend_dir = Path(web_dir) if web_dir is not None else _project_root() / "frontend" / "web"
     if not frontend_dir.exists():
         raise RuntimeError(f"Archbro frontend directory not found: {frontend_dir}")
+    static_asset_versions = {
+        f"/static/{asset.relative_to(frontend_dir).as_posix()}": hashlib.sha256(
+            asset.read_bytes()
+        ).hexdigest()[:16]
+        for asset in frontend_dir.rglob("*")
+        if asset.is_file()
+    }
     webmcp_asset_sha256 = hashlib.sha256(
         (frontend_dir / "archbro-webmcp.js").read_bytes()
     ).hexdigest()
@@ -194,6 +201,33 @@ def create_app(
             # deployment-bound MCP servers or the current user's authorized provider hub.
             "expected_tool_count": WEBMCP_DEFAULT_TOOL_COUNT + WEBMCP_GATEWAY_TOOL_COUNT,
         }
+
+    def runtime_config_script() -> str:
+        manifest = webmcp_manifest_payload()
+        payload = {
+            "auth_mode": auth_mode,
+            "firebase": public_firebase_config,
+            "connected_mcp_gateway_configured": manifest["connected_mcp_gateway_configured"],
+            "webmcp_surface_version": manifest["surface_version"],
+            "webmcp_asset_sha256": manifest["asset_sha256"],
+            "webmcp_expected_tool_count": manifest["expected_tool_count"],
+            "webmcp_manifest_url": "/webmcp-manifest.json",
+        }
+        return "window.__ARCHBRO_RUNTIME_CONFIG__ = " + json.dumps(payload) + ";\n"
+
+    def runtime_config_version() -> str:
+        return hashlib.sha256(runtime_config_script().encode("utf-8")).hexdigest()[:16]
+
+    index_template = (frontend_dir / "index.html").read_text(encoding="utf-8")
+    runtime_config_marker = 'src="/runtime-config.js"'
+    if index_template.count(runtime_config_marker) != 1:
+        raise RuntimeError("Archbro index must reference runtime-config.js exactly once")
+
+    def runtime_index_html() -> str:
+        return index_template.replace(
+            runtime_config_marker,
+            f'src="/runtime-config.js?v={runtime_config_version()}"',
+        )
 
     app = FastAPI(title="Archbro")
     app.include_router(
@@ -249,7 +283,28 @@ def create_app(
         )
         if environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=86400"
-        if request.url.path in {
+        versioned_static = (
+            static_asset_versions.get(request.url.path) is not None
+            and request.query_params.get("v") == static_asset_versions[request.url.path]
+        )
+        versioned_runtime_config = (
+            request.url.path == "/runtime-config.js"
+            and request.query_params.get("v") == runtime_config_version()
+        )
+        if response.status_code in {200, 206, 304} and (
+            versioned_static or versioned_runtime_config
+        ):
+            # Static asset URLs in index.html are content/version keyed. Keeping
+            # those responses no-store forces the browser to download the same
+            # 300KB+ modules on every F5. A changed asset always gets a new URL,
+            # so versioned static resources are safe to cache immutably while
+            # direct unversioned asset reads below remain fail-safe no-store.
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            if "Pragma" in response.headers:
+                del response.headers["Pragma"]
+            if "Expires" in response.headers:
+                del response.headers["Expires"]
+        elif request.url.path.startswith("/static/") or request.url.path in {
             "/",
             "/healthz",
             "/readyz",
@@ -257,8 +312,6 @@ def create_app(
             "/runtime-identity",
             "/runtime-config.js",
             "/webmcp-manifest.json",
-            "/static/app.js",
-            "/static/archbro-webmcp.js",
         }:
             response.headers["Cache-Control"] = "no-store, max-age=0"
             response.headers["Pragma"] = "no-cache"
@@ -307,7 +360,7 @@ def create_app(
 
     @app.get("/", include_in_schema=False)
     async def web_app():
-        return FileResponse(frontend_dir / "index.html")
+        return Response(content=runtime_index_html(), media_type="text/html")
 
     @app.get("/webmcp-manifest.json", include_in_schema=False)
     async def webmcp_manifest():
@@ -318,18 +371,8 @@ def create_app(
 
     @app.get("/runtime-config.js", include_in_schema=False)
     async def runtime_config():
-        manifest = webmcp_manifest_payload()
-        payload = {
-            "auth_mode": auth_mode,
-            "firebase": public_firebase_config,
-            "connected_mcp_gateway_configured": manifest["connected_mcp_gateway_configured"],
-            "webmcp_surface_version": manifest["surface_version"],
-            "webmcp_asset_sha256": manifest["asset_sha256"],
-            "webmcp_expected_tool_count": manifest["expected_tool_count"],
-            "webmcp_manifest_url": "/webmcp-manifest.json",
-        }
         return Response(
-            content="window.__ARCHBRO_RUNTIME_CONFIG__ = " + json.dumps(payload) + ";\n",
+            content=runtime_config_script(),
             media_type="application/javascript",
             headers={"Cache-Control": "no-store"},
         )

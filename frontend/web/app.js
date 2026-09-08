@@ -50,7 +50,7 @@ function makeWorkspaceAsyncState(projectId = null) {
     architectureVersion:null,
     phase:'idle',
     error:null,
-    resources:{canvas:resource(),codeArchitecture:resource()},
+    resources:{canvas:resource(),codeArchitecture:resource(),projectDiagram:resource()},
   };
 }
 
@@ -1187,25 +1187,44 @@ async function loadLatestCodeArchitecture(projectId) {
 
 // WORKSPACE_CORE_LOADER_START
 async function loadProjectCoreContext(projectId) {
-  const architectureRequest = api(`/projects/${projectId}/architecture`);
-  const [project,tasks,architecture,proposals,activity] = await Promise.all([
-    api(`/projects/${projectId}`),
-    api(`/projects/${projectId}/tasks`),
-    architectureRequest,
-    api(`/projects/${projectId}/architecture/proposals`),
-    api(`/projects/${projectId}/events?limit=12`),
-  ]);
-  return {project,tasks,architecture,proposals,activity};
+  const bootstrap = await api(`/projects/${projectId}/workspace-bootstrap?reading_mode=FULL`);
+  if (bootstrap?.schema !== 'archbro.workspace-bootstrap.v2') throw new Error('Unsupported workspace bootstrap contract.');
+  return {
+    project: bootstrap.project,
+    tasks: bootstrap.tasks || [],
+    architecture: bootstrap.architecture,
+    proposals: bootstrap.proposals || [],
+    activity: bootstrap.activity || [],
+    deferredArchitectureResources: bootstrap.resources || {},
+  };
+}
+
+function deferredBootstrapResourceHref(resource, expectedPrefix, architectureVersion) {
+  const href = String(resource?.href || '');
+  const versionToken = `expected_architecture_version=${Number(architectureVersion) || 0}`;
+  if (resource?.status !== 'DEFERRED' || !href.startsWith(expectedPrefix) || !href.includes(versionToken)) {
+    throw new Error('Workspace bootstrap returned an invalid deferred resource.');
+  }
+  return href;
 }
 // WORKSPACE_CORE_LOADER_END
 
-async function refreshCanvasResource(contextTicket, architecture, {scopeComponentId = null, retainData = false} = {}) {
+async function refreshCanvasResource(contextTicket, architecture, {scopeComponentId = null, retainData = false, deferredResources = null} = {}) {
   const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:retainData && Boolean(state.diagram)});
   if (!request) return false;
   try {
-    const diagram = ARCHITECTURE_CANVAS_MODE
-      ? await loadArchitectureCanvasDiagram(contextTicket.projectId, architecture, 'FULL')
-      : await loadArchitectureDiagram(contextTicket.projectId, architecture, scopeComponentId, state.readingMode);
+    let diagram;
+    if (ARCHITECTURE_CANVAS_MODE && !scopeComponentId && deferredResources?.canvas) {
+      const href = deferredBootstrapResourceHref(deferredResources.canvas, `/projects/${contextTicket.projectId}/architecture/canvas?`, architecture.version);
+      diagram = normalizeFullCanvasResponse(await api(href));
+    } else if (!ARCHITECTURE_CANVAS_MODE && !scopeComponentId && state.readingMode === 'MAP' && deferredResources?.project_diagram) {
+      const href = deferredBootstrapResourceHref(deferredResources.project_diagram, `/projects/${contextTicket.projectId}/architecture/diagram?`, architecture.version);
+      diagram = normalizeScopedDiagramResponse(await api(href), null);
+    } else {
+      diagram = ARCHITECTURE_CANVAS_MODE
+        ? await loadArchitectureCanvasDiagram(contextTicket.projectId, architecture, 'FULL')
+        : await loadArchitectureDiagram(contextTicket.projectId, architecture, scopeComponentId, state.readingMode);
+    }
     if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
     state.diagram = diagram;
     state.diagramError = null;
@@ -1251,11 +1270,34 @@ async function refreshCodeArchitectureResource(contextTicket, {retainData = fals
   }
 }
 
-function refreshWorkspaceOptionalResources(contextTicket, architecture, {scopeComponentId = null, retainData = false} = {}) {
-  return Promise.allSettled([
-    refreshCanvasResource(contextTicket, architecture, {scopeComponentId, retainData}),
+async function refreshProjectDiagramResource(contextTicket, architecture, {deferredResources = null} = {}) {
+  if (!ARCHITECTURE_CANVAS_MODE || !deferredResources?.project_diagram) return false;
+  const request = beginWorkspaceResource(state.workspaceAsync, 'projectDiagram', contextTicket, {retainData:Boolean(cachedArchitectureView('project', contextTicket.projectId, architecture.version))});
+  if (!request) return false;
+  try {
+    const href = deferredBootstrapResourceHref(deferredResources.project_diagram, `/projects/${contextTicket.projectId}/architecture/diagram?`, architecture.version);
+    const diagram = normalizeScopedDiagramResponse(await api(href), null);
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    resetArchitectureViewCache(contextTicket.projectId, architecture.version);
+    if (diagram) cacheArchitectureView('project', contextTicket.projectId, architecture.version, diagram);
+    settleWorkspaceResource(state.workspaceAsync, request, diagram ? 'ready' : 'empty');
+    return true;
+  } catch (error) {
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    settleWorkspaceResource(state.workspaceAsync, request, 'error', error);
+    return false;
+  }
+}
+
+function refreshWorkspaceOptionalResources(contextTicket, architecture, {scopeComponentId = null, retainData = false, deferredResources = null} = {}) {
+  const requests = [
+    refreshCanvasResource(contextTicket, architecture, {scopeComponentId, retainData, deferredResources}),
     refreshCodeArchitectureResource(contextTicket, {retainData}),
-  ]);
+  ];
+  if (ARCHITECTURE_CANVAS_MODE && deferredResources?.project_diagram) {
+    requests.push(refreshProjectDiagramResource(contextTicket, architecture, {deferredResources}));
+  }
+  return Promise.allSettled(requests);
 }
 
 function retryWorkspaceResource(name) {
@@ -1365,7 +1407,7 @@ async function selectProject(projectId) {
     persistExpandedProjectIds();
     persistActiveProjectSelection(projectId);
     render();
-    void refreshWorkspaceOptionalResources(ticket, context.architecture, {retainData:retainOptional});
+    void refreshWorkspaceOptionalResources(ticket, context.architecture, {retainData:retainOptional,deferredResources:context.deferredArchitectureResources});
     return true;
   } catch (err) {
     if (workspaceContextIsCurrent(state.workspaceAsync, ticket)) {
@@ -1404,7 +1446,7 @@ async function refresh() {
     if (!retainOptional) clearWorkspaceOptionalData();
     clearAgentContextPreview();
     render();
-    void refreshWorkspaceOptionalResources(ticket, context.architecture, {scopeComponentId,retainData:retainOptional});
+    void refreshWorkspaceOptionalResources(ticket, context.architecture, {scopeComponentId,retainData:retainOptional,deferredResources:context.deferredArchitectureResources});
     return true;
   } catch (err) {
     if (!workspaceContextIsCurrent(state.workspaceAsync, ticket)) return false;
@@ -6208,7 +6250,40 @@ window.addEventListener('popstate', () => {
 window.matchMedia('(max-width: 760px)').addEventListener('change', syncMobileSidebarLayers);
 async function initializeWorkspace() {
   try {
-    await loadProjects();
+    const initialProjectId = state.projectId;
+    const projectsPromise = loadProjects()
+      .then(() => ({error: null}))
+      .catch((error) => ({error}));
+    const startupContextRequest = initialProjectId ? beginWorkspaceContextRequest(initialProjectId) : null;
+    const startupTicket = initialProjectId ? beginWorkspaceContext(state.workspaceAsync, initialProjectId) : null;
+    const directProjectContextPromise = initialProjectId
+      ? loadProjectCoreContext(initialProjectId)
+          .then((context) => ({context, error: null}))
+          .catch((error) => ({context: null, error}))
+      : Promise.resolve(null);
+    if (initialProjectId) {
+      const direct = await directProjectContextPromise;
+      if (direct?.context
+          && workspaceContextIsCurrent(state.workspaceAsync, startupTicket)
+          && isWorkspaceContextRequestCurrent(startupContextRequest)) {
+        if (!bindWorkspaceContextArchitecture(state.workspaceAsync, startupTicket, direct.context.architecture?.version)) return false;
+        persistActiveProjectSelection(initialProjectId);
+        state.onboarding.active = false;
+        Object.assign(state, direct.context);
+        clearWorkspaceOptionalData();
+        clearAgentContextPreview();
+        if (ARCHITECTURE_CANVAS_MODE) state.currentView = 'architecture';
+        render();
+        void refreshWorkspaceOptionalResources(startupTicket, direct.context.architecture, {deferredResources:direct.context.deferredArchitectureResources});
+        void projectsPromise.then((result) => {
+          if (result.error) toast(`Could not refresh the project list. ${result.error.message}`, true);
+        });
+        return true;
+      }
+      if (direct?.error && !String(direct.error.message).startsWith('404:')) throw direct.error;
+    }
+    const projectsResult = await projectsPromise;
+    if (projectsResult.error) throw projectsResult.error;
     const staleProjectId = state.projectId;
     if (state.projectId && !state.projects.some((project) => project.id === state.projectId)) {
       state.projectId = null;

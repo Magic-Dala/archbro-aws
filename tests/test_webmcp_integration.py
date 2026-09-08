@@ -87,7 +87,7 @@ def test_webmcp_asset_uses_current_imperative_document_model_context_surface(dsn
 
     index = client.get("/")
     assert index.status_code == 200
-    assert 'src="/runtime-config.js"' in index.text
+    assert 'src="/runtime-config.js?v=' in index.text
     assert 'src="/static/firebase-auth-client.js?v=20260901-auth-providers"' in index.text
     assert 'type="module" src="/static/app.js?v=' in index.text
     assert f'type="module" src="/static/archbro-webmcp.js?v={webmcp_version}"' in index.text

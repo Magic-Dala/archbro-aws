@@ -312,11 +312,16 @@ test('canvas mode switches in-page and never uses popup or location navigation',
   assert.match(app,/cachedArchitectureView\(cacheKind/);
   const core=app.slice(app.indexOf('// WORKSPACE_CORE_LOADER_START'),app.indexOf('// WORKSPACE_CORE_LOADER_END'));
   assert.match(core,/loadProjectCoreContext/);
+  assert.match(core,/workspace-bootstrap\?reading_mode=FULL/);
+  assert.match(core,/archbro\.workspace-bootstrap\.v2/);
   assert.doesNotMatch(core,/code-architecture|architecture\/canvas/);
   const optional=app.slice(app.indexOf('async function refreshCanvasResource('),app.indexOf('function clearWorkspaceOptionalData('));
-  assert.match(optional,/loadArchitectureCanvasDiagram/);
+  assert.match(optional,/deferredBootstrapResourceHref/);
   assert.match(optional,/refreshCodeArchitectureResource/);
+  assert.match(optional,/refreshProjectDiagramResource/);
   assert.match(optional,/refreshWorkspaceOptionalResources/);
+  assert.match(optional,/beginWorkspaceResource\(state\.workspaceAsync, 'projectDiagram'/);
+  assert.doesNotMatch(app,/bootstrapArchitectureViewsRequest|diagramLoading/);
 });
 
 async function canvasSwitchHarness(options = {}) {
@@ -534,8 +539,77 @@ test('workspace restore never presents the signed-out landing screen as loading 
   assert.match(page,/id="bootstrapLogoutBtn"/);
   assert.match(app,/showWorkspaceRecovery\(new Error/);
   const core=app.slice(app.indexOf('// WORKSPACE_CORE_LOADER_START'),app.indexOf('// WORKSPACE_CORE_LOADER_END'));
+  assert.match(core,/workspace-bootstrap\?reading_mode=FULL/);
+  assert.match(core,/archbro\.workspace-bootstrap\.v2/);
   assert.doesNotMatch(core,/architecture\/canvas|code-architecture/);
   assert.match(app,/void refreshWorkspaceOptionalResources\(/);
+  const workspaceInit=app.slice(app.indexOf('async function initializeWorkspace()'),app.indexOf('async function initializeApp()'));
+  assert.match(workspaceInit,/const projectsPromise = loadProjects\(\)/);
+  assert.match(workspaceInit,/const directProjectContextPromise = initialProjectId/);
+  assert.match(workspaceInit,/loadProjectCoreContext\(initialProjectId/);
+  assert.ok(workspaceInit.indexOf('await directProjectContextPromise') < workspaceInit.indexOf('await projectsPromise'));
+  assert.match(workspaceInit,/refreshWorkspaceOptionalResources\(startupTicket/);
+  assert.doesNotMatch(app,/bootstrapArchitectureViewsRequest|diagramLoading/);
+});
+
+test('deferred bootstrap projections use canonical resource generations and isolate failures', async () => {
+  const app=await readFile(new URL('app.js',webRoot),'utf8');
+  const asyncBlock=app.slice(app.indexOf('// WORKSPACE_ASYNC_STATE_START')+'// WORKSPACE_ASYNC_STATE_START'.length,app.indexOf('// WORKSPACE_ASYNC_STATE_END'));
+  const optionalBlock=app.slice(app.indexOf('function deferredBootstrapResourceHref('),app.indexOf('function clearWorkspaceOptionalData('));
+  let resolveCanvas, rejectProject;
+  const canvasPromise=new Promise(resolve=>{resolveCanvas=resolve;});
+  const projectPromise=new Promise((_resolve,reject)=>{rejectProject=reject;});
+  const cached=[], renders=[];
+  const state={projectId:'project-1',architecture:{version:4},diagram:null,diagramError:null,readingMode:'MAP',currentView:'architecture',codeDiagram:null};
+  const context={
+    state,
+    ARCHITECTURE_CANVAS_MODE:true,
+    api:href=>href.includes('/architecture/canvas?')?canvasPromise:projectPromise,
+    normalizeFullCanvasResponse:payload=>payload,
+    normalizeScopedDiagramResponse:payload=>payload,
+    loadArchitectureCanvasDiagram:()=>Promise.reject(new Error('deferred canvas href should be used')),
+    loadArchitectureDiagram:()=>Promise.reject(new Error('deferred project href should be used')),
+    loadLatestCodeArchitecture:()=>Promise.resolve(null),
+    normalizeCodeArchitectureSnapshot:payload=>payload,
+    cachedArchitectureView:()=>null,
+    resetArchitectureViewCache:()=>{},
+    cacheArchitectureView:(...args)=>cached.push(args),
+    render:()=>renders.push('render'),
+    renderGraph:()=>{},
+  };
+  runInNewContext(asyncBlock+optionalBlock+';globalThis.makeAsync=makeWorkspaceAsyncState;globalThis.beginContext=beginWorkspaceContext;globalThis.bindContext=bindWorkspaceContextArchitecture;globalThis.refreshCanvas=refreshCanvasResource;globalThis.refreshProject=refreshProjectDiagramResource;',context);
+  state.workspaceAsync=context.makeAsync('project-1');
+  const ticket=context.beginContext(state.workspaceAsync,'project-1');
+  context.bindContext(state.workspaceAsync,ticket,4);
+  const resources={
+    canvas:{status:'DEFERRED',href:'/projects/project-1/architecture/canvas?expected_architecture_version=4&reading_mode=FULL'},
+    project_diagram:{status:'DEFERRED',href:'/projects/project-1/architecture/diagram?expected_architecture_version=4&reading_mode=MAP'},
+  };
+  const canvas=context.refreshCanvas(ticket,{version:4},{deferredResources:resources});
+  const project=context.refreshProject(ticket,{version:4},{deferredResources:resources});
+  resolveCanvas({fullCanvas:true,id:'canvas-ready'});
+  assert.equal(await canvas,true);
+  assert.equal(state.diagram.id,'canvas-ready');
+  assert.equal(state.workspaceAsync.resources.canvas.status,'ready');
+  assert.equal(state.workspaceAsync.resources.projectDiagram.status,'loading');
+  rejectProject(new Error('project view unavailable'));
+  assert.equal(await project,false);
+  assert.equal(state.diagram.id,'canvas-ready');
+  assert.equal(state.workspaceAsync.resources.projectDiagram.status,'error');
+  assert.equal(cached.some(args=>args[0]==='canvas'),true);
+  assert.equal(cached.some(args=>args[0]==='project'),false);
+
+  let resolveStale;
+  const stalePromise=new Promise(resolve=>{resolveStale=resolve;});
+  context.api=()=>stalePromise;
+  const staleTicket=context.beginContext(state.workspaceAsync,'project-1');
+  context.bindContext(state.workspaceAsync,staleTicket,4);
+  const pending=context.refreshCanvas(staleTicket,{version:4},{deferredResources:resources});
+  const b=context.beginContext(state.workspaceAsync,'project-2');
+  context.bindContext(state.workspaceAsync,b,9);
+  resolveStale({fullCanvas:true,id:'stale'});
+  assert.equal(await pending,false);
+  assert.equal(state.diagram.id,'canvas-ready');
 });
 
 test('summary response validates membership, direction, boundaries and route identities', async () => {

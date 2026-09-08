@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Literal
@@ -57,6 +59,10 @@ from archbro.backend.core.diagram import (
 from archbro.backend.core.diagram_layout import layout_canvas_diagram, layout_diagram
 from archbro.backend.core.repository import ProjectRepositoryPort
 from archbro.backend.llm.provider import GoalConversationMessage, GoalDraft, ModelProvider
+
+
+CANVAS_PROJECTION_ACTIVE_BUILD_LIMIT = 4
+CANVAS_PROJECTION_ADMITTED_BUILD_LIMIT = 8
 
 
 class CreateProjectRequest(BaseModel):
@@ -351,6 +357,47 @@ def build_router(
     executor = ActionExecutor(repository)
     authorizer = ProjectAuthorizer()
     router = APIRouter()
+    canvas_projection_cache: dict[str, dict[str, Any]] = {}
+    canvas_projection_builds: dict[str, asyncio.Task[dict[str, Any]]] = {}
+    canvas_projection_cache_limit = 32
+    canvas_projection_active_slots = asyncio.Semaphore(CANVAS_PROJECTION_ACTIVE_BUILD_LIMIT)
+    canvas_projection_admission_lock = asyncio.Lock()
+
+    def canvas_projection_cache_key(
+        project_id: str,
+        architecture: Architecture,
+        tasks: list[Any],
+        proposals: list[ArchitectureChangeProposal],
+        reading_mode: str,
+    ) -> str:
+        """Fingerprint every persisted input that can affect one canvas response.
+
+        Geometry is deterministic for an accepted Architecture, while task and
+        proposal state affect projected health/review metadata. Including their
+        full JSON state makes the process-local cache fail closed on any such
+        mutation without requiring a separate invalidation channel.
+        """
+
+        payload = {
+            "project_id": project_id,
+            "reading_mode": reading_mode,
+            "architecture": architecture.model_dump(mode="json"),
+            "tasks": [
+                task.model_dump(mode="json")
+                for task in sorted(tasks, key=lambda item: item.id)
+            ],
+            "proposals": [
+                proposal.model_dump(mode="json")
+                for proposal in sorted(proposals, key=lambda item: item.id)
+            ],
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def build_canvas_projection_payload(
         project_id: str,
@@ -358,12 +405,17 @@ def build_router(
         tasks: list[Any],
         proposals: list[ArchitectureChangeProposal],
         reading_mode: str,
+        precomputed_full_diagram: Any | None = None,
     ) -> dict[str, Any]:
         work_budget = CanvasWorkBudget()
-        full_diagram = project_diagram(
+        full_diagram = precomputed_full_diagram or project_diagram(
             architecture,
             tasks=tasks,
             proposals=proposals,
+        )
+        work_budget.require_input(
+            nodes=len(full_diagram.nodes),
+            edges=len(full_diagram.edges),
         )
         route_edge_ids = map_edge_ids(full_diagram) if reading_mode == "MAP" else None
         reading_views = canvas_reading_views(architecture, full_diagram)
@@ -444,6 +496,84 @@ def build_router(
             "diagram": diagram.model_dump(mode="json"),
             "positioned_graph": asdict(positioned_graph),
         }
+
+    async def get_or_build_canvas_projection_payload(
+        project_id: str,
+        architecture: Architecture,
+        tasks: list[Any],
+        proposals: list[ArchitectureChangeProposal],
+        reading_mode: str,
+    ) -> dict[str, Any]:
+        cache_key = canvas_projection_cache_key(
+            project_id,
+            architecture,
+            tasks,
+            proposals,
+            reading_mode,
+        )
+        cached = canvas_projection_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        async def build_and_cache(precomputed_full_diagram: Any) -> dict[str, Any]:
+            async with canvas_projection_active_slots:
+                payload = await run_in_threadpool(
+                    build_canvas_projection_payload,
+                    project_id,
+                    architecture,
+                    tasks,
+                    proposals,
+                    reading_mode,
+                    precomputed_full_diagram,
+                )
+            canvas_projection_cache[cache_key] = payload
+            while len(canvas_projection_cache) > canvas_projection_cache_limit:
+                canvas_projection_cache.pop(next(iter(canvas_projection_cache)))
+            return payload
+
+        async with canvas_projection_admission_lock:
+            cached = canvas_projection_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            build_task = canvas_projection_builds.get(cache_key)
+            if build_task is None:
+                # Static input complexity is a property of the request, not of
+                # current server pressure. Reject it before consuming one of the
+                # finite admitted-build slots so 422 remains authoritative over
+                # an unrelated 503 busy condition.
+                preflight_diagram = project_diagram(
+                    architecture,
+                    tasks=tasks,
+                    proposals=proposals,
+                )
+                CanvasWorkBudget().require_input(
+                    nodes=len(preflight_diagram.nodes),
+                    edges=len(preflight_diagram.edges),
+                )
+                if len(canvas_projection_builds) >= CANVAS_PROJECTION_ADMITTED_BUILD_LIMIT:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "canvas_projection_busy",
+                            "active_limit": CANVAS_PROJECTION_ACTIVE_BUILD_LIMIT,
+                            "admitted_limit": CANVAS_PROJECTION_ADMITTED_BUILD_LIMIT,
+                        },
+                        headers={"Retry-After": "1"},
+                    )
+                build_task = asyncio.create_task(build_and_cache(preflight_diagram))
+                canvas_projection_builds[cache_key] = build_task
+
+                def clear_completed_task(completed: asyncio.Task[dict[str, Any]]) -> None:
+                    if canvas_projection_builds.get(cache_key) is completed:
+                        canvas_projection_builds.pop(cache_key, None)
+                    # A disconnected waiter must not leave an unobserved task error.
+                    # Retrieving it does not change what surviving awaiters receive.
+                    if not completed.cancelled():
+                        completed.exception()
+
+                build_task.add_done_callback(clear_completed_task)
+
+        return await asyncio.shield(build_task)
 
     def authentication_error(detail: str) -> HTTPException:
         return HTTPException(
@@ -770,8 +900,7 @@ def build_router(
             )
 
         try:
-            return await run_in_threadpool(
-                build_canvas_projection_payload,
+            return await get_or_build_canvas_projection_payload(
                 project_id,
                 architecture,
                 tasks,
@@ -780,6 +909,59 @@ def build_router(
             )
         except CanvasComplexityError as exc:
             raise HTTPException(status_code=422, detail=exc.detail()) from exc
+
+    @router.get("/projects/{project_id}/workspace-bootstrap")
+    async def get_workspace_bootstrap(
+        project_id: str,
+        http_request: Request,
+        reading_mode: Literal["MAP", "READ", "FULL"] = Query(default="FULL"),
+    ):
+        """Return authenticated core state without blocking on optional projections.
+
+        The v2 bootstrap is intentionally core-only: accepted project state is
+        returned immediately, while Canvas and Project Diagram are advertised as
+        deferred read resources. Expensive projection work therefore cannot hold
+        first paint or convert an optional failure into a workspace failure.
+        """
+
+        project = await authorized_project(
+            http_request, project_id, ProjectPermission.READ
+        )
+        architecture, tasks, proposals, activity = await run_in_threadpool(
+            lambda: (
+                repository.get_architecture(project_id),
+                repository.list_tasks(project_id),
+                repository.list_proposals(project_id),
+                repository.list_events(project_id, limit=12),
+            )
+        )
+        return {
+            "schema": "archbro.workspace-bootstrap.v2",
+            "project": project.model_dump(mode="json"),
+            "tasks": [task.model_dump(mode="json") for task in tasks],
+            "architecture": architecture.model_dump(mode="json"),
+            "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
+            "activity": [event.model_dump(mode="json") for event in activity],
+            "resources": {
+                "canvas": {
+                    "status": "DEFERRED",
+                    "href": (
+                        f"/projects/{project_id}/architecture/canvas"
+                        f"?expected_architecture_version={architecture.version}"
+                        f"&reading_mode={reading_mode}"
+                    ),
+                },
+                "project_diagram": {
+                    "status": "DEFERRED",
+                    "href": (
+                        f"/projects/{project_id}/architecture/diagram"
+                        f"?expected_architecture_version={architecture.version}"
+                        "&reading_mode=MAP"
+                    ),
+                },
+            },
+            "built_in_model_called": False,
+        }
 
     @router.get("/projects/{project_id}/architecture/proposals")
     async def list_proposals(project_id: str, http_request: Request):
