@@ -7,6 +7,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from archbro.backend.core.contracts import (
+    AgentContextSnapshot,
     AgentRunResult,
     Architecture,
     ArchitectureChangeProposal,
@@ -441,6 +442,85 @@ class PostgresProjectRepository:
             ).fetchall()
         events = [ProjectEvent.model_validate_json(row["data"]) for row in rows]
         return list(reversed(events))
+
+    def load_agent_context_snapshot(
+        self,
+        project_id: str,
+        *,
+        event_scan_limit: int,
+    ) -> AgentContextSnapshot:
+        # Manifest preview/execution must not combine rows from different committed
+        # project states. Keep every input read in one repeatable-read transaction.
+        if event_scan_limit < 1:
+            raise ValueError("agent context event_scan_limit must be positive")
+        with self._connect() as conn:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            project_row = conn.execute(
+                "SELECT data FROM projects WHERE id=%s",
+                (project_id,),
+            ).fetchone()
+            if project_row is None:
+                raise KeyError(project_id)
+            architecture_row = conn.execute(
+                "SELECT data FROM architectures WHERE project_id=%s",
+                (project_id,),
+            ).fetchone()
+            task_rows = conn.execute(
+                "SELECT data FROM tasks WHERE project_id=%s ORDER BY seq",
+                (project_id,),
+            ).fetchall()
+            proposal_rows = conn.execute(
+                "SELECT data FROM proposals WHERE project_id=%s ORDER BY seq",
+                (project_id,),
+            ).fetchall()
+            event_rows = conn.execute(
+                """
+                SELECT data FROM events
+                WHERE project_id=%s AND (data::jsonb ->> 'type')<>%s
+                ORDER BY seq DESC
+                LIMIT %s
+                """,
+                (
+                    project_id,
+                    ProjectEventType.CODE_ARCHITECTURE_SNAPSHOT.value,
+                    event_scan_limit + 1,
+                ),
+            ).fetchall()
+            latest_code_architecture_row = conn.execute(
+                """
+                SELECT data FROM events
+                WHERE project_id=%s AND (data::jsonb ->> 'type')=%s
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                (project_id, ProjectEventType.CODE_ARCHITECTURE_SNAPSHOT.value),
+            ).fetchone()
+
+        event_history_truncated = len(event_rows) > event_scan_limit
+        event_rows = event_rows[:event_scan_limit]
+        return AgentContextSnapshot(
+            project=Project.model_validate_json(project_row["data"]),
+            architecture=(
+                Architecture.model_validate_json(architecture_row["data"])
+                if architecture_row is not None
+                else Architecture()
+            ),
+            tasks=[Task.model_validate_json(row["data"]) for row in task_rows],
+            proposals=[
+                ArchitectureChangeProposal.model_validate_json(row["data"])
+                for row in proposal_rows
+            ],
+            events=[
+                ProjectEvent.model_validate_json(row["data"])
+                for row in reversed(event_rows)
+            ],
+            event_history_truncated=event_history_truncated,
+            latest_code_architecture_event=(
+                ProjectEvent.model_validate_json(latest_code_architecture_row["data"])
+                if latest_code_architecture_row is not None
+                else None
+            ),
+        )
 
     def get_latest_event_by_type(
         self,

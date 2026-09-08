@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from archbro.backend.core.contracts import (
+    AgentContextSnapshot,
     AgentRunResult,
     Architecture,
     ArchitectureChangeProposal,
@@ -96,6 +97,14 @@ class ProjectRepositoryPort(Protocol):
         ...
     def get_event(self, event_id: str) -> ProjectEvent: ...
     def list_events(self, project_id: str, limit: int = 100) -> list[ProjectEvent]: ...
+    def load_agent_context_snapshot(
+        self,
+        project_id: str,
+        *,
+        event_scan_limit: int,
+    ) -> AgentContextSnapshot:
+        """Read project, architecture, tasks, proposals, and events from one DB snapshot."""
+        ...
     def get_latest_event_by_type(
         self,
         project_id: str,

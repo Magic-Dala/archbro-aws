@@ -8,6 +8,11 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from archbro.backend.agent.context_manifest import (
+    AgentContextPreviewStaleError,
+    prepare_agent_context_event_payload,
+)
+from archbro.backend.agent.node_context import StaleArchitectureVersionError
 from archbro.backend.agent.orchestration import AgentOrchestrator
 from archbro.backend.api.agent_surface import build_agent_surface_router
 from archbro.backend.api.provider_connections import build_provider_mcp_router
@@ -502,13 +507,46 @@ def build_router(
     @router.post("/projects/{project_id}/events")
     async def post_event(project_id: str, request: EventRequest, http_request: Request):
         await authorized_project(http_request, project_id, ProjectPermission.WRITE)
+        payload = dict(request.payload)
+        context_fields_present = any(
+            field in payload
+            for field in ("agent_context_request", "agent_context_manifest")
+        )
+        if context_fields_present and request.type != ProjectEventType.USER_MESSAGE:
+            raise HTTPException(
+                status_code=422,
+                detail="bounded agent context is supported only for USER_MESSAGE events",
+            )
+        if request.type == ProjectEventType.USER_MESSAGE:
+            try:
+                payload = prepare_agent_context_event_payload(repository, project_id, payload)
+            except StaleArchitectureVersionError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "stale_architecture_version",
+                        "expected_architecture_version": exc.expected,
+                        "current_architecture_version": exc.current,
+                    },
+                )
+            except AgentContextPreviewStaleError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "agent_context_preview_stale",
+                        "expected_manifest_hash": exc.expected_hash,
+                        "current_manifest_hash": exc.current_hash,
+                    },
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
         event = ProjectEvent(
             project_id=project_id,
             type=request.type,
             source=request.source,
             source_event_id=request.source_event_id,
             occurred_at=request.occurred_at,
-            payload=request.payload,
+            payload=payload,
         )
         try:
             return await orchestrator.observe_event(event)

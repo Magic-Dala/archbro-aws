@@ -27,6 +27,19 @@ from archbro.backend.core.repository import ProjectRepositoryPort
 logger = logging.getLogger("archbro")
 
 
+def _context_telemetry(event: ProjectEvent) -> dict[str, object] | None:
+    manifest = event.payload.get("agent_context_manifest")
+    if not isinstance(manifest, dict):
+        return None
+    usage = manifest.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return {
+        **usage,
+        "manifest_hash": manifest.get("manifest_hash"),
+        "architecture_version": manifest.get("architecture_version"),
+        "selection": manifest.get("selection"),
+    }
 
 
 def _provider_usage(provider: ModelProvider) -> dict[str, object] | None:
@@ -101,6 +114,7 @@ class AgentOrchestrator:
                 model=used_model,
                 result="ERROR",
                 error=f"{type(exc).__name__}: {exc}",
+                context_telemetry=_context_telemetry(event),
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
             )
@@ -204,6 +218,7 @@ class AgentOrchestrator:
                 provider=self.provider.name,
                 model=used_model,
                 result="SUCCESS",
+                context_telemetry=_context_telemetry(event),
                 provider_usage=provider_usage,
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
@@ -229,6 +244,7 @@ class AgentOrchestrator:
                 model=used_model,
                 result="ERROR",
                 error=f"{type(exc).__name__}: {exc}",
+                context_telemetry=_context_telemetry(event),
                 provider_usage=_provider_usage(self.provider),
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),

@@ -11,7 +11,10 @@ import {
 } from './firebase-auth.js?v=20260901-auth-providers';
 
 const prototype = window.ArchbroPrototype;
-const storedProjectId = localStorage.getItem('archbro-project-id');
+const initialUrlParams = new URLSearchParams(window.location.search);
+const requestedProjectId = initialUrlParams.get('project')?.trim() || null;
+const persistedProjectId = localStorage.getItem('archbro-project-id');
+const initialProjectId = requestedProjectId || persistedProjectId;
 const WEBMCP_AGENT_MODE = new URLSearchParams(window.location.search).get('mode') === 'webmcp';
 const AUTH_PROVIDER_SIGN_INS = new Map([
   ['google', signInWithGoogleAccount],
@@ -32,7 +35,7 @@ function persistExpandedProjectIds(storage = localStorage) {
   storage.setItem('archbro-expanded-projects', JSON.stringify([...state.expandedProjectIds]));
 }
 const state = {
-  projectId: storedProjectId,
+  projectId: initialProjectId,
   projects: [],
   project: null,
   tasks: [],
@@ -60,7 +63,7 @@ const state = {
   openProjectMenuId: null,
   projectMenuFocusId: null,
   onboarding: {
-    active: !storedProjectId,
+    active: !initialProjectId,
     stage: 'name',
     projectName: '',
     initialGoal: '',
@@ -73,7 +76,28 @@ const state = {
   },
 };
 
-if (storedProjectId) state.expandedProjectIds.add(storedProjectId);
+let workspaceContextGeneration = 0;
+
+function beginWorkspaceContextRequest(projectId) {
+  return {projectId, generation: ++workspaceContextGeneration};
+}
+
+function isWorkspaceContextRequestCurrent(request, {requireSelectedProject = false} = {}) {
+  if (!request || request.generation !== workspaceContextGeneration) return false;
+  return !requireSelectedProject || state.projectId === request.projectId;
+}
+
+function supersedeWorkspaceContextRequests() {
+  workspaceContextGeneration += 1;
+}
+
+function commitWorkspaceContext(request, context, updates = {}, {requireSelectedProject = false} = {}) {
+  if (!isWorkspaceContextRequestCurrent(request, {requireSelectedProject})) return false;
+  Object.assign(state, context, updates);
+  return true;
+}
+
+if (initialProjectId) state.expandedProjectIds.add(initialProjectId);
 
 state.experience = {
   phase: 'landing',
@@ -464,6 +488,7 @@ function renderWorkspaceHome() {
 }
 
 async function openPersonalWorkspace() {
+  supersedeWorkspaceContextRequests();
   state.projectId = null;
   state.project = null;
   state.tasks = [];
@@ -485,7 +510,7 @@ async function openPersonalWorkspace() {
   state.currentView = 'overview';
   state.openProjectMenuId = null;
   state.renamingProjectId = null;
-  localStorage.removeItem('archbro-project-id');
+  clearActiveProjectSelection();
   await loadProjectSnapshots();
   renderWorkspaceHome();
   closeMobileSidebar();
@@ -858,19 +883,39 @@ async function loadProjectContext(projectId, {scopeComponentId = null} = {}) {
   return {project,tasks,architecture,diagram,diagramError,proposals,activity,codeArchitecture,codeDiagram};
 }
 
+function persistActiveProjectSelection(projectId) {
+  localStorage.setItem('archbro-project-id', projectId);
+  const activeUrl = new URL(window.location.href);
+  if (activeUrl.searchParams.get('project') !== projectId) {
+    activeUrl.searchParams.set('project', projectId);
+    window.history.replaceState(window.history.state, '', activeUrl);
+  }
+}
+
+function clearActiveProjectSelection() {
+  localStorage.removeItem('archbro-project-id');
+  const activeUrl = new URL(window.location.href);
+  if (activeUrl.searchParams.has('project')) {
+    activeUrl.searchParams.delete('project');
+    window.history.replaceState(window.history.state, '', activeUrl);
+  }
+}
+
 async function selectProject(projectId) {
   if (!projectId) return false;
   state.openProjectMenuId = null;
   if (projectId === state.projectId && state.project) {
+    persistActiveProjectSelection(projectId);
     state.onboarding.active = false;
     state.currentView = 'overview';
     render();
     return true;
   }
   $('projectTree').setAttribute('aria-busy', 'true');
+  const contextRequest = beginWorkspaceContextRequest(projectId);
   try {
     const context = await loadProjectContext(projectId);
-    Object.assign(state, context, {
+    if (!commitWorkspaceContext(contextRequest, context, {
       projectId,
       lastRun: null,
       scopeComponentId: null,
@@ -882,11 +927,11 @@ async function selectProject(projectId) {
       selectedTaskId: null,
       selectedProposalId: null,
       currentView: 'overview',
-    });
+    })) return false;
     state.onboarding.active = false;
     state.expandedProjectIds.add(projectId);
     persistExpandedProjectIds();
-    localStorage.setItem('archbro-project-id', projectId);
+    persistActiveProjectSelection(projectId);
     render();
     return true;
   } catch (err) {
@@ -907,13 +952,16 @@ async function refresh() {
     renderWorkspaceHome();
     return true;
   }
+  const projectId = state.projectId;
+  const contextRequest = beginWorkspaceContextRequest(projectId);
   try {
-    Object.assign(state, await loadProjectContext(state.projectId, {scopeComponentId: state.scopeComponentId}));
+    const context = await loadProjectContext(projectId, {scopeComponentId: state.scopeComponentId});
+    if (!commitWorkspaceContext(contextRequest, context, {}, {requireSelectedProject: true})) return false;
     render();
     return true;
   } catch (err) {
     if (String(err.message).startsWith('404:')) {
-      localStorage.removeItem('archbro-project-id');
+      clearActiveProjectSelection();
       state.projectId = null;
       state.project = null;
       await loadProjects();
@@ -1257,7 +1305,7 @@ async function confirmGoalAndGenerate() {
     $('onboardingAsk').value = '';
     state.projectId = project.id;
     state.expandedProjectIds.add(project.id);
-    localStorage.setItem('archbro-project-id', project.id);
+    persistActiveProjectSelection(project.id);
     state.project = project;
     state.lastRun = null;
     state.onboarding.active = false;
@@ -1291,6 +1339,8 @@ function openEditProject(trigger = document.activeElement) {
 
 async function saveProjectEdits() {
   if (!state.projectId) return;
+  const projectId = state.projectId;
+  const contextRequest = beginWorkspaceContextRequest(projectId);
   const body = {
     name: $('editProjectName').value.trim(),
     description: $('editProjectDescription').value.trim(),
@@ -1298,7 +1348,11 @@ async function saveProjectEdits() {
   if (!$('editProjectGoal').disabled) body.goal = $('editProjectGoal').value.trim();
   if (!body.name || (body.goal !== undefined && !body.goal)) return;
   try {
-    const updated = await api(`/projects/${state.projectId}`, {method: 'PATCH', body: JSON.stringify(body)});
+    const updated = await api(`/projects/${projectId}`, {method: 'PATCH', body: JSON.stringify(body)});
+    if (!isWorkspaceContextRequestCurrent(contextRequest, {requireSelectedProject: true})) {
+      await loadProjects();
+      return;
+    }
     state.project = updated;
     $('editProjectDialog').close();
     await loadProjects();
@@ -1319,9 +1373,19 @@ async function deleteCurrentProject() {
   if (!state.projectId) return;
   const deletedId = state.projectId;
   const deletedName = state.project?.name || 'Project';
+  const deleteRequest = beginWorkspaceContextRequest(deletedId);
   try {
-    await api(`/projects/${state.projectId}`, {method: 'DELETE'});
+    await api(`/projects/${deletedId}`, {method: 'DELETE'});
     $('deleteProjectDialog').close();
+    state.projectSnapshots.delete(deletedId);
+    state.expandedProjectIds.delete(deletedId);
+    persistExpandedProjectIds();
+    if (!isWorkspaceContextRequestCurrent(deleteRequest, {requireSelectedProject: true})) {
+      await loadProjects();
+      toast(`${deletedName} deleted.`);
+      return;
+    }
+    supersedeWorkspaceContextRequests();
     state.projectId = null;
     state.project = null;
     state.tasks = [];
@@ -1338,10 +1402,7 @@ async function deleteCurrentProject() {
     state.selectedComponentId = null;
     state.scopeComponentId = null;
     state.readingMode = 'MAP';
-    state.projectSnapshots.delete(deletedId);
-    state.expandedProjectIds.delete(deletedId);
-    persistExpandedProjectIds();
-    localStorage.removeItem('archbro-project-id');
+    clearActiveProjectSelection();
     await loadProjects();
     if (state.projects.length) {
       await selectProject(state.projects[0].id);
@@ -1474,6 +1535,7 @@ function renderAccountIdentity() {
 }
 
 function resetEphemeralSessionState() {
+  supersedeWorkspaceContextRequests();
   if (state.onboarding.workingTimer) clearInterval(state.onboarding.workingTimer);
   state.openProjectMenuId = null;
   state.projectMenuFocusId = null;
@@ -1553,6 +1615,7 @@ function resetEphemeralSessionState() {
 
 async function logout() {
   try {
+    supersedeWorkspaceContextRequests();
     await signOutFromFirebase();
     prototype.endSession(localStorage);
     state.experience.workspaceInitialized = false;
@@ -3389,6 +3452,17 @@ function normalizeInitialPlanningTrace(rawTrace, normalizedComponents) {
 }
 
 window.ArchBroWebBridge = {
+  getActiveProjectId() {
+    return state.projectId || null;
+  },
+
+  getActiveProjectBinding() {
+    return {
+      projectId: state.projectId || null,
+      generation: workspaceContextGeneration,
+    };
+  },
+
   async bootstrapProject({name, goal, architectureSummary, components = [], relationships = [], tasks = [], planningTrace, reasoning} = {}) {
     await ensureAppInitialized();
     const projectName = String(name || '').trim();
@@ -3436,10 +3510,11 @@ window.ArchBroWebBridge = {
 
     try {
       state.projectId = project.id;
-      localStorage.setItem('archbro-project-id', project.id);
+      persistActiveProjectSelection(project.id);
       state.project = project;
       state.lastRun = null;
       state.onboarding.active = false;
+      const bootstrapRequest = beginWorkspaceContextRequest(project.id);
       const result = await api(`/projects/${project.id}/interactive-initial-architecture`, {
         method: 'POST',
         body: JSON.stringify({
@@ -3450,12 +3525,24 @@ window.ArchBroWebBridge = {
         }),
       });
       await loadProjects();
-      await refresh();
+      const bootstrapStillSelected = isWorkspaceContextRequestCurrent(
+        bootstrapRequest,
+        {requireSelectedProject: true},
+      );
+      if (bootstrapStillSelected) await refresh();
       return {
-        project: state.project,
+        project,
         ...result,
         built_in_model_called: false,
-        context: webMcpContext(),
+        context: bootstrapStillSelected ? webMcpContext() : {
+          project,
+          view: 'overview',
+          architecture_version: result?.architecture?.version ?? 1,
+          selected_task: null,
+          selected_architecture_node: null,
+          selected_proposal: null,
+          pending_proposal_count: 0,
+        },
       };
     } catch (error) {
       try {
@@ -3463,11 +3550,14 @@ window.ArchBroWebBridge = {
       } catch (_cleanupError) {
         // Preserve the original bootstrap failure; cleanup is best-effort.
       }
-      state.projectId = previousProjectId || null;
-      if (previousProjectId) localStorage.setItem('archbro-project-id', previousProjectId);
-      else localStorage.removeItem('archbro-project-id');
       await loadProjects();
-      await refresh();
+      if (state.projectId === project.id) {
+        supersedeWorkspaceContextRequests();
+        state.projectId = previousProjectId || null;
+        if (previousProjectId) persistActiveProjectSelection(previousProjectId);
+        else clearActiveProjectSelection();
+        await refresh();
+      }
       throw error;
     }
   },
@@ -3522,8 +3612,9 @@ window.ArchBroWebBridge = {
       method: 'POST',
       body: JSON.stringify({name: projectName, goal: projectGoal, description: projectDescription}),
     });
+    supersedeWorkspaceContextRequests();
     state.projectId = project.id;
-    localStorage.setItem('archbro-project-id', project.id);
+    persistActiveProjectSelection(project.id);
     state.project = project;
     state.lastRun = null;
     state.onboarding.active = false;
@@ -4165,16 +4256,22 @@ async function initializeWorkspace() {
     const staleProjectId = state.projectId;
     if (state.projectId && !state.projects.some((project) => project.id === state.projectId)) {
       state.projectId = null;
-      localStorage.removeItem('archbro-project-id');
+      clearActiveProjectSelection();
       state.expandedProjectIds.delete(staleProjectId);
       persistExpandedProjectIds();
-      if (state.projects.length) {
-        state.expandedProjectIds.add(state.projects[0].id);
-        await selectProject(state.projects[0].id);
+      const fallbackProjectId = (
+        persistedProjectId
+        && persistedProjectId !== staleProjectId
+        && state.projects.some((project) => project.id === persistedProjectId)
+      ) ? persistedProjectId : state.projects[0]?.id;
+      if (fallbackProjectId) {
+        state.expandedProjectIds.add(fallbackProjectId);
+        await selectProject(fallbackProjectId);
         return true;
       }
     }
     if (state.projectId) {
+      persistActiveProjectSelection(state.projectId);
       state.onboarding.active = false;
       return (await refresh()) !== false;
     }

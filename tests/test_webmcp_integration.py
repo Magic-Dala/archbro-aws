@@ -1,4 +1,5 @@
 import copy
+import hashlib
 from pathlib import Path
 import re
 
@@ -80,13 +81,16 @@ def test_webmcp_ui_mode_is_explicit_but_site_tools_auto_register_on_the_normal_u
 
 def test_webmcp_asset_uses_current_imperative_document_model_context_surface(dsn):
     client = make_client(dsn)
+    root = Path(__file__).resolve().parents[1]
+    webmcp_asset = (root / "frontend" / "web" / "archbro-webmcp.js").read_bytes()
+    webmcp_version = hashlib.sha256(webmcp_asset.replace(b"\r\n", b"\n")).hexdigest()[:16]
 
     index = client.get("/")
     assert index.status_code == 200
     assert 'src="/runtime-config.js"' in index.text
     assert 'src="/static/firebase-auth-client.js?v=20260901-auth-providers"' in index.text
     assert 'type="module" src="/static/app.js?v=' in index.text
-    assert 'type="module" src="/static/archbro-webmcp.js?v=20260903-provider-bridge-v3"' in index.text
+    assert f'type="module" src="/static/archbro-webmcp.js?v={webmcp_version}"' in index.text
     assert index.headers["cache-control"] == "no-store, max-age=0"
 
     module = client.get("/static/archbro-webmcp.js")

@@ -357,6 +357,7 @@ class AgentRunResult(BaseModel):
     model: str
     result: Literal["SUCCESS", "ERROR"]
     error: str | None = None
+    context_telemetry: dict[str, Any] | None = None
     provider_usage: dict[str, Any] | None = None
     started_at: datetime = Field(default_factory=utcnow)
     completed_at: datetime = Field(default_factory=utcnow)
@@ -387,3 +388,15 @@ class ProjectContext(BaseModel):
     tasks: list[Task]
     pending_proposals: list[ArchitectureChangeProposal]
     recent_notes: list[str] = Field(default_factory=list)
+
+
+class AgentContextSnapshot(BaseModel):
+    """One repository-consistent read used to build a bounded Agent Context Manifest."""
+
+    project: Project
+    architecture: Architecture
+    tasks: list[Task] = Field(default_factory=list)
+    proposals: list[ArchitectureChangeProposal] = Field(default_factory=list)
+    events: list[ProjectEvent] = Field(default_factory=list)
+    event_history_truncated: bool = False
+    latest_code_architecture_event: ProjectEvent | None = None

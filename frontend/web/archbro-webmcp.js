@@ -4,7 +4,54 @@ const TOOL_PREFIX = 'archbro_';
 const WEBMCP_SURFACE_VERSION = 'archbro.semantic-webmcp.v4';
 const WEBMCP_MANIFEST_URL = '/webmcp-manifest.json';
 const WEBMCP_RUNTIME_CHECK_INTERVAL_MS = 10_000;
+const EXTERNAL_RESULT_INLINE_MAX_CHARS = 8_000;
+const EXTERNAL_RESULT_RECOVERY_CHARS = 6_000;
+const EXTERNAL_RESULT_RECOVERY_MAX_CHARS = 12_000;
+const EXTERNAL_RESULT_CACHE_SIZE = 8;
+let externalResultSequence = 0;
+const externalResultCache = new Map();
 let staleReloadScheduled = false;
+
+const WEBMCP_MODEL_TOOL_DESCRIPTIONS = {
+  [`${TOOL_PREFIX}ping`]: 'Check WebMCP build identity without mutation or model use.',
+  [`${TOOL_PREFIX}get_agent_context`]: 'Get project context or server-owned node preview.',
+  [`${TOOL_PREFIX}get_architecture_diagram`]: 'Read one canonical architecture scope with deterministic layout.',
+  [`${TOOL_PREFIX}publish_code_architecture`]: 'Publish revision-pinned implementation evidence only.',
+  [`${TOOL_PREFIX}get_code_architecture`]: 'Read the latest implementation-evidence snapshot.',
+  [`${TOOL_PREFIX}get_architecture_node_context`]: 'Read bounded authored upstream/downstream architecture context.',
+  [`${TOOL_PREFIX}find_architecture_path`]: 'Find a directed path through authored architecture relationships.',
+  [`${TOOL_PREFIX}bootstrap_project`]: 'Create Architecture v1 atomically with stable ids, planning trace, relationships and tasks.',
+  [`${TOOL_PREFIX}expand_architecture_scope`]: 'Propose one child level under an accepted component for human review.',
+  [`${TOOL_PREFIX}get_architecture_decision_context`]: 'Read accepted architecture and evidence for a governed decision.',
+  [`${TOOL_PREFIX}submit_architecture_recommendation`]: 'Submit evidence-backed architecture advice; changes remain pending human review.',
+  [`${TOOL_PREFIX}create_task`]: 'Create an implementation task without calling the built-in model.',
+  [`${TOOL_PREFIX}update_task_status`]: 'Start or complete one task deterministically.',
+  [`${TOOL_PREFIX}record_project_observation`]: 'Record external evidence without changing accepted architecture.',
+  [`${TOOL_PREFIX}list_connected_mcp_servers`]: 'List connected external MCP sources.',
+  [`${TOOL_PREFIX}list_connected_mcp_tools`]: 'List tools exposed by one connected MCP source.',
+  [`${TOOL_PREFIX}call_connected_mcp_tool`]: 'Call a connected MCP tool; large output uses result_ref.',
+};
+
+function compactInputSchemaForModel(value, {propertyMap = false} = {}) {
+  if (Array.isArray(value)) return value.map(compactInputSchemaForModel);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => propertyMap || key !== 'description')
+      .map(([key, nested]) => [
+        key,
+        compactInputSchemaForModel(nested, {propertyMap: !propertyMap && key === 'properties'}),
+      ]),
+  );
+}
+
+function compactToolForModel(tool) {
+  return {
+    ...tool,
+    description: WEBMCP_MODEL_TOOL_DESCRIPTIONS[tool.name] || tool.description,
+    inputSchema: compactInputSchemaForModel(tool.inputSchema),
+  };
+}
 
 async function fetchWebMcpManifest({signal} = {}) {
   const response = await fetch(WEBMCP_MANIFEST_URL, {
@@ -56,14 +103,165 @@ function asToolResult(value) {
   return JSON.stringify(value ?? null);
 }
 
-function activeProjectId() {
-  const projectId = globalThis.localStorage?.getItem('archbro-project-id')?.trim();
-  if (!projectId) throw new Error('No active ArchBro project is selected.');
-  return projectId;
+function externalResultCap(key = '') {
+  const normalized = String(key).toLowerCase();
+  if (normalized.includes('error') || normalized.includes('exception')) return 20;
+  if (normalized.includes('warning') || normalized.includes('failure') || normalized.includes('xfail')) return 10;
+  if (normalized.includes('inventory') || normalized.includes('package') || normalized.includes('dependency') || normalized.includes('image')) return 50;
+  return 20;
 }
 
-async function agentSurfaceApi(path, {method = 'GET', body, signal} = {}) {
+function compactExternalValue(value, key = 'result', depth = 0) {
+  if (typeof value === 'string') {
+    if (value.length <= 1_600) return value;
+    const head = value.slice(0, 1_200);
+    const tail = value.slice(-240);
+    return {
+      excerpt: `${head}\n… ${value.length - head.length - tail.length} chars omitted …\n${tail}`,
+      original_chars: value.length,
+      truncated: true,
+    };
+  }
+  if (Array.isArray(value)) {
+    const cap = externalResultCap(key);
+    const items = value.slice(0, cap).map((item) => compactExternalValue(item, key, depth + 1));
+    if (value.length <= cap) return items;
+    return {items, shown: items.length, total: value.length, overflow_count: value.length - items.length, truncated: true};
+  }
+  if (!value || typeof value !== 'object') return value;
+  if (depth >= 6) return {summary: '[nested result omitted]', truncated: true};
+  return Object.fromEntries(
+    Object.entries(value).map(([nestedKey, nestedValue]) => [nestedKey, compactExternalValue(nestedValue, nestedKey, depth + 1)]),
+  );
+}
+
+function rememberExternalResult(raw, {serverId, toolName}) {
+  const ref = `webmcp-result:${Date.now().toString(36)}:${++externalResultSequence}`;
+  externalResultCache.set(ref, {raw, serverId, toolName});
+  while (externalResultCache.size > EXTERNAL_RESULT_CACHE_SIZE) {
+    externalResultCache.delete(externalResultCache.keys().next().value);
+  }
+  return ref;
+}
+
+function readCachedExternalResult({resultRef, serverId, toolName, offset = 0, maxChars = EXTERNAL_RESULT_RECOVERY_CHARS}) {
+  const cached = externalResultCache.get(resultRef);
+  if (!cached || cached.serverId !== serverId || cached.toolName !== toolName) {
+    throw new Error('Connected MCP result_ref is missing, expired, or belongs to a different tool.');
+  }
+  const start = Math.max(0, Number.isFinite(Number(offset)) ? Math.trunc(Number(offset)) : 0);
+  const requested = Number.isFinite(Number(maxChars)) ? Math.trunc(Number(maxChars)) : EXTERNAL_RESULT_RECOVERY_CHARS;
+  const size = Math.max(1, Math.min(EXTERNAL_RESULT_RECOVERY_MAX_CHARS, requested));
+  const content = cached.raw.slice(start, start + size);
+  const nextOffset = start + content.length;
+  return {
+    schema: 'archbro.bounded_result_slice.v1',
+    full_result_ref: resultRef,
+    server_id: serverId,
+    tool_name: toolName,
+    offset: start,
+    next_offset: nextOffset,
+    complete: nextOffset >= cached.raw.length,
+    total_chars: cached.raw.length,
+    content,
+  };
+}
+
+function boundedConnectedMcpResult(payload, {serverId, toolName}) {
+  const raw = typeof payload === 'string' ? payload : JSON.stringify(payload ?? null);
+  if (raw.length <= EXTERNAL_RESULT_INLINE_MAX_CHARS) return payload;
+
+  const fullResultRef = rememberExternalResult(raw, {serverId, toolName});
+  let compacted = compactExternalValue(payload);
+  let compactedJson = typeof compacted === 'string' ? compacted : JSON.stringify(compacted);
+  if (compactedJson.length > EXTERNAL_RESULT_INLINE_MAX_CHARS - 1_000) {
+    const head = compactedJson.slice(0, EXTERNAL_RESULT_INLINE_MAX_CHARS - 2_000);
+    const tail = compactedJson.slice(-600);
+    compacted = {
+      excerpt: `${head}\n… ${compactedJson.length - head.length - tail.length} compacted chars omitted …\n${tail}`,
+      truncated: true,
+    };
+    compactedJson = JSON.stringify(compacted);
+  }
+  return {
+    schema: 'archbro.bounded_result.v1',
+    classification: 'EXTERNAL_EVIDENCE',
+    canonical_state_mutated: false,
+    summary: `Connected MCP result bounded from ${raw.length} chars to ${compactedJson.length} chars.`,
+    result: compacted,
+    truncated: true,
+    original_chars: raw.length,
+    full_result_ref: fullResultRef,
+    recovery: {server_id: serverId, tool_name: toolName, offset: 0, max_chars: EXTERNAL_RESULT_RECOVERY_CHARS},
+  };
+}
+
+function compactCodeArchitectureForTool(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const compactSource = (source) => {
+    if (!source || typeof source !== 'object') return source;
+    const {excerpt: _excerpt, ...reference} = source;
+    return reference;
+  };
+  const diagram = payload.diagram && typeof payload.diagram === 'object'
+    ? {
+        ...payload.diagram,
+        nodes: Array.isArray(payload.diagram.nodes)
+          ? payload.diagram.nodes.map((node) => ({
+              ...node,
+              sources: Array.isArray(node.sources) ? node.sources.map(compactSource) : node.sources,
+            }))
+          : payload.diagram.nodes,
+        edges: Array.isArray(payload.diagram.edges)
+          ? payload.diagram.edges.map((edge) => ({
+              ...edge,
+              sources: Array.isArray(edge.sources) ? edge.sources.map(compactSource) : edge.sources,
+            }))
+          : payload.diagram.edges,
+      }
+    : payload.diagram;
+  return {...payload, diagram};
+}
+
+function activeProjectBinding() {
+  const bridgeBinding = globalThis.window?.ArchBroWebBridge?.getActiveProjectBinding?.();
+  if (bridgeBinding && typeof bridgeBinding.projectId === 'string' && bridgeBinding.projectId.trim()) {
+    return {
+      projectId: bridgeBinding.projectId.trim(),
+      generation: Number.isInteger(bridgeBinding.generation) ? bridgeBinding.generation : null,
+      source: 'bridge',
+    };
+  }
+  const bridgeProjectId = globalThis.window?.ArchBroWebBridge?.getActiveProjectId?.();
+  if (typeof bridgeProjectId === 'string' && bridgeProjectId.trim()) {
+    return {projectId: bridgeProjectId.trim(), generation: null, source: 'bridge'};
+  }
+  const requestedProjectId = new URLSearchParams(globalThis.location?.search || '').get('project')?.trim();
+  if (requestedProjectId) return {projectId: requestedProjectId, generation: null, source: 'url'};
+  const storedProjectId = globalThis.localStorage?.getItem('archbro-project-id')?.trim();
+  if (storedProjectId) return {projectId: storedProjectId, generation: null, source: 'storage'};
+  throw new Error('No active ArchBro project is selected.');
+}
+
+function activeProjectId() {
+  return activeProjectBinding().projectId;
+}
+
+function assertActiveProjectBinding(binding) {
+  if (!binding || binding.source !== 'bridge' || binding.generation === null) return;
+  const current = globalThis.window?.ArchBroWebBridge?.getActiveProjectBinding?.();
+  if (
+    !current
+    || current.projectId !== binding.projectId
+    || current.generation !== binding.generation
+  ) {
+    throw new Error('Active ArchBro project changed while the tool request was being prepared. Retry against the project currently on screen.');
+  }
+}
+
+async function agentSurfaceApi(path, {method = 'GET', body, signal, projectBinding} = {}) {
   const token = await getFirebaseIdToken();
+  if (projectBinding) assertActiveProjectBinding(projectBinding);
   const response = await fetch(path, {
     method,
     signal,
@@ -77,7 +275,8 @@ async function agentSurfaceApi(path, {method = 'GET', body, signal} = {}) {
     let detail = 'ArchBro agent surface request failed';
     try {
       const payload = await response.json();
-      detail = payload.detail || JSON.stringify(payload);
+      const rawDetail = payload.detail ?? payload;
+      detail = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
     } catch {}
     throw new Error(`${response.status}: ${detail}`);
   }
@@ -135,9 +334,52 @@ function mergeProviderConnectionsIntoAgentContext(context, connections) {
   };
 }
 
-async function getAgentContext({signal} = {}) {
-  const projectId = activeProjectId();
-  const context = await agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/agent-context`, {signal});
+function agentContextExecutionRequest(manifest) {
+  const selection = manifest?.selection || {};
+  if (
+    manifest?.schema !== 'archbro.agent_context_manifest.v1'
+    || !selection.node_id
+    || !selection.direction
+    || !selection.expansion_policy
+    || !Number.isInteger(manifest.architecture_version)
+    || !/^[0-9a-f]{64}$/i.test(String(manifest.manifest_hash || ''))
+  ) {
+    throw new Error('Server returned an invalid bounded Agent Context Manifest.');
+  }
+  return {
+    node_id: selection.node_id,
+    direction: selection.direction,
+    expansion_policy: selection.expansion_policy,
+    expected_architecture_version: manifest.architecture_version,
+    preview_manifest_hash: manifest.manifest_hash,
+  };
+}
+
+async function getAgentContext({nodeId, expectedArchitectureVersion, signal} = {}) {
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
+  if (nodeId) {
+    if (!Number.isInteger(expectedArchitectureVersion) || expectedArchitectureVersion < 1) {
+      throw new Error('expected_architecture_version >= 1 is required for bounded Agent Context preview.');
+    }
+    const manifest = await agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/agent-context/manifest`, {
+      method: 'POST',
+      body: {
+        node_id: nodeId,
+        direction: 'both',
+        expansion_policy: 'ASK_ALL',
+        expected_architecture_version: expectedArchitectureVersion,
+      },
+      signal,
+      projectBinding,
+    });
+    return {
+      mode: 'BOUNDED_NODE',
+      manifest,
+      agent_context_request: agentContextExecutionRequest(manifest),
+    };
+  }
+  const context = await agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/agent-context`, {signal, projectBinding});
   let providerConnections = [];
   try {
     providerConnections = await listAuthorizedProviderConnections({signal});
@@ -318,17 +560,19 @@ function expansionChildInputSchema() {
 }
 
 async function getScopedDiagram({scopeComponentId, expectedArchitectureVersion, signal} = {}) {
-  const projectId = activeProjectId();
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
   const suffix = querySuffix([
     ['scope', scopeComponentId],
     ['expected_architecture_version', expectedArchitectureVersion],
   ]);
-  return agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/architecture/diagram${suffix}`, {signal});
+  return agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/architecture/diagram${suffix}`, {signal, projectBinding});
 }
 
 async function publishCodeArchitectureSnapshot({repository, revision, summary, components, relationships, sourceEvidence, signal} = {}) {
-  const projectId = activeProjectId();
-  return agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/code-architecture/snapshots`, {
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
+  const payload = await agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/code-architecture/snapshots`, {
     method: 'POST',
     body: {
       repository,
@@ -339,16 +583,21 @@ async function publishCodeArchitectureSnapshot({repository, revision, summary, c
       source_evidence: sourceEvidence,
     },
     signal,
+    projectBinding,
   });
+  return compactCodeArchitectureForTool(payload);
 }
 
 async function getLatestCodeArchitectureSnapshot({signal} = {}) {
-  const projectId = activeProjectId();
-  return agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/code-architecture/latest`, {signal});
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
+  const payload = await agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/code-architecture/latest`, {signal, projectBinding});
+  return compactCodeArchitectureForTool(payload);
 }
 
 async function getNodeContext({nodeId, direction, maxHops, maxResults, expectedArchitectureVersion, signal} = {}) {
-  const projectId = activeProjectId();
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
   const suffix = querySuffix([
     ['direction', direction],
     ['max_hops', maxHops],
@@ -357,30 +606,33 @@ async function getNodeContext({nodeId, direction, maxHops, maxResults, expectedA
   ]);
   return agentSurfaceApi(
     `/projects/${encodeURIComponent(projectId)}/architecture/nodes/${encodeURIComponent(nodeId)}/context${suffix}`,
-    {signal},
+    {signal, projectBinding},
   );
 }
 
 async function findArchitecturePath({sourceId, targetId, maxHops, expectedArchitectureVersion, signal} = {}) {
-  const projectId = activeProjectId();
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
   const suffix = querySuffix([
     ['source_id', sourceId],
     ['target_id', targetId],
     ['max_hops', maxHops],
     ['expected_architecture_version', expectedArchitectureVersion],
   ]);
-  return agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/architecture/path${suffix}`, {signal});
+  return agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/architecture/path${suffix}`, {signal, projectBinding});
 }
 
 async function listConnectedMcpServers(bridge, {signal} = {}) {
   if (hasBridgeMethod(bridge, 'listConnectedMcpServers')) {
     return bridge.listConnectedMcpServers({signal});
   }
-  const projectId = activeProjectId();
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
   const [projectSources, providerConnections] = await Promise.all([
-    agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/mcp/servers`, {signal}),
+    agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/mcp/servers`, {signal, projectBinding}),
     listAuthorizedProviderConnections({signal}),
   ]);
+  assertActiveProjectBinding(projectBinding);
   const servers = [...(projectSources?.servers || [])];
   const ids = new Set(servers.map((server) => server.id));
   for (const connection of providerConnections) {
@@ -393,10 +645,12 @@ async function listConnectedMcpTools(bridge, {serverId, signal} = {}) {
   if (hasBridgeMethod(bridge, 'listConnectedMcpTools')) {
     return bridge.listConnectedMcpTools({serverId, signal});
   }
-  const projectId = activeProjectId();
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
   const providerConnection = await providerConnectionById(serverId, {signal});
+  assertActiveProjectBinding(projectBinding);
   if (providerConnection) {
-    const result = await agentSurfaceApi(`/mcp/connections/${encodeURIComponent(serverId)}/tools`, {signal});
+    const result = await agentSurfaceApi(`/mcp/connections/${encodeURIComponent(serverId)}/tools`, {signal, projectBinding});
     return {
       project_id: projectId,
       server_id: serverId,
@@ -407,34 +661,40 @@ async function listConnectedMcpTools(bridge, {serverId, signal} = {}) {
   }
   return agentSurfaceApi(
     `/projects/${encodeURIComponent(projectId)}/mcp/servers/${encodeURIComponent(serverId)}/tools`,
-    {signal},
+    {signal, projectBinding},
   );
 }
 
-async function callConnectedMcpTool(bridge, {serverId, toolName, arguments: args = {}, signal} = {}) {
+async function callConnectedMcpTool(bridge, {serverId, toolName, arguments: args = {}, resultRef, offset = 0, maxChars = EXTERNAL_RESULT_RECOVERY_CHARS, signal} = {}) {
+  if (resultRef) return readCachedExternalResult({resultRef, serverId, toolName, offset, maxChars});
+
   if (hasBridgeMethod(bridge, 'callConnectedMcpTool')) {
-    return bridge.callConnectedMcpTool({serverId, toolName, arguments: args, signal});
+    const result = await bridge.callConnectedMcpTool({serverId, toolName, arguments: args, signal});
+    return boundedConnectedMcpResult(result, {serverId, toolName});
   }
-  const projectId = activeProjectId();
+  const projectBinding = activeProjectBinding();
+  const projectId = projectBinding.projectId;
   const providerConnection = await providerConnectionById(serverId, {signal});
+  assertActiveProjectBinding(projectBinding);
   if (providerConnection) {
     const result = await agentSurfaceApi(
       `/mcp/connections/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(toolName)}`,
-      {method: 'POST', body: {arguments: args}, signal},
+      {method: 'POST', body: {arguments: args}, signal, projectBinding},
     );
-    return {
+    return boundedConnectedMcpResult({
       project_id: projectId,
       server_id: serverId,
       tool_name: toolName,
       result,
       classification: 'EXTERNAL_EVIDENCE',
       canonical_state_mutated: false,
-    };
+    }, {serverId, toolName});
   }
-  return agentSurfaceApi(
+  const result = await agentSurfaceApi(
     `/projects/${encodeURIComponent(projectId)}/mcp/servers/${encodeURIComponent(serverId)}/call`,
-    {method: 'POST', body: {tool_name: toolName, arguments: args}, signal},
+    {method: 'POST', body: {tool_name: toolName, arguments: args}, signal, projectBinding},
   );
+  return boundedConnectedMcpResult(result, {serverId, toolName});
 }
 
 function createCoreTools(bridge) {
@@ -471,10 +731,21 @@ function createCoreTools(bridge) {
     {
       name: `${TOOL_PREFIX}get_agent_context`,
       title: 'Get compact ArchBro agent context',
-      description: 'Bootstrap an agent with a compact Markdown map of the selected project, current execution focus, governance rules, and connected external MCP sources. Use this before broad project or source reads.',
-      inputSchema: {type: 'object', properties: {}, additionalProperties: false},
+      description: 'Without node_id, bootstrap with the existing compact project map. With node_id and expected_architecture_version, preview the server-owned bounded Agent Context Manifest and return the exact agent_context_request (including preview_manifest_hash) required to execute against the same context. The client never rebuilds or traverses context itself.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          node_id: {type: 'string', pattern: '^node:.+', description: 'Stable canonical node ID for bounded context. Omit for the existing project-level compact context.'},
+          expected_architecture_version: {type: 'integer', minimum: 1, description: 'Required with node_id; the server fails stale versions closed.'},
+        },
+        additionalProperties: false,
+      },
       annotations: {readOnlyHint: true, untrustedContentHint: true},
-      execute: async (_input, client = {}) => asToolResult(await getAgentContext({signal: client.signal})),
+      execute: async ({node_id, expected_architecture_version}, client = {}) => asToolResult(await getAgentContext({
+        nodeId: node_id,
+        expectedArchitectureVersion: expected_architecture_version,
+        signal: client.signal,
+      })),
     },
     {
       name: `${TOOL_PREFIX}get_architecture_diagram`,
@@ -535,7 +806,7 @@ function createCoreTools(bridge) {
     {
       name: `${TOOL_PREFIX}find_architecture_path`,
       title: 'Find directed authored architecture path',
-      description: 'Find a deterministic shortest directed path using only current canonical authored Architecture relationships.',
+      description: 'Call the canonical backend Architecture path query and return its authored FOUND, UNREACHABLE, or LIMIT_REACHED result unchanged. A stale expected_architecture_version remains a server 409; no client path traversal is substituted.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -569,6 +840,7 @@ function createCoreTools(bridge) {
           },
           relationships: {
             type: 'array',
+            description: 'Explicit interactions authored during RECONCILE. A plan with multiple atomic components must include relationships between distinct components. Do not omit interactions, substitute self-links, or invent containment dependencies.',
             items: {
               type: 'object',
               properties: {
@@ -740,10 +1012,10 @@ function createConnectedMcpTools(bridge) {
     {
       name: `${TOOL_PREFIX}call_connected_mcp_tool`,
       title: 'Call connected MCP tool',
-      description: 'Call one tool from an MCP source returned by list_connected_mcp_servers. Provider output is external evidence and is not automatically written into ArchBro canonical state.',
-      inputSchema: {type: 'object', properties: {server_id: {type: 'string', minLength: 1}, tool_name: {type: 'string', minLength: 1}, arguments: {type: 'object', additionalProperties: true}}, required: ['server_id', 'tool_name'], additionalProperties: false},
+      description: 'Call one tool from an MCP source returned by list_connected_mcp_servers. Provider output is external evidence, not canonical state. Large results return full_result_ref; pass it as result_ref with offset/max_chars to recover only the needed slice without calling the provider again.',
+      inputSchema: {type: 'object', properties: {server_id: {type: 'string', minLength: 1}, tool_name: {type: 'string', minLength: 1}, arguments: {type: 'object', additionalProperties: true}, result_ref: {type: 'string', minLength: 1}, offset: {type: 'integer', minimum: 0}, max_chars: {type: 'integer', minimum: 1, maximum: 12000}}, required: ['server_id', 'tool_name'], additionalProperties: false},
       annotations: {readOnlyHint: false, untrustedContentHint: true},
-      execute: async ({server_id, tool_name, arguments: args = {}}, client = {}) => asToolResult(await callConnectedMcpTool(bridge, {serverId: server_id, toolName: tool_name, arguments: args, signal: client.signal})),
+      execute: async ({server_id, tool_name, arguments: args = {}, result_ref, offset = 0, max_chars = EXTERNAL_RESULT_RECOVERY_CHARS}, client = {}) => asToolResult(await callConnectedMcpTool(bridge, {serverId: server_id, toolName: tool_name, arguments: args, resultRef: result_ref, offset, maxChars: max_chars, signal: client.signal})),
     },
   ];
 }
@@ -753,9 +1025,10 @@ function connectedMcpGatewayConfigured() {
 }
 
 export function createArchBroTools(bridge, {includeConnectedMcp = true} = {}) {
-  return includeConnectedMcp
+  const tools = includeConnectedMcp
     ? [...createCoreTools(bridge), ...createConnectedMcpTools(bridge)]
     : createCoreTools(bridge);
+  return tools.map(compactToolForModel);
 }
 
 function resolveModelContext(modelContext) {

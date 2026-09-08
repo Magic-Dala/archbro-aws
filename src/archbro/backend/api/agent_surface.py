@@ -4,11 +4,16 @@ import hashlib
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from archbro.backend.agent.code_architecture import (
     CodeArchitectureSnapshotRequest,
     build_code_architecture_snapshot,
+    build_code_truth_impact,
+)
+from archbro.backend.agent.context_manifest import (
+    AgentContextManifestRequest,
+    build_agent_context_manifest,
 )
 from archbro.backend.agent.context_projection import build_agent_context
 from archbro.backend.agent.node_context import (
@@ -191,6 +196,27 @@ def build_agent_surface_router(
     executor = ActionExecutor(repository)
     router = APIRouter()
 
+    def _load_stored_code_architecture(
+        project_id: str,
+    ) -> tuple[ProjectEvent, CodeArchitectureSnapshotRequest] | None:
+        event = repository.get_latest_event_by_type(
+            project_id,
+            ProjectEventType.CODE_ARCHITECTURE_SNAPSHOT,
+        )
+        if event is None:
+            return None
+        raw_request = event.payload.get("request")
+        if not isinstance(raw_request, dict):
+            raise HTTPException(status_code=500, detail="stored Code Architecture snapshot is invalid")
+        try:
+            snapshot_request = CodeArchitectureSnapshotRequest.model_validate(raw_request)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="stored Code Architecture snapshot is invalid",
+            ) from exc
+        return event, snapshot_request
+
     @router.get("/projects/{project_id}/agent-context")
     async def get_agent_context(project_id: str, http_request: Request):
         await authorized_project(http_request, project_id, ProjectPermission.READ)
@@ -199,6 +225,20 @@ def build_agent_surface_router(
             project_id,
             connected_sources=gateway.list_servers(project_id),
         )
+
+    @router.post("/projects/{project_id}/agent-context/manifest")
+    async def preview_agent_context_manifest(
+        project_id: str,
+        request: AgentContextManifestRequest,
+        http_request: Request,
+    ):
+        await authorized_project(http_request, project_id, ProjectPermission.READ)
+        try:
+            return build_agent_context_manifest(repository, project_id, request)
+        except (ArchitectureNodeNotFoundError, StaleArchitectureVersionError) as exc:
+            raise _architecture_query_http_error(exc)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     @router.post("/projects/{project_id}/tasks")
     async def create_agent_task(
@@ -407,7 +447,8 @@ def build_agent_surface_router(
         # READ authorization is sufficient because no provider or ArchBro state is mutated.
         await authorized_project(http_request, project_id, ProjectPermission.READ)
         repository.get_project(project_id)
-        return build_code_architecture_snapshot(project_id, request)
+        architecture = repository.get_architecture(project_id)
+        return build_code_architecture_snapshot(project_id, request, architecture=architecture)
 
     @router.post("/projects/{project_id}/code-architecture/snapshots")
     async def publish_repository_code_architecture(
@@ -417,6 +458,15 @@ def build_agent_surface_router(
     ):
         await authorized_project(http_request, project_id, ProjectPermission.WRITE)
         repository.get_project(project_id)
+        architecture = repository.get_architecture(project_id)
+        try:
+            snapshot = build_code_architecture_snapshot(
+                project_id,
+                request,
+                architecture=architecture,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         canonical_request = request.model_dump_json()
         digest = hashlib.sha256(f"{project_id}\x1f{canonical_request}".encode("utf-8")).hexdigest()
         event = ProjectEvent(
@@ -431,7 +481,6 @@ def build_agent_surface_router(
             },
         )
         repository.save_event(event)
-        snapshot = build_code_architecture_snapshot(project_id, request)
         return {
             **snapshot,
             "derived_artifact_persisted": True,
@@ -443,26 +492,55 @@ def build_agent_surface_router(
     async def get_latest_repository_code_architecture(project_id: str, http_request: Request):
         await authorized_project(http_request, project_id, ProjectPermission.READ)
         repository.get_project(project_id)
-        event = repository.get_latest_event_by_type(
-            project_id,
-            ProjectEventType.CODE_ARCHITECTURE_SNAPSHOT,
-        )
-        if event is not None:
-            raw_request = event.payload.get("request")
-            if isinstance(raw_request, dict):
-                try:
-                    snapshot_request = CodeArchitectureSnapshotRequest.model_validate(raw_request)
-                except ValueError:
-                    snapshot_request = None
-                if snapshot_request is not None:
-                    snapshot = build_code_architecture_snapshot(project_id, snapshot_request)
-                    return {
-                        **snapshot,
-                        "derived_artifact_persisted": True,
-                        "event_id": event.id,
-                        "published_at": event.timestamp.isoformat(),
-                    }
-        return Response(status_code=204)
+        architecture = repository.get_architecture(project_id)
+        loaded = _load_stored_code_architecture(project_id)
+        if loaded is None:
+            return Response(status_code=204)
+        event, snapshot_request = loaded
+        try:
+            snapshot = build_code_architecture_snapshot(
+                project_id,
+                snapshot_request,
+                architecture=architecture,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail="stored Code Architecture snapshot is invalid") from exc
+        return {
+            **snapshot,
+            "derived_artifact_persisted": True,
+            "event_id": event.id,
+            "published_at": event.timestamp.isoformat(),
+        }
+
+    @router.get("/projects/{project_id}/code-architecture/symbols/{symbol_id}/impact")
+    async def get_code_truth_symbol_impact(
+        project_id: str,
+        symbol_id: str,
+        http_request: Request,
+        direction: Literal["callers", "callees", "both"] = "callers",
+        max_hops: int = Query(default=2, ge=1, le=5),
+        max_results: int = Query(default=40, ge=1, le=100),
+    ):
+        await authorized_project(http_request, project_id, ProjectPermission.READ)
+        repository.get_project(project_id)
+        loaded = _load_stored_code_architecture(project_id)
+        if loaded is None:
+            raise HTTPException(status_code=404, detail="no Code Architecture snapshot is published")
+        _event, snapshot_request = loaded
+        try:
+            return build_code_truth_impact(
+                project_id,
+                snapshot_request,
+                symbol_id,
+                direction=direction,
+                max_hops=max_hops,
+                max_results=max_results,
+                architecture=repository.get_architecture(project_id),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "symbol not found" in message or "no verified Code Truth" in message else 409
+            raise HTTPException(status_code=status_code, detail=message)
 
     @router.get("/projects/{project_id}/architecture/nodes/{node_id}/context")
     async def get_architecture_node_context(

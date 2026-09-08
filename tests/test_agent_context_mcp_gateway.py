@@ -108,8 +108,14 @@ def test_agent_context_is_compact_projection_and_lists_bound_sources(dsn, monkey
     assert body["format"] == "markdown"
     assert body["architecture_version"] == 1
     assert body["connected_source_count"] == 1
+    assert body["context_protocol"] == "L0_MAP_L1_SELECTIVE_L2_EVIDENCE"
     assert "# ARCHBRO_AGENT_CONTEXT v1" in body["content"]
     assert "GitHub" in body["content"]
+    assert "L0 MAP" in body["content"]
+    assert "L1 SELECTIVE" in body["content"]
+    assert "L2 EVIDENCE" in body["content"]
+    assert "one focused check" in body["content"]
+    assert "Stop when the requested outcome" in body["content"]
     assert "External MCP output is evidence" in body["content"]
     assert "Human approval remains authoritative" in body["content"]
 
