@@ -84,9 +84,44 @@ def _relationship_category(semantic_type: str) -> DiagramRelationshipCategory:
         return DiagramRelationshipCategory.DELIVERY
     if any(stem in normalized for stem in ("SUBSCRIB", "PUBLISH", "CONSUM", "EMIT", "FANOUT", "EVENT", "STREAM", "NOTIFY", "BROADCAST")):
         return DiagramRelationshipCategory.EVENT
-    if any(stem in normalized for stem in ("PERSIST", "READ", "WRITE", "STORE", "APPEND", "QUERY", "SCHEMA", "DATABASE")):
+    if any(
+        stem in normalized
+        for stem in (
+            "PERSIST",
+            "READ",
+            "WRITE",
+            "STORE",
+            "APPEND",
+            "QUERY",
+            "SCHEMA",
+            "DATABASE",
+            "SQL",
+            "CACHE",
+            "INDEX",
+        )
+    ):
         return DiagramRelationshipCategory.DATA
-    if any(stem in normalized for stem in ("CALL", "INVOK", "COMMAND", "REQUEST", "DISPATCH", "SEND", "RECEIVE", "CONNECT", "UPDATE", "TRIGGER", "ROUTE", "DELEGAT")):
+    if any(
+        stem in normalized
+        for stem in (
+            "CALL",
+            "INVOK",
+            "COMMAND",
+            "REQUEST",
+            "DISPATCH",
+            "SEND",
+            "RECEIVE",
+            "CONNECT",
+            "UPDATE",
+            "TRIGGER",
+            "ROUTE",
+            "DELEGAT",
+            "HTTP",
+            "RPC",
+            "REST",
+            "WEBSOCKET",
+        )
+    ):
         return DiagramRelationshipCategory.FLOW
     return DiagramRelationshipCategory.SUPPORT
 
@@ -137,6 +172,7 @@ class DiagramEdge(BaseModel):
     source: str
     target: str
     semantic_type: str
+    relationship_category: DiagramRelationshipCategory = DiagramRelationshipCategory.SUPPORT
     label: str
     supporting_text: str = ""
     projection_kind: DiagramEdgeProjectionKind = DiagramEdgeProjectionKind.AUTHORED
@@ -570,6 +606,7 @@ def _authored_edge(record: _AuthoredRelationship) -> DiagramEdge:
         source=_node_id(relationship.source),
         target=_node_id(relationship.target),
         semantic_type=relationship.relationship_type,
+        relationship_category=_relationship_category(relationship.relationship_type),
         label=relationship.relationship_type,
         supporting_text=relationship.description,
         projection_kind=DiagramEdgeProjectionKind.AUTHORED,
@@ -660,6 +697,7 @@ def _project_edges(
                 source=source_node_id,
                 target=target_node_id,
                 semantic_type=semantic_type,
+                relationship_category=_relationship_category(semantic_type),
                 label=label,
                 supporting_text="",
                 projection_kind=DiagramEdgeProjectionKind.DERIVED_CROSSING,
@@ -707,21 +745,6 @@ def project_diagram(
         nodes=nodes,
         edges=edges,
     )
-
-
-def _external_representative(
-    *,
-    scope_path: tuple[str, ...],
-    endpoint_path: tuple[str, ...],
-) -> str:
-    common = 0
-    for left, right in zip(scope_path, endpoint_path):
-        if left != right:
-            break
-        common += 1
-    if common < len(endpoint_path):
-        return endpoint_path[common]
-    return endpoint_path[-1]
 
 
 def project_scoped_diagram(

@@ -83,11 +83,15 @@ def save_hierarchical_fixture(repository: PostgresProjectRepository) -> Project:
     return project
 
 
-def assert_matching_graph_contracts(body: dict) -> None:
+def assert_matching_graph_contracts(
+    body: dict,
+    *,
+    expected_layout_version: str = "archbro.layout.v1",
+) -> None:
     diagram = body["diagram"]
     positioned = body["positioned_graph"]
     assert diagram["diagram_version"] == "archbro.diagram.v1"
-    assert positioned["layout_version"] == "archbro.layout.v1"
+    assert positioned["layout_version"] == expected_layout_version
     assert diagram["architecture_version"] == positioned["architecture_version"]
     assert {node["id"] for node in diagram["nodes"]} == {node["node_id"] for node in positioned["nodes"]}
     assert {edge["id"] for edge in diagram["edges"]} == {edge["edge_id"] for edge in positioned["edges"]}
@@ -113,6 +117,101 @@ def test_architecture_diagram_endpoint_returns_frozen_root_envelope_and_layout(d
     }
     assert [node["component_id"] for node in body["diagram"]["nodes"]] == ["backend", "data", "external", "web"]
     assert_matching_graph_contracts(body)
+
+
+def test_architecture_canvas_endpoint_returns_complete_hierarchy_and_authored_relationships(dsn):
+    repository, client = make_client(dsn)
+    project = save_hierarchical_fixture(repository)
+
+    response = client.get(f"/projects/{project.id}/architecture/canvas")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert set(body) == {
+        "schema",
+        "project_id",
+        "architecture_version",
+        "diagram",
+        "positioned_graph",
+        "group_frames",
+        "reading_views",
+        "connection_summaries",
+        "presentation",
+        "work_budget",
+    }
+    assert body["schema"] == "archbro.full_canvas.v1"
+    assert body["project_id"] == project.id
+    assert body["architecture_version"] == 9
+    assert [node["component_id"] for node in body["diagram"]["nodes"]] == [
+        "backend",
+        "api",
+        "validator",
+        "worker",
+        "data",
+        "db",
+        "external",
+        "search",
+        "web",
+        "ui",
+    ]
+    assert len(body["diagram"]["edges"]) == 5
+    by_component = {node["component_id"]: node for node in body["diagram"]["nodes"]}
+    assert by_component["api"]["parent_id"] == "node:backend"
+    assert by_component["validator"]["parent_id"] == "node:api"
+    assert by_component["ui"]["parent_id"] == "node:web"
+    assert {frame["node_id"] for frame in body["group_frames"]} == {
+        "node:backend",
+        "node:api",
+        "node:data",
+        "node:external",
+        "node:web",
+    }
+    assert body["reading_views"][0]["id"] == "backbone"
+    assert body["reading_views"][0]["kind"] == "STRUCTURAL_SUMMARY"
+    assert body["connection_summaries"]["schema"] == "archbro.connection-summaries.v1"
+    assert body["connection_summaries"]["architecture_version"] == 9
+    assert body["presentation"] is None
+    assert set(body["work_budget"]).issubset(
+        {"pair_evaluations", "route_candidates", "route_expansions", "summary_candidates"}
+    )
+    assert all(value > 0 for value in body["work_budget"].values())
+    assert_matching_graph_contracts(
+        body, expected_layout_version="archbro.canvas-layout.v10"
+    )
+
+
+def test_architecture_canvas_endpoint_map_mode_only_filters_edges_not_nodes(dsn):
+    repository, client = make_client(dsn)
+    project = save_hierarchical_fixture(repository)
+
+    full = client.get(f"/projects/{project.id}/architecture/canvas", params={"reading_mode": "FULL"}).json()
+    mapped = client.get(f"/projects/{project.id}/architecture/canvas", params={"reading_mode": "MAP"}).json()
+
+    assert [node["id"] for node in mapped["diagram"]["nodes"]] == [node["id"] for node in full["diagram"]["nodes"]]
+    assert [node["node_id"] for node in mapped["positioned_graph"]["nodes"]] == [
+        node["node_id"] for node in full["positioned_graph"]["nodes"]
+    ]
+    assert len(mapped["diagram"]["edges"]) <= len(full["diagram"]["edges"])
+    assert_matching_graph_contracts(
+        mapped, expected_layout_version="archbro.canvas-layout.v10"
+    )
+
+
+def test_architecture_canvas_endpoint_rejects_stale_expected_version(dsn):
+    repository, client = make_client(dsn)
+    project = save_hierarchical_fixture(repository)
+
+    response = client.get(
+        f"/projects/{project.id}/architecture/canvas",
+        params={"expected_architecture_version": 8},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "stale_architecture_version",
+        "expected_architecture_version": 8,
+        "current_architecture_version": 9,
+    }
 
 
 def test_architecture_diagram_scoped_route_returns_one_depth_and_boundary_provenance(dsn):

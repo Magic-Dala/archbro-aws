@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import heapq
+import math
 from typing import Any
 
 from .contracts import Architecture
+from .canvas_budget import CanvasWorkBudget
+from .canvas_numeric import stable_cost_sum, stable_mean
+from .canvas_routing import reciprocal_canvas_pairs, route_canvas_connections
 
 
 LAYOUT_VERSION = "archbro.layout.v1"
+CANVAS_LAYOUT_VERSION = "archbro.canvas-layout.v10"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +77,32 @@ class PositionedGraph:
     nodes: tuple[PositionedNode, ...]
     edges: tuple[RoutedEdge, ...]
     stable_order: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasGroupFrame:
+    """Deterministic presentation frame for one hierarchy-owning canvas node.
+
+    Frames are derived exclusively from PositionedGraph parent relationships and
+    geometry. They are viewer presentation metadata, never a second topology.
+    """
+
+    node_id: str
+    parent_group_id: str | None
+    x: float
+    y: float
+    width: float
+    height: float
+    depth: int
+    order: int
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasLayoutResult:
+    """One complete deterministic canvas layout plus hierarchy presentation frames."""
+
+    graph: PositionedGraph
+    group_frames: tuple[CanvasGroupFrame, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +184,557 @@ def layout_diagram(
         nodes=graph.nodes,
         edges=tuple(edge for edge in graph.edges if edge.edge_id in visible_edge_ids),
         stable_order=graph.stable_order,
+    )
+
+
+def canvas_group_frames(
+    graph: PositionedGraph,
+    *,
+    side_padding: float = 10.0,
+    header_padding: float = 18.0,
+    bottom_padding: float = 6.0,
+) -> tuple[CanvasGroupFrame, ...]:
+    """Derive nested hierarchy frames from an already deterministic graph.
+
+    A node becomes a group when another positioned node names it as parent. The
+    recursive bounds include child group frames, guaranteeing that nested frames
+    contain their complete descendant geometry without consulting labels, names,
+    browser state, or a second hierarchy model.
+    """
+
+    by_id = {node.node_id: node for node in graph.nodes}
+    children: dict[str, list[str]] = defaultdict(list)
+    for node in graph.nodes:
+        if node.parent_id in by_id:
+            children[node.parent_id].append(node.node_id)
+    for node_id in children:
+        children[node_id].sort(key=lambda child_id: (by_id[child_id].order, child_id))
+
+    group_ids = frozenset(children)
+    if not group_ids:
+        return ()
+
+    frames: dict[str, CanvasGroupFrame] = {}
+    bounds: dict[str, tuple[float, float, float, float]] = {}
+
+    def node_bounds(node_id: str) -> tuple[float, float, float, float]:
+        cached = bounds.get(node_id)
+        if cached is not None:
+            return cached
+
+        node = by_id[node_id]
+        left = node.x
+        top = node.y
+        right = node.x + node.width
+        bottom = node.y + node.height
+        for child_id in children.get(node_id, ()):
+            child_left, child_top, child_right, child_bottom = node_bounds(child_id)
+            left = min(left, child_left)
+            top = min(top, child_top)
+            right = max(right, child_right)
+            bottom = max(bottom, child_bottom)
+
+        if node_id in group_ids:
+            frame_left = left - side_padding
+            frame_top = top - header_padding
+            frame_right = right + side_padding
+            frame_bottom = bottom + bottom_padding
+            depth = max(0, len(node.hierarchy_path) - 1)
+            parent_group_id = node.parent_id if node.parent_id in group_ids else None
+            frames[node_id] = CanvasGroupFrame(
+                node_id=node_id,
+                parent_group_id=parent_group_id,
+                x=frame_left,
+                y=frame_top,
+                width=frame_right - frame_left,
+                height=frame_bottom - frame_top,
+                depth=depth,
+                order=node.order,
+            )
+            cached = (frame_left, frame_top, frame_right, frame_bottom)
+        else:
+            cached = (left, top, right, bottom)
+        bounds[node_id] = cached
+        return cached
+
+    root_ids = [node.node_id for node in graph.nodes if node.parent_id not in by_id]
+    for node_id in sorted(root_ids, key=lambda item: (by_id[item].order, item)):
+        node_bounds(node_id)
+    # Defensive completion for malformed/disconnected parent chains already
+    # tolerated by PositionedGraph: every derived group still gets one frame.
+    for node_id in sorted(group_ids):
+        node_bounds(node_id)
+
+    return tuple(sorted(frames.values(), key=lambda frame: (frame.depth, frame.order, frame.node_id)))
+
+
+def layout_canvas_diagram(
+    diagram: Any,
+    *,
+    config: LayoutConfig = LayoutConfig(node_height=80),
+    route_edge_ids: Collection[str] | None = None,
+    reading_edge_ids: Collection[str] = (),
+    work_budget: CanvasWorkBudget | None = None,
+) -> CanvasLayoutResult:
+    """Lay out one complete hierarchy as non-overlapping architecture regions.
+
+    The ordinary ``layout_diagram`` remains optimized for scoped dependency
+    reading. The full-system canvas has a different presentation problem: all
+    canonical hierarchy levels must coexist at once and sibling subsystem
+    boundaries must never overlap. This projection therefore packs canonical
+    subtrees into deterministic regions while preserving the same stable node
+    ids, parent ids, hierarchy paths, and authored edges.
+
+    No component name is inspected. Root lane placement uses explicit semantic
+    kind/type metadata only. Sibling order follows authored calls and events,
+    with stable project reading paths prioritized before operational callbacks.
+    The union of reading paths is fixed for every view; selecting a journey
+    in the browser never changes this layout.
+    """
+
+    work_budget = work_budget or CanvasWorkBudget()
+    raw_nodes = list(_value(diagram, "nodes", ()) or ())
+    raw_edges = _value(diagram, "edges", ()) or ()
+    nodes = _collect_nodes(raw_nodes)
+    edges = _normalize_edges(raw_edges, set(nodes))
+    work_budget.require_input(nodes=len(nodes), edges=len(edges))
+    diagram_version = _value(diagram, "diagram_version", None)
+    if diagram_version is None:
+        diagram_version = _value(diagram, "version", None)
+    architecture_version = _value(diagram, "architecture_version", None)
+
+    if not nodes:
+        empty = _layout(
+            nodes,
+            edges,
+            diagram_version=diagram_version,
+            architecture_version=architecture_version,
+            config=config,
+        )
+        return CanvasLayoutResult(graph=replace(empty, layout_version=CANVAS_LAYOUT_VERSION), group_frames=())
+
+    # Dependency layout is retained only as a stable ordering signal. Full
+    # canvas geometry below is separately packed so hierarchy regions cannot
+    # overlap each other.
+    base = _layout(
+        nodes,
+        edges,
+        diagram_version=diagram_version,
+        architecture_version=architecture_version,
+        config=config,
+    )
+    base_by_id = {node.node_id: node for node in base.nodes}
+    raw_by_id = {str(_value(node, "id", "")): node for node in raw_nodes}
+
+    reading_edges = frozenset(reading_edge_ids)
+    if not reading_edges.issubset({edge.edge_id for edge in edges}):
+        raise ValueError("Reading priority references an unknown canonical edge")
+    category_by_edge = {str(_value(edge, "id", "")): str(_value(edge, "relationship_category", "SUPPORT")) for edge in raw_edges}
+    endpoint_count: Counter[str] = Counter()
+    for edge in edges:
+        endpoint_count[edge.source] += 1
+        endpoint_count[edge.target] += 1
+
+    def safe_endpoint_capacity(width: float, height: float) -> int:
+        def side(length: float) -> int:
+            return max(1, int(max(0.0, length - 28.0) // 16.0) + 1)
+
+        return 2 * side(width) + 2 * side(height)
+
+    def routing_width(node_id: str, *, height: float, minimum: float) -> float:
+        width = minimum
+        required = endpoint_count[node_id]
+        while safe_endpoint_capacity(width, height) < required:
+            width += 16.0
+        return width
+
+    def flow_order(siblings: list[str]) -> list[str]:
+        """Order sibling subtrees by authored flow; deterministically break cycles.
+
+        Data reads and operational callbacks remain routed, but do not outweigh
+        the principal call/event flow. This changes positions, never direction.
+        """
+        candidates = set(siblings)
+        owner = {
+            node_id: next((part for part in base_by_id[node_id].hierarchy_path if part in candidates), None)
+            for node_id in nodes
+        }
+        weights: dict[tuple[str, str], float] = defaultdict(float)
+        for edge in edges:
+            source, target = owner[edge.source], owner[edge.target]
+            if source and target and source != target:
+                weight = {"FLOW": 5.0, "EVENT": 3.0, "DATA": 1.0}.get(category_by_edge.get(edge.edge_id), 0.1)
+                weights[source, target] += weight + (24.0 if edge.edge_id in reading_edges else 0.0)
+        remaining = set(siblings)
+        front, back = [], []
+        while remaining:
+            outgoing = {node: stable_cost_sum(weight for (source, target), weight in weights.items() if source == node and target in remaining) for node in remaining}
+            incoming = {node: stable_cost_sum(weight for (source, target), weight in weights.items() if target == node and source in remaining) for node in remaining}
+            sources = sorted(node for node in remaining if incoming[node] == 0)
+            sinks = sorted(node for node in remaining if outgoing[node] == 0)
+            if sources:
+                chosen = sources[0]
+                front.append(chosen)
+            elif sinks:
+                chosen = sinks[-1]
+                back.append(chosen)
+            else:
+                chosen = min(remaining, key=lambda node: (-(outgoing[node]-incoming[node]), node))
+                front.append(chosen)
+            remaining.remove(chosen)
+        return front + list(reversed(back))
+
+    children: dict[str, list[str]] = defaultdict(list)
+    for node_id, spec in nodes.items():
+        if spec.parent_id in nodes:
+            children[spec.parent_id].append(node_id)
+    for parent_id in children:
+        children[parent_id] = flow_order(children[parent_id])
+
+    group_ids = frozenset(children)
+    header_height = 34.0
+    group_padding = 28.0
+    child_gap = 52.0
+    region_gap = 64.0
+    lane_gap = 66.0
+    canvas_padding = float(config.padding_x)
+
+    def shifted_box(
+        box: tuple[float, float, float, float], dx: float, dy: float
+    ) -> tuple[float, float, float, float]:
+        x, y, width, height = box
+        return x + dx, y + dy, width, height
+
+    def layout_subtree(node_id: str) -> dict[str, Any]:
+        child_ids = children.get(node_id, [])
+        if not child_ids:
+            leaf_width = routing_width(
+                node_id,
+                height=float(config.node_height),
+                minimum=float(config.node_width),
+            )
+            return {
+                "width": leaf_width,
+                "height": float(config.node_height),
+                "boxes": {
+                    node_id: (
+                        0.0,
+                        0.0,
+                        leaf_width,
+                        float(config.node_height),
+                    )
+                },
+                "frames": [],
+            }
+
+        child_layouts = [(child_id, layout_subtree(child_id)) for child_id in child_ids]
+        count = len(child_layouts)
+        columns = min(2, count) if all(children.get(child_id) for child_id in child_ids) else (1 if count <= 3 else min(3, math.ceil(math.sqrt(count))))
+        rows = math.ceil(count / columns)
+
+        column_widths = [0.0] * columns
+        row_heights = [0.0] * rows
+        for index, (_child_id, child_layout) in enumerate(child_layouts):
+            row = index // columns
+            column = index % columns
+            column_widths[column] = max(column_widths[column], child_layout["width"])
+            row_heights[row] = max(row_heights[row], child_layout["height"])
+
+        column_x: list[float] = []
+        cursor = 0.0
+        for width in column_widths:
+            column_x.append(cursor)
+            cursor += width + child_gap
+        content_width = max(0.0, cursor - child_gap)
+
+        row_y: list[float] = []
+        cursor = 0.0
+        for height in row_heights:
+            row_y.append(cursor)
+            cursor += height + child_gap
+        content_height = max(0.0, cursor - child_gap)
+
+        owner_width = routing_width(
+            node_id,
+            height=header_height,
+            minimum=max(300.0, float(config.node_width)),
+        )
+        frame_width = max(
+            owner_width,
+            content_width + group_padding * 2,
+        )
+        # A 28-unit title gap left only 4 units between padded obstacles.
+        # Reserve three 12-unit approach lanes for leaf-level connections.
+        entry_gap = max(group_padding, 60.0) if any(not children.get(child) for child in child_ids) else group_padding
+        frame_height = (
+            header_height
+            + entry_gap
+            + content_height
+            + group_padding
+        )
+        content_origin_x = (frame_width - content_width) / 2
+        content_origin_y = header_height + entry_gap
+
+        boxes: dict[str, tuple[float, float, float, float]] = {
+            # The title occupies a bounded label, not an invisible wall
+            # across the whole boundary. Routes can cross the unused header.
+            node_id: (0.0, 0.0, min(frame_width, owner_width), header_height)
+        }
+        frames: list[CanvasGroupFrame] = [
+            CanvasGroupFrame(
+                node_id=node_id,
+                parent_group_id=(
+                    nodes[node_id].parent_id
+                    if nodes[node_id].parent_id in group_ids
+                    else None
+                ),
+                x=0.0,
+                y=0.0,
+                width=frame_width,
+                height=frame_height,
+                depth=max(0, len(base_by_id[node_id].hierarchy_path) - 1),
+                order=base_by_id[node_id].order,
+            )
+        ]
+
+        for index, (_child_id, child_layout) in enumerate(child_layouts):
+            row = index // columns
+            column = index % columns
+            dx = content_origin_x + column_x[column]
+            dy = content_origin_y + row_y[row]
+            # Center smaller child subtrees inside their deterministic grid cell.
+            dx += (column_widths[column] - child_layout["width"]) / 2
+            for descendant_id, box in child_layout["boxes"].items():
+                boxes[descendant_id] = shifted_box(box, dx, dy)
+            for frame in child_layout["frames"]:
+                frames.append(
+                    CanvasGroupFrame(
+                        node_id=frame.node_id,
+                        parent_group_id=frame.parent_group_id,
+                        x=frame.x + dx,
+                        y=frame.y + dy,
+                        width=frame.width,
+                        height=frame.height,
+                        depth=frame.depth,
+                        order=frame.order,
+                    )
+                )
+
+        return {
+            "width": frame_width,
+            "height": frame_height,
+            "boxes": boxes,
+            "frames": frames,
+        }
+
+    roots = [
+        node_id for node_id, spec in nodes.items() if spec.parent_id not in nodes
+    ]
+    roots = flow_order(roots)
+    root_layouts = {node_id: layout_subtree(node_id) for node_id in roots}
+
+    def root_lane(node_id: str) -> str:
+        raw = raw_by_id.get(node_id)
+        kind = str(_value(raw, "semantic_kind", "") or "").strip().upper()
+        semantic_type = "_".join(
+            str(_value(raw, "semantic_type", "") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .split()
+        )
+        data_tokens = (
+            "data",
+            "database",
+            "store",
+            "storage",
+            "cache",
+            "warehouse",
+            "index",
+            "state",
+        )
+        if kind in {"DATA_STORE", "STATE"} or any(
+            token in semantic_type for token in data_tokens
+        ):
+            return "data"
+        if kind == "EXTERNAL_SERVICE" or "external" in semantic_type:
+            return "external"
+        return "main"
+
+    lanes = {
+        "main": [node_id for node_id in roots if root_lane(node_id) == "main"],
+        "external": [
+            node_id for node_id in roots if root_lane(node_id) == "external"
+        ],
+        "data": [node_id for node_id in roots if root_lane(node_id) == "data"],
+    }
+
+    def pack_grid(
+        node_ids: Sequence[str], *, max_columns: int
+    ) -> tuple[dict[str, tuple[float, float]], float, float]:
+        if not node_ids:
+            return {}, 0.0, 0.0
+        # Choose a stable, compact landscape region packing; viewport size is
+        # deliberately absent from canonical geometry.
+        def packing_cost(columns):
+            rows = math.ceil(len(node_ids) / columns)
+            widths = [max(root_layouts[node_ids[i]]["width"] for i in range(col, len(node_ids), columns)) for col in range(columns)]
+            heights = [max(root_layouts[node_id]["height"] for node_id in node_ids[row*columns:(row+1)*columns]) for row in range(rows)]
+            width = stable_cost_sum(widths) + region_gap*(columns-1)
+            height = stable_cost_sum(heights) + region_gap*(rows-1)
+            return width*height*(1 + abs(math.log((width/height)/1.5))), columns
+
+        columns = min(range(1, min(max_columns, len(node_ids))+1), key=packing_cost)
+        rows = math.ceil(len(node_ids) / columns)
+        column_widths = [0.0] * columns
+        row_heights = [0.0] * rows
+        for index, node_id in enumerate(node_ids):
+            row = index // columns
+            column = index % columns
+            layout = root_layouts[node_id]
+            column_widths[column] = max(column_widths[column], layout["width"])
+            row_heights[row] = max(row_heights[row], layout["height"])
+
+        xs: list[float] = []
+        cursor = 0.0
+        for width in column_widths:
+            xs.append(cursor)
+            cursor += width + region_gap
+        total_width = cursor - region_gap
+
+        ys: list[float] = []
+        cursor = 0.0
+        for height in row_heights:
+            ys.append(cursor)
+            cursor += height + region_gap
+        total_height = cursor - region_gap
+
+        offsets: dict[str, tuple[float, float]] = {}
+        for index, node_id in enumerate(node_ids):
+            row = index // columns
+            column = index % columns
+            layout = root_layouts[node_id]
+            offsets[node_id] = (
+                xs[column] + (column_widths[column] - layout["width"]) / 2,
+                ys[row],
+            )
+        return offsets, total_width, total_height
+
+    main_offsets, main_width, main_height = pack_grid(
+        lanes["main"], max_columns=4
+    )
+    external_offsets, external_width, external_height = pack_grid(
+        lanes["external"], max_columns=1
+    )
+    data_offsets, data_width, data_height = pack_grid(
+        lanes["data"], max_columns=3
+    )
+
+    external_origin_x = main_width + (lane_gap if main_width and external_width else 0.0)
+    upper_height = max(main_height, external_height)
+    data_origin_y = upper_height + (lane_gap if upper_height and data_height else 0.0)
+
+    root_offsets: dict[str, tuple[float, float]] = {}
+    root_offsets.update(main_offsets)
+    root_offsets.update(
+        {
+            node_id: (x + external_origin_x, y)
+            for node_id, (x, y) in external_offsets.items()
+        }
+    )
+    root_offsets.update(
+        {
+            node_id: (x, y + data_origin_y)
+            for node_id, (x, y) in data_offsets.items()
+        }
+    )
+
+    positioned_boxes: dict[str, tuple[float, float, float, float]] = {}
+    group_frames: list[CanvasGroupFrame] = []
+    for root_id in roots:
+        layout = root_layouts[root_id]
+        root_x, root_y = root_offsets[root_id]
+        dx = root_x + canvas_padding
+        dy = root_y + canvas_padding
+        for node_id, box in layout["boxes"].items():
+            positioned_boxes[node_id] = shifted_box(box, dx, dy)
+        for frame in layout["frames"]:
+            group_frames.append(
+                CanvasGroupFrame(
+                    node_id=frame.node_id,
+                    parent_group_id=frame.parent_group_id,
+                    x=frame.x + dx,
+                    y=frame.y + dy,
+                    width=frame.width,
+                    height=frame.height,
+                    depth=frame.depth,
+                    order=frame.order,
+                )
+            )
+
+    positioned_nodes = tuple(
+        PositionedNode(
+            node_id=node_id,
+            x=positioned_boxes[node_id][0],
+            y=positioned_boxes[node_id][1],
+            width=positioned_boxes[node_id][2],
+            height=positioned_boxes[node_id][3],
+            layer=base_by_id[node_id].layer,
+            order=base_by_id[node_id].order,
+            parent_id=nodes[node_id].parent_id,
+            hierarchy_path=base_by_id[node_id].hierarchy_path,
+        )
+        for node_id in base.stable_order
+    )
+    paths = route_canvas_connections(
+        positioned_nodes,
+        edges,
+        reading_edge_ids=reading_edges,
+        work_budget=work_budget,
+    )
+    reciprocal_pairs = reciprocal_canvas_pairs(edges)
+    all_routes = tuple(
+        RoutedEdge(
+            edge_id=edge.edge_id, source=edge.source, target=edge.target,
+            points=tuple(LayoutPoint(x, y) for x, y in paths[edge.edge_id]),
+            routing="ORTHOGONAL_CANVAS_RECIPROCAL" if edge.edge_id in reciprocal_pairs else "ORTHOGONAL_CANVAS", order=order,
+        )
+        for order, edge in enumerate(edges)
+    )
+    if route_edge_ids is not None:
+        visible = frozenset(route_edge_ids)
+        routed_edges = tuple(edge for edge in all_routes if edge.edge_id in visible)
+    else:
+        routed_edges = all_routes
+
+    max_right = max(
+        [node.x + node.width for node in positioned_nodes]
+        + [frame.x + frame.width for frame in group_frames]
+        + [point.x for route in all_routes for point in route.points]
+    )
+    max_bottom = max(
+        [node.y + node.height for node in positioned_nodes]
+        + [frame.y + frame.height for frame in group_frames]
+        + [point.y for route in all_routes for point in route.points]
+    )
+    graph = PositionedGraph(
+        layout_version=CANVAS_LAYOUT_VERSION,
+        diagram_version=diagram_version,
+        architecture_version=architecture_version,
+        width=max_right + canvas_padding,
+        height=max_bottom + canvas_padding,
+        nodes=positioned_nodes,
+        edges=routed_edges,
+        stable_order=base.stable_order,
+    )
+    return CanvasLayoutResult(
+        graph=graph,
+        group_frames=tuple(
+            sorted(
+                group_frames,
+                key=lambda frame: (frame.depth, frame.order, frame.node_id),
+            )
+        ),
     )
 
 
@@ -359,50 +941,6 @@ def _assign_layers(
     return layers
 
 
-def _align_unconstrained_same_hop_targets(
-    nodes: Mapping[str, _NodeSpec],
-    edges: Sequence[_EdgeSpec],
-    layers: Mapping[str, int],
-) -> dict[str, int]:
-    """Align free cross-cutting fan-out targets without making support edges rank constraints.
-
-    BACKBONE remains the semantic rank source. A CROSS_CUTTING target may only
-    follow a source's unique forward BACKBONE hop when that target is otherwise
-    unconstrained by BACKBONE and lives in the same hierarchy group.
-    """
-    aligned = dict(layers)
-    backbone_incident: set[str] = set()
-    backbone_targets: dict[str, list[str]] = defaultdict(list)
-    cross_targets: dict[str, list[str]] = defaultdict(list)
-    for edge in edges:
-        if edge.layout_role == "BACKBONE":
-            backbone_incident.update((edge.source, edge.target))
-            backbone_targets[edge.source].append(edge.target)
-        else:
-            cross_targets[edge.source].append(edge.target)
-
-    for source in sorted(cross_targets):
-        source_layer = aligned[source]
-        forward_layers = sorted(
-            {
-                aligned[target]
-                for target in backbone_targets.get(source, ())
-                if aligned[target] > source_layer
-            }
-        )
-        if len(forward_layers) != 1:
-            continue
-        target_layer = forward_layers[0]
-        for target in sorted(set(cross_targets[source])):
-            if target in backbone_incident:
-                continue
-            if nodes[target].parent_id != nodes[source].parent_id:
-                continue
-            if aligned[target] <= target_layer:
-                aligned[target] = target_layer
-    return aligned
-
-
 def _order_layers_by_topology(
     nodes: Mapping[str, _NodeSpec],
     edges: Sequence[_EdgeSpec],
@@ -445,7 +983,7 @@ def _order_layers_by_topology(
     def reorder(layer: int, neighbors: Mapping[str, Sequence[str]], pos: Mapping[str, float]) -> None:
         def key(node_id: str) -> tuple[Any, ...]:
             usable = [pos[neighbor] for neighbor in neighbors.get(node_id, ()) if neighbor in pos]
-            barycenter = sum(usable) / len(usable) if usable else float("inf")
+            barycenter = stable_mean(usable) if usable else float("inf")
             return (
                 0 if nodes[node_id].projection_role == "PRIMARY" else 1,
                 paths[node_id][0] if len(paths[node_id]) > 1 else "",

@@ -4,7 +4,13 @@ from itertools import combinations
 from pathlib import Path
 
 from archbro.backend.core.contracts import Architecture, Component, Relationship
-from archbro.backend.core.diagram_layout import PositionedGraph, layout_architecture, layout_diagram
+from archbro.backend.core.diagram_layout import (
+    PositionedGraph,
+    canvas_group_frames,
+    layout_architecture,
+    layout_canvas_diagram,
+    layout_diagram,
+)
 
 
 def component(node_id: str, *, children: list[Component] | None = None) -> Component:
@@ -465,6 +471,126 @@ def test_diagram_ir_structural_adapter_preserves_versions_and_parent_grouping():
     assert nodes["child-a"].order < nodes["child-b"].order
     assert_no_node_overlap(graph)
     assert_edges_avoid_unrelated_nodes(graph)
+
+
+def test_canvas_group_frames_are_deterministic_nested_and_contain_descendants():
+    diagram = {
+        "diagram_version": "archbro.diagram.v1",
+        "architecture_version": 31,
+        "nodes": [
+            {"id": "root"},
+            {"id": "service", "parent_id": "root"},
+            {"id": "worker", "parent_id": "service"},
+            {"id": "store", "parent_id": "root"},
+        ],
+        "edges": [
+            {"id": "service-worker", "source": "service", "target": "worker"},
+            {"id": "worker-store", "source": "worker", "target": "store"},
+        ],
+    }
+    graph = layout_diagram(diagram)
+    first = canvas_group_frames(graph)
+    second = canvas_group_frames(layout_diagram({**diagram, "nodes": list(reversed(diagram["nodes"]))}))
+
+    assert first == second
+    frames = {frame.node_id: frame for frame in first}
+    assert set(frames) == {"root", "service"}
+    assert frames["service"].parent_group_id == "root"
+    assert frames["root"].parent_group_id is None
+
+    nodes = by_id(graph)
+    for group_id, frame in frames.items():
+        prefix = nodes[group_id].hierarchy_path
+        descendants = [
+            node
+            for node in graph.nodes
+            if node.hierarchy_path[: len(prefix)] == prefix
+        ]
+        assert descendants
+        assert all(frame.x <= node.x for node in descendants)
+        assert all(frame.y <= node.y for node in descendants)
+        assert all(frame.x + frame.width >= node.x + node.width for node in descendants)
+        assert all(frame.y + frame.height >= node.y + node.height for node in descendants)
+
+    root = frames["root"]
+    service = frames["service"]
+    assert root.x <= service.x
+    assert root.y <= service.y
+    assert root.x + root.width >= service.x + service.width
+    assert root.y + root.height >= service.y + service.height
+
+
+def test_full_canvas_layout_packs_root_groups_without_overlap_and_data_below_main():
+    diagram = {
+        "diagram_version": "archbro.diagram.v1",
+        "architecture_version": 32,
+        "nodes": [
+            {"id": "experience", "semantic_kind": "SYSTEM", "semantic_type": "experience"},
+            {"id": "viewer", "parent_id": "experience", "semantic_kind": "UI", "semantic_type": "ui"},
+            {"id": "platform", "semantic_kind": "SYSTEM", "semantic_type": "platform"},
+            {"id": "api", "parent_id": "platform", "semantic_kind": "SERVICE", "semantic_type": "service"},
+            {"id": "data", "semantic_kind": "SYSTEM", "semantic_type": "data_plane"},
+            {"id": "db", "parent_id": "data", "semantic_kind": "DATA_STORE", "semantic_type": "database"},
+            {"id": "external", "semantic_kind": "EXTERNAL_SERVICE", "semantic_type": "external_service"},
+            {"id": "search", "parent_id": "external", "semantic_kind": "EXTERNAL_SERVICE", "semantic_type": "external_service"},
+        ],
+        "edges": [
+            {"id": "viewer-api", "source": "viewer", "target": "api", "semantic_type": "HTTPS"},
+            {"id": "api-db", "source": "api", "target": "db", "semantic_type": "SQL"},
+            {"id": "api-search", "source": "api", "target": "search", "semantic_type": "HTTPS"},
+        ],
+    }
+
+    first = layout_canvas_diagram(diagram)
+    second = layout_canvas_diagram({**diagram, "nodes": list(reversed(diagram["nodes"]))})
+    assert first == second
+
+    root_frames = {
+        frame.node_id: frame
+        for frame in first.group_frames
+        if frame.parent_group_id is None
+    }
+    assert set(root_frames) == {"experience", "platform", "data", "external"}
+
+    def overlaps(left, right):
+        return not (
+            left.x + left.width <= right.x
+            or right.x + right.width <= left.x
+            or left.y + left.height <= right.y
+            or right.y + right.height <= left.y
+        )
+
+    roots = list(root_frames.values())
+    assert all(
+        not overlaps(left, right)
+        for index, left in enumerate(roots)
+        for right in roots[index + 1 :]
+    )
+    upper_bottom = max(
+        root_frames[node_id].y + root_frames[node_id].height
+        for node_id in ("experience", "platform", "external")
+    )
+    assert root_frames["data"].y > upper_bottom
+    assert root_frames["external"].x > max(
+        root_frames["experience"].x + root_frames["experience"].width,
+        root_frames["platform"].x + root_frames["platform"].width,
+    )
+
+    by_node = {node.node_id: node for node in first.graph.nodes}
+    for frame in first.group_frames:
+        prefix = by_node[frame.node_id].hierarchy_path
+        descendants = [
+            node
+            for node in first.graph.nodes
+            if node.hierarchy_path[: len(prefix)] == prefix
+        ]
+        assert all(frame.x <= node.x for node in descendants)
+        assert all(frame.y <= node.y for node in descendants)
+        assert all(frame.x + frame.width >= node.x + node.width for node in descendants)
+        assert all(frame.y + frame.height >= node.y + node.height for node in descendants)
+
+    assert all(len(edge.points) >= 2 for edge in first.graph.edges)
+    assert all(edge.routing == "ORTHOGONAL_CANVAS" for edge in first.graph.edges)
 
 
 def test_scoped_layout_is_deterministic_and_primary_precedes_context_in_equal_rank():

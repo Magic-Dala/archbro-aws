@@ -280,6 +280,13 @@ The golden WebMCP governance loop is covered by `tests/test_webmcp_golden_flow.p
 
 Browser-native local probes live under `qa/`, including `qa/probe_webmcp_live.py`.
 
+Architecture generation and Canvas changes use the same three retained reference
+projects: commerce, collaborative AI workspace, and manufacturing supply chain.
+The [fixed reference corpus and comparison procedure](examples/reference-projects/README.md)
+contains frozen inputs, production project links, nine workflow checks, and the
+recorded visual baseline. Reuse those projects for comparisons instead of creating
+unrelated demonstrations or deleting them as acceptance fixtures.
+
 ## Container deployment
 
 A production-oriented `Dockerfile` is included. The container listens on `$PORT` (default `8080`). Configure environment variables in the deployment platform rather than baking credentials into the image.

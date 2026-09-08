@@ -17,6 +17,7 @@ from archbro.backend.core.diagram import (
     DiagramEdgeProjectionKind,
     DiagramHealth,
     DiagramProjectionRole,
+    DiagramRelationshipCategory,
     project_diagram,
     project_scoped_diagram,
 )
@@ -392,7 +393,7 @@ def test_canonical_architecture_has_no_presentation_state():
 
 
 def test_generated_relationship_vocabulary_gets_stable_layout_roles():
-    from archbro.backend.core.diagram import _layout_role_for_semantic_types
+    from archbro.backend.core.diagram import _layout_role_for_semantic_types, _relationship_category
 
     assert _layout_role_for_semantic_types(["MONITORS"]).value == "CROSS_CUTTING"
     assert _layout_role_for_semantic_types(["VALIDATES_MIGRATIONS"]).value == "CROSS_CUTTING"
@@ -402,6 +403,11 @@ def test_generated_relationship_vocabulary_gets_stable_layout_roles():
     assert _layout_role_for_semantic_types(["QUERIES", "COMMANDS", "AUTHENTICATES_WITH"]).value == "BACKBONE"
     assert _layout_role_for_semantic_types(["SUBSCRIBES"]).value == "BACKBONE"
     assert _layout_role_for_semantic_types(["TOTALLY_NEW_SUPPORT_RELATION"]).value == "CROSS_CUTTING"
+    assert _relationship_category("HTTPS") == DiagramRelationshipCategory.FLOW
+    assert _relationship_category("SQL") == DiagramRelationshipCategory.DATA
+    assert _relationship_category("SUBSCRIBES") == DiagramRelationshipCategory.EVENT
+    assert _relationship_category("MONITORS") == DiagramRelationshipCategory.OBSERVABILITY
+    assert _relationship_category("TOTALLY_NEW_SUPPORT_RELATION") == DiagramRelationshipCategory.SUPPORT
 
 
 def test_map_collapses_parallel_backbone_semantics_to_one_connection():

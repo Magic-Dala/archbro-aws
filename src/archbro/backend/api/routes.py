@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from archbro.backend.agent.context_manifest import (
     AgentContextPreviewStaleError,
@@ -16,6 +17,10 @@ from archbro.backend.agent.node_context import StaleArchitectureVersionError
 from archbro.backend.agent.orchestration import AgentOrchestrator
 from archbro.backend.api.agent_surface import build_agent_surface_router
 from archbro.backend.api.provider_connections import build_provider_mcp_router
+from archbro.backend.core.canvas_reading import canvas_reading_views
+from archbro.backend.core.canvas_connection_summaries import canvas_connection_summaries
+from archbro.backend.core.canvas_budget import CanvasComplexityError, CanvasWorkBudget
+from archbro.backend.core.canvas_presentation import canvas_presentation
 from archbro.backend.core.action_executor import ActionExecutor
 from archbro.backend.core.architecture_validation import validate_architecture_relationship_connectivity
 from archbro.backend.core.authorization import (
@@ -46,9 +51,10 @@ from archbro.backend.core.observation import ObservationInProgressError
 from archbro.backend.core.diagram import (
     ArchitectureNodeNotFoundError,
     map_edge_ids,
+    project_diagram,
     project_scoped_diagram,
 )
-from archbro.backend.core.diagram_layout import layout_diagram
+from archbro.backend.core.diagram_layout import layout_canvas_diagram, layout_diagram
 from archbro.backend.core.repository import ProjectRepositoryPort
 from archbro.backend.llm.provider import GoalConversationMessage, GoalDraft, ModelProvider
 
@@ -346,6 +352,99 @@ def build_router(
     authorizer = ProjectAuthorizer()
     router = APIRouter()
 
+    def build_canvas_projection_payload(
+        project_id: str,
+        architecture: Architecture,
+        tasks: list[Any],
+        proposals: list[ArchitectureChangeProposal],
+        reading_mode: str,
+    ) -> dict[str, Any]:
+        work_budget = CanvasWorkBudget()
+        full_diagram = project_diagram(
+            architecture,
+            tasks=tasks,
+            proposals=proposals,
+        )
+        route_edge_ids = map_edge_ids(full_diagram) if reading_mode == "MAP" else None
+        reading_views = canvas_reading_views(architecture, full_diagram)
+        canvas_layout = layout_canvas_diagram(
+            full_diagram,
+            reading_edge_ids={
+                edge_id
+                for view in reading_views
+                if view["kind"] == "AUTHORED_JOURNEY"
+                for edge_id in view["edge_ids"]
+            },
+            route_edge_ids=route_edge_ids,
+            work_budget=work_budget,
+        )
+        positioned_graph = canvas_layout.graph
+        group_frames = canvas_layout.group_frames
+        diagram = (
+            full_diagram.model_copy(
+                update={
+                    "edges": [
+                        edge for edge in full_diagram.edges if edge.id in route_edge_ids
+                    ]
+                }
+            )
+            if route_edge_ids is not None
+            else full_diagram
+        )
+        return {
+            "schema": "archbro.full_canvas.v1",
+            "project_id": project_id,
+            "architecture_version": architecture.version,
+            "diagram": diagram.model_dump(mode="json"),
+            "positioned_graph": asdict(positioned_graph),
+            "group_frames": [asdict(frame) for frame in group_frames],
+            "reading_views": reading_views if reading_mode != "MAP" else [],
+            "connection_summaries": canvas_connection_summaries(
+                diagram, positioned_graph, work_budget=work_budget
+            ),
+            "presentation": canvas_presentation(architecture, diagram),
+            "work_budget": work_budget.snapshot(),
+        }
+
+    def build_scoped_project_diagram_payload(
+        project_id: str,
+        architecture: Architecture,
+        tasks: list[Any],
+        proposals: list[ArchitectureChangeProposal],
+        scope_component_id: str | None = None,
+        reading_mode: str = "MAP",
+    ) -> dict[str, Any]:
+        """Use one Project View contract for both direct reads and bootstrap.
+
+        Bootstrap preloads the root MAP view; direct reads also support scoped
+        READ/FULL views. Neither entry point owns a separate projection policy.
+        """
+
+        projection = project_scoped_diagram(
+            architecture,
+            scope_component_id=scope_component_id,
+            tasks=tasks,
+            proposals=proposals,
+        )
+        full_diagram = projection.diagram
+        route_edge_ids = map_edge_ids(full_diagram) if reading_mode == "MAP" else None
+        positioned_graph = layout_diagram(full_diagram, route_edge_ids=route_edge_ids)
+        diagram = (
+            full_diagram.model_copy(
+                update={"edges": [edge for edge in full_diagram.edges if edge.id in route_edge_ids]}
+            )
+            if route_edge_ids is not None
+            else full_diagram
+        )
+        return {
+            "schema": projection.schema,
+            "project_id": project_id,
+            "architecture_version": projection.architecture_version,
+            "scope": projection.scope.model_dump(mode="json"),
+            "diagram": diagram.model_dump(mode="json"),
+            "positioned_graph": asdict(positioned_graph),
+        }
+
     def authentication_error(detail: str) -> HTTPException:
         return HTTPException(
             status_code=401,
@@ -596,7 +695,13 @@ def build_router(
         reading_mode: Literal["MAP", "READ", "FULL"] = Query(default="FULL"),
     ):
         await authorized_project(http_request, project_id, ProjectPermission.READ)
-        architecture = repository.get_architecture(project_id)
+        architecture, tasks, proposals = await run_in_threadpool(
+            lambda: (
+                repository.get_architecture(project_id),
+                repository.list_tasks(project_id),
+                repository.list_proposals(project_id),
+            )
+        )
         if (
             expected_architecture_version is not None
             and expected_architecture_version != architecture.version
@@ -610,11 +715,14 @@ def build_router(
                 },
             )
         try:
-            projection = project_scoped_diagram(
+            return await run_in_threadpool(
+                build_scoped_project_diagram_payload,
+                project_id,
                 architecture,
-                scope_component_id=scope,
-                tasks=repository.list_tasks(project_id),
-                proposals=repository.list_proposals(project_id),
+                tasks,
+                proposals,
+                scope,
+                reading_mode,
             )
         except ArchitectureNodeNotFoundError:
             raise HTTPException(
@@ -624,24 +732,54 @@ def build_router(
                     "component_id": scope,
                 },
             )
-        full_diagram = projection.diagram
-        route_edge_ids = map_edge_ids(full_diagram) if reading_mode == "MAP" else None
-        positioned_graph = layout_diagram(full_diagram, route_edge_ids=route_edge_ids)
-        diagram = (
-            full_diagram.model_copy(
-                update={"edges": [edge for edge in full_diagram.edges if edge.id in route_edge_ids]}
+
+    @router.get("/projects/{project_id}/architecture/canvas")
+    async def get_architecture_canvas(
+        project_id: str,
+        http_request: Request,
+        expected_architecture_version: int | None = Query(default=None, ge=0),
+        reading_mode: Literal["MAP", "READ", "FULL"] = Query(default="FULL"),
+    ):
+        """Return one complete, read-only Living Architecture canvas projection.
+
+        The canvas is a presentation/read surface over the accepted canonical
+        Architecture. It deliberately reuses the existing complete Diagram IR
+        projection and deterministic layout engine instead of introducing a
+        second topology or viewer-authored hierarchy model.
+        """
+
+        await authorized_project(http_request, project_id, ProjectPermission.READ)
+        architecture, tasks, proposals = await run_in_threadpool(
+            lambda: (
+                repository.get_architecture(project_id),
+                repository.list_tasks(project_id),
+                repository.list_proposals(project_id),
             )
-            if route_edge_ids is not None
-            else full_diagram
         )
-        return {
-            "schema": projection.schema,
-            "project_id": project_id,
-            "architecture_version": projection.architecture_version,
-            "scope": projection.scope.model_dump(mode="json"),
-            "diagram": diagram.model_dump(mode="json"),
-            "positioned_graph": asdict(positioned_graph),
-        }
+        if (
+            expected_architecture_version is not None
+            and expected_architecture_version != architecture.version
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stale_architecture_version",
+                    "expected_architecture_version": expected_architecture_version,
+                    "current_architecture_version": architecture.version,
+                },
+            )
+
+        try:
+            return await run_in_threadpool(
+                build_canvas_projection_payload,
+                project_id,
+                architecture,
+                tasks,
+                proposals,
+                reading_mode,
+            )
+        except CanvasComplexityError as exc:
+            raise HTTPException(status_code=422, detail=exc.detail()) from exc
 
     @router.get("/projects/{project_id}/architecture/proposals")
     async def list_proposals(project_id: str, http_request: Request):
