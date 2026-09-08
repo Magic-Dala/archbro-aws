@@ -1,6 +1,9 @@
 :root{font-family:Inter,"Segoe UI",Arial,sans-serif;color:#1D1D1F;background:#F6F5F2;font-synthesis:none;--brand-primary:#CBC3E3;--brand-hover:#B8AADD;--brand-soft:#F4F1FB;--brand-strong:#7567A8;--brand-deep:#4D416F;--module-deep:#5A49B8;--module-violet:#8B5CF6;--module-coral:#FF7A66;--module-blue:#3B82F6;--module-green:#22B96B;--module-orange:#FF593D;--canvas:#F6F5F2;--surface:#FFFFFF;--ink:#1D1D1F;--success:#237A57;--warning:#A15C12;--danger:#B42318;--line:#E6E3EA;--muted:#6F6B78;--focus-ring:rgba(77,65,111,.22);--success-soft:#EEF8F2;--warning-soft:#FFF7E8;--danger-soft:#FFF1F0;--card:var(--surface)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--canvas);color:var(--ink)}
+.bootstrap-experience{min-height:100vh;display:grid;place-items:center;background:var(--canvas)}
+.bootstrap-experience-card{display:flex;align-items:center;gap:14px;padding:18px 22px;border:1px solid var(--line);border-radius:16px;background:var(--surface);box-shadow:0 14px 38px rgba(29,29,31,.06)}
+.bootstrap-experience-card img{width:38px;height:38px}.bootstrap-experience-copy{display:grid;gap:5px;max-width:min(520px,calc(100vw - 120px))}.bootstrap-experience-card strong{font-size:15px}.bootstrap-experience-card span{font-size:11px;color:var(--muted);line-height:1.45}.bootstrap-recovery-actions{display:flex;gap:8px;margin-top:7px}.bootstrap-recovery-actions .btn{padding:8px 12px;font-size:11px}
 button,input,textarea{font:inherit}
 button,select,input,textarea,[tabindex]{outline:none}
 button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--brand-deep);outline-offset:3px;box-shadow:0 0 0 5px var(--focus-ring)}
@@ -82,6 +85,8 @@ main{grid-column:2;min-width:0}
 .alignment-row{margin-top:28px;display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;font-size:11px;color:var(--muted)}
 .alignment-track{height:8px;background:#e9e7f1;border-radius:6px;overflow:hidden}
 .alignment-fill{height:100%;width:0;background:var(--brand-strong);transition:width .25s}
+.alignment-fill.is-pending{width:72%}
+.alignment-fill.is-aligned{width:100%}
 .attention-panel{background:#fffdf8;border-color:#f2db9e}
 .attention-content p{font-size:12px;color:#6e7786;line-height:1.5}
 .attention-card{margin-top:16px;background:#fff7e8;border:1px solid #f3cf73;border-radius:12px;padding:14px}
@@ -322,11 +327,43 @@ main{display:block}
 .global-agent-reply-head small{font-size:8.5px;color:var(--muted)}
 .global-agent-reply p{margin:5px 0 0;color:#4b5563;font-size:11px;line-height:1.45}
 .global-agent-reply.error p{color:var(--danger)}
+.agent-context-tray{border:1px solid #d9d2ee;border-radius:16px;background:#fcfbff;box-shadow:0 10px 28px rgba(77,65,111,.08);overflow:hidden}
+.agent-context-tray-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:13px 15px;border-bottom:1px solid #e7e2f2;background:#f8f6fd}
+.agent-context-tray-head small{display:block;color:#81749e;font-size:8px;font-weight:900;letter-spacing:.09em}
+.agent-context-tray-head strong{display:block;margin-top:3px;color:var(--ink);font-size:12px}
+.agent-context-tray-controls{display:flex;align-items:flex-end;gap:8px;flex:0 0 auto}
+.agent-context-tray-controls label{display:grid;gap:3px;color:#6c6680;font-size:8px;font-weight:800;letter-spacing:.04em}
+.agent-context-tray-controls select,.agent-context-tray-controls button,.agent-context-tray-body>button{height:30px;border:1px solid #d7d0e8;border-radius:9px;background:#fff;color:#554877;padding:0 9px;font-size:9px;font-weight:800;cursor:pointer}
+.agent-context-tray-controls select:focus,.agent-context-tray-controls button:focus-visible,.agent-context-tray-body>button:focus-visible{outline:3px solid var(--focus-ring);outline-offset:1px}
+.agent-context-tray-body{padding:13px 15px}
+.agent-context-status{margin:0;color:var(--muted);font-size:10.5px;line-height:1.5}
+.agent-context-status.error{color:var(--danger)}
+.agent-context-status+button{margin-top:8px}
+.agent-context-boundary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.agent-context-boundary>div{min-width:0;display:grid;align-content:start;gap:3px;padding:9px 10px;border:1px solid #e4e0ed;border-radius:10px;background:#fff}
+.agent-context-boundary>div>span{color:#8b839b;font-size:7.5px;font-weight:850;letter-spacing:.055em;text-transform:uppercase}
+.agent-context-boundary>div>strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#3f3557;font-size:10px}
+.agent-context-boundary>div>small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#7b7488;font-size:8px}
+.agent-context-boundary.bounded-warning>div{border-color:#ead39a;background:#fffdf6}
+.agent-context-policy-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px}
+.agent-context-policy-summary span{border-radius:999px;background:#f0edf8;color:#65577f;padding:4px 7px;font-size:8px;font-weight:800}
+.agent-context-policy-summary .agent-context-limit{background:#fff3d4;color:#8a641f}
+.agent-context-telemetry{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 0;padding-top:10px;border-top:1px solid #e7e2f2}
+.agent-context-telemetry>div{display:flex;align-items:baseline;gap:5px}
+.agent-context-telemetry dt{color:#8d8698;font-size:8px}
+.agent-context-telemetry dd{margin:0;color:#4d416f;font-size:8.5px;font-weight:800}
+.agent-context-telemetry code{font-size:8px}
 @media(max-width:760px){.workspace{padding-bottom:224px}
 .global-agent-dock{left:16px;right:16px;bottom:14px;gap:7px}
 .global-agent-composer{padding:12px;gap:10px}
 .global-agent-reply{max-height:84px;padding:9px 11px}
 .global-agent-reply-head small{display:none}
+.agent-context-tray-head{align-items:flex-start;display:grid;gap:9px;padding:11px 12px}
+.agent-context-tray-controls{width:100%;justify-content:space-between}
+.agent-context-tray-controls label{min-width:0;flex:1}
+.agent-context-tray-controls select{width:100%}
+.agent-context-tray-body{padding:11px 12px}
+.agent-context-boundary{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 .entry-experience{min-height:100vh;background:var(--canvas);color:var(--ink)}
 .entry-topbar{height:68px;display:flex;align-items:center;justify-content:space-between;padding:0 28px;border-bottom:1px solid var(--line);background:var(--surface)}
@@ -500,6 +537,17 @@ main{display:block}
 #graphCanvas .graph-hierarchy{stroke:#d8dee8;stroke-width:1.5;vector-effect:non-scaling-stroke;pointer-events:none}
 #graphCanvas .graph-edge{opacity:1;transition:opacity .12s}
 #graphCanvas .graph-edge path{fill:none;stroke:#94a3b8;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+#graphCanvas .graph-edge{cursor:pointer}
+#graphCanvas .graph-edge .graph-edge-hit{stroke:transparent;stroke-width:14;pointer-events:stroke;fill:none}
+#graphCanvas .graph-edge.selected .graph-edge-line{stroke:var(--brand-deep);stroke-width:2.8}
+#graphCanvas .graph-edge.relationship-event .graph-edge-line{stroke-dasharray:7 5}
+#graphCanvas .graph-edge.relationship-data .graph-edge-line{stroke-dasharray:2.5 4}
+#graphCanvas .graph-edge.relationship-access .graph-edge-line{stroke-dasharray:10 4 2 4}
+#graphCanvas .graph-edge.relationship-observability .graph-edge-line{stroke-dasharray:1 5}
+#graphCanvas .graph-edge.relationship-validation .graph-edge-line{stroke-dasharray:4 3}
+#graphCanvas .graph-edge.relationship-delivery .graph-edge-line{stroke-width:2.2}
+#graphCanvas .graph-edge.relationship-support .graph-edge-line{stroke-dasharray:12 6}
+#graphCanvas .graph-edge.is-isolated-out,#graphCanvas .node-card.is-isolated-out,#graphCanvas .architecture-group-frame.is-isolated-out{display:none}
 #graphCanvas .graph-edge-source-port{fill:#94a3b8;stroke:#fff;stroke-width:1;vector-effect:non-scaling-stroke}
 #graphCanvas .graph-edge text{font-size:9.5px;font-weight:750;fill:#667588;paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}
 #graphCanvas .graph-edge.is-focused path{stroke:var(--brand-deep);stroke-width:2.2}
@@ -517,6 +565,13 @@ main{display:block}
 #graphCanvas .node-card.projection-scope .node-surface{fill:#f7f5ff;stroke:var(--brand-primary);stroke-width:2.2}
 #graphCanvas .node-card.projection-scope{cursor:default}
 #graphCanvas .node-card.projection-context .node-surface{fill:#fbfcfe;stroke-dasharray:6 4}
+#graphCanvas .node-card.is-boundary-context .node-surface{fill:#fbfcfe;stroke-dasharray:5 4}
+#graphCanvas .architecture-group-owner.is-boundary-context .architecture-group-owner-hit{fill:#fbfcfe;stroke-dasharray:5 4}
+#graphCanvas .architecture-group-frame.is-boundary-context rect{stroke-dasharray:7 5}
+#graphCanvas .node-card.is-collapsed .node-surface{fill:#faf8ff;stroke-dasharray:7 4;stroke-width:2}
+#graphCanvas .architecture-group-owner.is-collapsed .architecture-group-owner-hit{fill:#faf8ff;stroke-dasharray:7 4;stroke-width:2}
+#graphCanvas .architecture-group-frame.is-collapsed rect{fill-opacity:.42;stroke-dasharray:9 5}
+#graphCanvas .graph-edge.projection-collapsed .graph-edge-line{stroke-width:2.2}
 #graphCanvas .node-card:hover .node-surface,#graphCanvas .node-card:focus-visible .node-surface{stroke:var(--module-violet);stroke-width:2.2}
 #graphCanvas .node-card.selected .node-surface{stroke:var(--brand-deep);stroke-width:3}
 #graphCanvas .node-card.is-dimmed{opacity:.42}
@@ -538,16 +593,19 @@ main{display:block}
 #graphCanvas .node-card.health-blocked .node-surface{stroke:#f87171}
 #graphCanvas .node-card.health-planned .node-health-dot{fill:#94a3b8}
 #graphCanvas .graph-detail-read,#graphCanvas .graph-detail-full{transition:opacity .12s}
-#graphCanvas .graph-stage[data-reading-mode="MAP"] .graph-detail-read,#graphCanvas .graph-stage[data-reading-mode="MAP"] .graph-detail-full,#graphCanvas .graph-stage[data-reading-mode="READ"] .graph-detail-full{opacity:0;pointer-events:none}
-#graphCanvas .graph-stage[data-reading-mode="MAP"] .node-card.selected .graph-detail-read,#graphCanvas .graph-stage[data-reading-mode="MAP"] .node-card.selected .graph-detail-full{opacity:1;pointer-events:auto}
+/* Scoped graphs use MAP/READ/FULL; the full Canvas discloses detail by zoom tier. */
+body:not(.architecture-canvas-mode) #graphCanvas .graph-stage[data-reading-mode="MAP"] .graph-detail-read,body:not(.architecture-canvas-mode) #graphCanvas .graph-stage[data-reading-mode="MAP"] .graph-detail-full,body:not(.architecture-canvas-mode) #graphCanvas .graph-stage[data-reading-mode="READ"] .graph-detail-full{opacity:0;pointer-events:none}
+body:not(.architecture-canvas-mode) #graphCanvas .graph-stage[data-reading-mode="MAP"] .node-card.selected .graph-detail-read,body:not(.architecture-canvas-mode) #graphCanvas .graph-stage[data-reading-mode="MAP"] .node-card.selected .graph-detail-full{opacity:1;pointer-events:auto}
 #selectedNode .graph-focus-controls{display:flex;gap:7px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid #e7ebf1}
 #selectedNode .graph-focus-controls button{border:1px solid #dfe5ed;background:#fff;color:#5f6d7d;border-radius:999px;padding:6px 10px;font-size:9.5px;font-weight:780;cursor:pointer}
 #selectedNode .graph-focus-controls button:hover,#selectedNode .graph-focus-controls button.active{border-color:var(--brand-hover);background:#f5f3ff;color:var(--brand-deep)}
+#selectedNode .graph-focus-controls .graph-open-scope{margin-left:auto;border-color:var(--brand-primary);background:var(--brand-soft);color:var(--brand-deep)}
 #selectedNode .health-pill.health-planned{background:#f1f5f9;color:#64748b}
 @media(max-width:760px){#graphCanvas .graph-scope-bar{display:grid;gap:10px;padding:10px}#graphCanvas .graph-scope-actions{width:100%;justify-content:space-between}#graphCanvas .living-graph-svg{width:100%;height:auto;min-width:0;max-width:100%}#selectedNode .graph-focus-controls button{min-height:34px}}
 
 /* Architecture source switch: accepted Living intent vs revision-pinned implementation evidence. */
 .architecture-view-tools{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+.architecture-canvas-button{padding:8px 11px;font-size:10px;white-space:nowrap}
 #view-architecture .section-intro{flex-wrap:wrap;gap:12px}
 .architecture-mode-switch{display:flex;gap:3px;padding:3px;border-radius:11px;background:#eef1f5}
 .architecture-mode-switch button{border:0;border-radius:8px;background:transparent;color:#6b7788;padding:7px 11px;font-size:9.5px;font-weight:850;cursor:pointer}
@@ -621,6 +679,82 @@ main{display:block}
   .task-row .status-pill{grid-column:2;justify-self:start}
   .proposal-card .actions{justify-content:stretch}
   .proposal-card .actions .btn{flex:1 1 180px}
+}
+
+/* Dedicated Architecture Canvas: viewport interaction only. Backend still owns canonical topology, scope, geometry, and routes. */
+.architecture-canvas-mode #workspaceShell:not(.hidden){position:fixed;inset:0;display:block;min-height:0;height:100dvh;overflow:hidden;background:var(--canvas)}
+.architecture-canvas-mode #workspaceShell:not(.hidden)>.sidebar,
+.architecture-canvas-mode #workspaceShell:not(.hidden)>#sidebarBackdrop,
+.architecture-canvas-mode #workspaceMain>.topbar,
+.architecture-canvas-mode #workspaceHome,
+.architecture-canvas-mode #view-overview,
+.architecture-canvas-mode #view-tasks{display:none!important}
+.architecture-canvas-mode #workspaceMain{grid-column:1;width:100%;height:100dvh;min-height:0;overflow:hidden}
+.architecture-canvas-mode #workspace{display:block!important;width:100%;height:100dvh;max-width:none;margin:0;padding:14px;overflow:hidden}
+.architecture-canvas-mode #view-architecture.active{display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;height:100%;min-height:0}
+.architecture-canvas-mode #view-architecture .section-intro{margin:0;padding:0 2px;align-items:center}
+.architecture-canvas-mode #view-architecture .section-intro h2{font-size:18px}
+.architecture-canvas-mode #view-architecture .section-intro p{margin-top:3px;font-size:10px}
+.architecture-canvas-mode #view-architecture .graph-layout{grid-template-columns:minmax(0,1fr) minmax(320px,360px);gap:12px;min-height:0;height:100%}
+.architecture-canvas-mode #view-architecture .graph-panel{display:grid;grid-template-rows:auto auto minmax(0,1fr);min-height:0;height:100%;padding:12px}
+.architecture-canvas-mode #view-architecture .graph-panel>.panel-head{padding:0 2px}
+.architecture-canvas-mode #view-architecture .graph-panel>.panel-head p{font-size:9.5px}
+.architecture-canvas-mode #graphHealthLegend{margin-top:8px}
+.architecture-canvas-mode #graphCanvas{display:grid;grid-template-rows:auto minmax(0,1fr);min-height:0;height:100%;margin-top:10px;overflow:hidden;background:#fbfcfe}
+.architecture-canvas-mode #graphCanvas .graph-scope-bar{margin:10px 10px 0;z-index:3}
+.architecture-canvas-mode #graphCanvas .code-snapshot-bar{margin:10px 10px 0;z-index:3}
+.architecture-canvas-mode #graphCanvas .graph-stage{position:relative;min-height:0;height:100%;overflow:hidden;cursor:grab;touch-action:none}
+.architecture-canvas-mode #graphCanvas .living-graph-svg{width:100%;height:100%;max-width:none;max-height:none;min-width:0;overflow:hidden;touch-action:none;user-select:none}
+.architecture-canvas-mode #graphCanvas .living-graph-svg.is-panning{cursor:grabbing}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame{pointer-events:none;transition:opacity .12s}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame rect{fill:rgba(255,255,255,.34);stroke:#cfd6e2;stroke-width:1.4;vector-effect:non-scaling-stroke}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame.depth-0 rect{fill:rgba(248,247,252,.66);stroke:#b8b1cf;stroke-width:1.8}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame.depth-1 rect{fill:rgba(251,252,254,.52);stroke:#d8dee8}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame.is-dimmed{opacity:.22}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner{cursor:pointer}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner-hit{fill:rgba(250,249,253,.88);stroke:rgba(184,177,207,.72);stroke-width:1;vector-effect:non-scaling-stroke}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner:hover .architecture-group-owner-hit,.architecture-canvas-mode #graphCanvas .architecture-group-owner:focus .architecture-group-owner-hit{fill:#fff;stroke:#8d83ac;stroke-width:1.5}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner.selected .architecture-group-owner-hit{fill:#fff;stroke:var(--brand-deep);stroke-width:2}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner-name{font-size:11px;font-weight:900;letter-spacing:.075em;fill:#4f4862;text-transform:uppercase;pointer-events:none}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner-health{pointer-events:none}
+.architecture-canvas-mode #graphCanvas .graph-meta{position:absolute;left:12px;bottom:12px;z-index:2;max-width:calc(100% - 24px);margin:0;background:rgba(255,255,255,.92);border:1px solid #e5e9ef;border-radius:10px;padding:5px 7px;pointer-events:none}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools{position:absolute;right:12px;top:12px;z-index:4;display:flex;align-items:center;gap:4px;padding:4px;border:1px solid #dfe5ed;border-radius:11px;background:#fff;box-shadow:0 6px 18px rgba(29,29,31,.08)}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools button{height:30px;min-width:30px;border:0;border-radius:8px;background:#f6f7f9;color:#4f5d6e;padding:0 8px;font-size:10px;font-weight:800;cursor:pointer}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools button:hover{background:var(--brand-soft);color:var(--brand-deep)}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools [data-graph-zoom]{min-width:46px;text-align:center;color:#687586;font-size:9px;font-weight:800}
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .node-responsibility,
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .node-status,
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .graph-edge-label,
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .node-drill-action{opacity:0;pointer-events:none}
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .architecture-group-owner-name{font-size:12px}
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="detail"] .node-status{opacity:0;pointer-events:none}
+.architecture-canvas-mode #view-architecture .graph-side{min-height:0;height:100%;overflow:auto;padding-right:2px}
+.architecture-canvas-mode #view-architecture .graph-side>.panel{min-height:0;padding:16px}
+.architecture-canvas-mode #view-architecture .graph-side>#globalAgentDock{display:grid!important;position:static;inset:auto;width:100%;max-width:none;margin:0;gap:8px}
+.architecture-canvas-mode #globalAgentDock .agent-context-tray-head{align-items:flex-start;display:grid;gap:9px;padding:11px 12px}
+.architecture-canvas-mode #globalAgentDock .agent-context-tray-controls{width:100%;justify-content:space-between}
+.architecture-canvas-mode #globalAgentDock .agent-context-tray-controls label{min-width:0;flex:1}
+.architecture-canvas-mode #globalAgentDock .agent-context-tray-controls select{width:100%}
+.architecture-canvas-mode #globalAgentDock .agent-context-tray-body{padding:11px 12px}
+.architecture-canvas-mode #globalAgentDock .agent-context-boundary{grid-template-columns:repeat(2,minmax(0,1fr))}
+.architecture-canvas-mode #globalAgentDock .global-agent-composer{position:relative;inset:auto;width:100%;padding:12px;gap:10px;grid-template-columns:auto minmax(0,1fr) auto}
+.architecture-canvas-mode #globalAgentDock .global-agent-reply{max-height:96px}
+.architecture-canvas-mode #graphEvidenceTitle{margin-bottom:8px}
+.architecture-inspector-tabs{display:flex;gap:5px;overflow-x:auto;padding:0 0 10px;margin:0 0 12px;border-bottom:1px solid #e7ebf1;scrollbar-width:thin}
+.architecture-inspector-tabs button{flex:0 0 auto;border:0;border-radius:8px;background:transparent;color:#6a7685;padding:7px 8px;font-size:9px;font-weight:800;cursor:pointer}
+.architecture-inspector-tabs button:hover,.architecture-inspector-tabs button.active{background:#f2f0fa;color:var(--brand-deep)}
+.architecture-inspector-content{display:grid;gap:12px;min-width:0}
+.inspector-relationship-endpoints{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px}
+.inspector-relationship-endpoints button,.inspector-code-links button{border:1px solid #e0e5ed;border-radius:10px;background:#fff;color:#4f5d6e;padding:9px;text-align:left;font-size:10px;font-weight:750;cursor:pointer}
+.inspector-relationship-endpoints>span{text-align:center;color:#7b8796;font-size:9px;font-weight:800}
+.inspector-code-links{display:grid;gap:8px}
+.inspector-code-links button{display:grid;gap:4px}
+.inspector-code-links button span{font-size:9px;color:#7b8796;font-weight:650}
+.inspector-evidence-list{display:grid;gap:8px}
+.inspector-evidence-list p{margin:0;padding:9px;border:1px solid #e7ebf1;border-radius:9px;background:#fbfcfe}
+@media(max-width:920px){
+  .architecture-canvas-mode #view-architecture .graph-layout{grid-template-columns:minmax(0,1fr)}
+  .architecture-canvas-mode #view-architecture .graph-side{position:absolute;right:18px;top:82px;bottom:18px;width:min(360px,calc(100vw - 36px));z-index:8;border-radius:16px;background:var(--canvas);box-shadow:0 18px 50px rgba(29,29,31,.16);padding:10px;pointer-events:auto}
 }
 
 /* Architecture review modal reading spacing */
@@ -722,3 +856,177 @@ main{display:block}
   .inspector-facts>div{grid-template-columns:minmax(88px,.8fr) minmax(0,1.2fr)}
   .inspector-technical-facts>div{grid-template-columns:1fr}
 }
+
+
+/* Full-system canvas: editorial hierarchy, quiet domains, deliberate emphasis. */
+.architecture-canvas-mode{--brand-deep:#136f68;--brand:#147d73;--canvas:#f4f6f8}
+.architecture-canvas-mode #workspace{padding:20px 24px 18px;background:#f4f6f8}
+.architecture-canvas-mode #view-architecture.active{gap:18px}
+.architecture-canvas-mode #view-architecture .section-intro{padding:0 2px;min-width:0;gap:16px}
+.architecture-canvas-mode #view-architecture .section-intro>div:first-child{min-width:0}
+.architecture-canvas-mode #view-architecture .section-intro>div:first-child:before{content:'ARCHBRO  /  LIVING ARCHITECTURE';display:block;margin-bottom:7px;color:#56716d;font:750 9px/1.2 system-ui,sans-serif;letter-spacing:1.9px}
+.architecture-canvas-mode #view-architecture .section-intro h2{font-size:26px;font-weight:650;letter-spacing:-.75px;color:#203633;line-height:1.18}
+.architecture-canvas-mode #view-architecture .section-intro p{font-size:11px;line-height:1.5;margin-top:5px;color:#6b7c80}
+.architecture-canvas-mode .architecture-view-tools{gap:10px;flex-shrink:0}
+.architecture-canvas-mode .version-pill{background:#e8f3ef;color:#2b6c57;border:1px solid #cddfd7;font-size:10px}
+.architecture-canvas-mode #view-architecture .graph-layout{grid-template-columns:minmax(0,1fr);gap:16px}
+.architecture-canvas-mode #view-architecture .graph-layout:not(.has-canvas-inspector)>.graph-side{display:none}
+.architecture-canvas-mode #view-architecture .graph-layout.has-canvas-inspector{grid-template-columns:minmax(0,1fr) 330px}
+.architecture-canvas-mode #view-architecture .graph-panel{grid-template-rows:minmax(0,1fr);padding:0;gap:0;border:1px solid #dce4e5;border-radius:16px;background:#fff;box-shadow:0 8px 28px #243e3b06;overflow:hidden}
+.architecture-canvas-mode #view-architecture .graph-panel>.panel-head,.architecture-canvas-mode #graphHealthLegend{display:none}
+.architecture-canvas-mode #graphCanvas{display:flex;flex-direction:column;margin:0;border:0;border-radius:0;background:#fff}
+.architecture-canvas-mode #graphCanvas .graph-stage{flex:1;min-height:0;height:auto;display:grid;grid-template-rows:minmax(0,1fr) auto;padding-top:38px;background:#fff}
+.architecture-canvas-mode #graphCanvas[data-graph-kind="living"] .graph-stage{padding-top:0}
+.architecture-canvas-mode #graphCanvas .living-graph-svg{grid-row:1;display:block}
+.architecture-canvas-mode #graphCanvas .graph-meta{position:static;grid-row:2;max-width:100%;border:0;border-top:1px solid #edf0f2;border-radius:0;padding:12px 18px;gap:0;box-shadow:none;background:#fcfdfd;color:#738589;font-size:10px}
+.architecture-canvas-mode #graphCanvas .graph-meta span{background:transparent;border:0;border-radius:0;padding:0 12px;border-right:1px solid #dfe6e8}
+.architecture-canvas-mode #graphCanvas .graph-meta span:first-child{padding-left:0;color:#344f51;font-weight:700}
+.architecture-canvas-mode #graphCanvas .graph-meta span:last-child{border:0}
+.canvas-reading-toolbar{display:flex;align-items:center;gap:22px;padding:13px 18px;border-bottom:1px solid #e8edee;background:#fff;flex:none;min-width:0}
+.canvas-reading-choice{display:flex;gap:10px;align-items:center;min-width:0;flex-shrink:1}
+.canvas-view-icon{color:#197e73;background:#eaf5f1;border:1px solid #d6e9e1;display:grid;place-items:center;width:30px;height:32px;border-radius:8px;font-size:21px;flex:none}
+.canvas-reading-toolbar label{display:flex;flex-direction:column;gap:3px;min-width:0}
+.canvas-reading-toolbar label>span{font-size:8px;font-weight:750;letter-spacing:1.3px;color:#879794}
+.canvas-reading-toolbar select{max-width:265px;width:100%;min-width:145px;padding:0 17px 0 0;border:0;background:transparent;color:#253f3a;font:650 12px/1.5 system-ui,sans-serif;cursor:pointer;outline-offset:4px}
+.canvas-reading-hint{font-size:10px;color:#8a9898;line-height:1.5}
+.canvas-readonly{display:flex;align-items:center;gap:6px;font-size:9px;color:#718784;white-space:nowrap;margin-left:auto}
+.canvas-readonly i{width:5px;height:5px;background:#4a9e7f;border-radius:50%}
+.architecture-canvas-mode #graphCanvas[data-graph-kind="living"] .graph-viewport-tools{position:static;display:flex;align-items:center;gap:3px;margin-left:auto;box-shadow:none;background:transparent;border:0;padding:0;flex:none}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools button{border-radius:6px;background:#f5f7f8;color:#506b6a;border:1px solid transparent;font-size:10px;padding:5px 8px;min-height:28px}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools button:hover{background:#e8f3ef;color:#176f64}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools [data-canvas-inspector]{margin-right:5px;background:white;border-color:#dae4e3}
+.architecture-canvas-mode #graphCanvas .graph-viewport-tools [data-graph-zoom]{min-width:30px;font-size:9px;color:#839694}
+.canvas-journey-strip{display:flex;gap:7px;align-items:center;overflow:auto;padding:10px 18px;border-bottom:1px solid #e3eeea;background:#f4faf7;flex:none;scrollbar-width:thin}
+.canvas-journey-strip button{white-space:nowrap;display:flex;align-items:center;gap:7px;padding:4px 0;border:0;background:transparent;color:#456862;font:550 10px/1.3 system-ui,sans-serif;cursor:pointer}
+.canvas-journey-strip button span{color:#8aa89e;font-size:8px;font-variant-numeric:tabular-nums}
+.canvas-journey-strip button:hover{color:#0b6f5b;text-decoration:underline}
+.canvas-journey-strip i{font-style:normal;color:#afc6bd;font-size:11px}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame rect{fill:#ffffff80;stroke:#dfe6e8;stroke-width:1}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame.depth-0 rect{fill:var(--domain-wash,#f5f8f8);stroke:var(--domain-color,#c7d7d1);stroke-opacity:.3;stroke-width:1.1}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner-hit{fill:transparent;stroke:none}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner-name,.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .architecture-group-owner-name{font:700 17px system-ui,sans-serif;letter-spacing:0;text-transform:none;fill:var(--domain-color,#456a60)}
+.architecture-canvas-mode #graphCanvas .architecture-group-owner-health{display:none}
+.architecture-canvas-mode #graphCanvas .node-surface{fill:#fff;stroke:#d2dfe0;stroke-width:1;filter:none}
+.architecture-canvas-mode #graphCanvas[data-graph-kind="living"] .node-name{font:650 17px system-ui,sans-serif;fill:#29423f;letter-spacing:0}
+.architecture-canvas-mode #graphCanvas .node-domain-tick{stroke:var(--domain-color,#78928b);stroke-width:2;stroke-linecap:round;opacity:.55}
+.architecture-canvas-mode #graphCanvas[data-graph-kind="living"] .node-kind{display:none}
+.architecture-canvas-mode #graphCanvas[data-graph-kind="living"][data-zoom-tier="full"] .node-kind{display:block;fill:#839894;font-size:7px;transform:translateY(-10px)}
+.architecture-canvas-mode #graphCanvas .canvas-hidden-detail,.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .node-health-dot{display:none}
+.architecture-canvas-mode #graphCanvas .graph-edge-line{stroke:#97acac;stroke-width:1.25;stroke-linejoin:round}
+.architecture-canvas-mode #graphCanvas .graph-edge-source-port{fill:#8da5a1;stroke:none}
+.architecture-canvas-mode #graphCanvas .graph-edge.is-focused .graph-edge-line,.architecture-canvas-mode #graphCanvas .graph-edge.selected .graph-edge-line{stroke:#157d70;stroke-width:2.4;stroke-dasharray:none}
+.architecture-canvas-mode #graphCanvas .graph-edge.is-dimmed{opacity:.12}
+.architecture-canvas-mode #graphCanvas .node-card.is-dimmed{opacity:.5}
+.architecture-canvas-mode #graphCanvas[data-journey="true"] .node-card.is-dimmed{opacity:.35}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame.is-dimmed{opacity:.55}
+.architecture-canvas-mode #graphCanvas .node-card.selected .node-surface{stroke:#148574;stroke-width:2.5;fill:#f5fcf9}
+.architecture-canvas-mode #graphCanvas .canvas-edge-key-bg{fill:#fff;stroke:#d6e7e0;stroke-width:1}
+.architecture-canvas-mode #graphCanvas .canvas-edge-key{font-size:11px;font-weight:650;fill:#237c6c;paint-order:normal;stroke:none}
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .canvas-edge-key,.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .canvas-edge-key-bg{opacity:0}
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .projection-parallel-actions .canvas-edge-key,.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .projection-parallel-actions .canvas-edge-key-bg{opacity:1}
+.architecture-canvas-mode #view-architecture .graph-side{display:flex;flex-direction:column;gap:12px;min-width:0;overflow-wrap:anywhere}
+.architecture-canvas-mode #view-architecture .graph-side>.panel{border:1px solid #dce5e3;border-radius:12px;box-shadow:none;padding:18px;min-width:0}
+.architecture-canvas-mode #selectedNode{order:0;flex:none}
+.architecture-canvas-mode #graphEvidencePanel{order:1;flex:none}
+.architecture-canvas-mode #globalAgentDock{order:2;flex:none}
+.architecture-canvas-mode #selectedNode small{color:#699086;letter-spacing:1.1px;font-size:8px}
+.architecture-canvas-mode #selectedNode h3{font-size:21px;line-height:1.25;letter-spacing:-.4px}
+.architecture-canvas-mode .architecture-inspector-tabs{flex-wrap:wrap;overflow-x:visible}
+.canvas-connection-button{display:flex;width:100%;gap:8px;align-items:flex-start;text-align:left;border:0;background:transparent;padding:9px 0;cursor:pointer;color:#445f5a}
+.canvas-connection-button>span{display:grid;gap:4px;min-width:0}
+.canvas-connection-button strong{font-size:11px;font-weight:650}
+.canvas-connection-button span span{font-size:10px;line-height:1.5;overflow-wrap:anywhere;color:#80928d}
+.canvas-connection-button:hover strong{color:#157d70}
+.architecture-canvas-mode .component-connections li{padding:2px 0;border:0;border-bottom:1px solid #edf1ef;border-radius:0;background:transparent}
+.architecture-canvas-mode #graphCanvas .architecture-group-frame.is-collapsed rect{fill:#edf4f1;stroke-dasharray:5 3}
+.architecture-canvas-mode .has-canvas-inspector .canvas-reading-hint,.architecture-canvas-mode .has-canvas-inspector .canvas-readonly{display:none}
+@media(max-width:1100px){.canvas-reading-hint,.canvas-readonly{display:none}.canvas-reading-toolbar{gap:12px}}
+@media(max-width:920px){
+  .architecture-canvas-mode #workspace{padding:14px}
+  .architecture-canvas-mode #view-architecture .graph-layout.has-canvas-inspector{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(0,.6fr)}
+  .architecture-canvas-mode #view-architecture .graph-layout.has-canvas-inspector>.graph-side{position:static;width:auto;box-shadow:none;max-height:40dvh;grid-row:2}
+  .canvas-reading-toolbar select{max-width:225px}
+}
+@media(max-width:600px){
+  .architecture-canvas-mode #view-architecture .section-intro h2{font-size:21px}
+  .architecture-canvas-mode #view-architecture .section-intro p{font-size:10px}
+  .canvas-reading-toolbar{flex-wrap:wrap;padding:10px 12px;gap:10px}
+  .architecture-canvas-mode #graphCanvas .graph-meta{font-size:8px;padding:9px;flex-wrap:wrap;gap:6px}
+  .architecture-canvas-mode #graphCanvas .graph-meta span{padding:0 6px}
+}
+
+/* CSP-safe fixed domain palette; dynamic Canvas markup selects only a tone index. */
+[data-domain-tone="0"]{--domain-color:#147d73;--domain-wash:#f0f8f6;--connection-color:#147d73}
+[data-domain-tone="1"]{--domain-color:#5265ad;--domain-wash:#f3f5fc;--connection-color:#5265ad}
+[data-domain-tone="2"]{--domain-color:#97602e;--domain-wash:#fcf7f0;--connection-color:#97602e}
+[data-domain-tone="3"]{--domain-color:#307dac;--domain-wash:#f0f7fc;--connection-color:#307dac}
+[data-domain-tone="4"]{--domain-color:#875794;--domain-wash:#f8f3fa;--connection-color:#875794}
+[data-domain-tone="5"]{--domain-color:#71834a;--domain-wash:#f6f8f1;--connection-color:#71834a}
+
+/* Continuous, directional connections: crossings have a gap, never a junction dot. */
+.architecture-canvas-mode #graphCanvas .graph-edge .graph-edge-line,
+.architecture-canvas-mode #graphCanvas .graph-edge .graph-edge-arrow{stroke:#7e9996;stroke-width:1.4;stroke-dasharray:none;stroke-linecap:round;pointer-events:none}
+.architecture-canvas-mode #graphCanvas .graph-edge .graph-edge-casing{stroke:#fff;stroke-width:4.8;stroke-dasharray:none;pointer-events:none}
+.architecture-canvas-mode #graphCanvas .graph-edge:is(.is-focused,.selected,:hover,:focus-visible) .graph-edge-line,
+.architecture-canvas-mode #graphCanvas .graph-edge:is(.is-focused,.selected,:hover,:focus-visible) .graph-edge-arrow{stroke:var(--connection-color,#157d70);stroke-width:1.9}
+.architecture-canvas-mode #graphCanvas .graph-edge .graph-edge-hit{stroke:transparent;stroke-width:14;pointer-events:stroke}
+.architecture-canvas-mode #graphCanvas .living-graph-svg:has(.graph-edge:hover) .graph-edge:not(:hover),
+.architecture-canvas-mode #graphCanvas .living-graph-svg:has(.graph-edge:focus-visible) .graph-edge:not(:focus-visible){opacity:.13}
+.architecture-canvas-mode #graphCanvas .graph-edge:is(:hover,:focus-visible){opacity:1;outline:none}
+
+.connection-directions{display:grid;gap:7px;margin-bottom:18px}
+.connection-directions>small{font-size:9px;letter-spacing:.08em;color:#66847f}
+.connection-directions button{text-align:left;border:1px solid #dce7e4;border-radius:9px;background:#fff;padding:10px;cursor:pointer;color:#34564f}
+.connection-directions button[aria-pressed="true"]{border-color:#157d70;background:#edf7f3}
+.connection-directions strong,.connection-directions span{display:block;font-size:11px;line-height:1.5}
+.connection-directions span{font-size:10px;color:#6c827b;margin-top:3px}
+
+/* Connection hue matches the remote top-level architecture boundary. */
+.canvas-connection-button .canvas-connection-domain{display:flex;align-items:center;gap:6px;color:var(--connection-color);font-size:10px;line-height:1.5}
+.canvas-connection-domain i{display:inline-block;flex:0 0 6px;width:6px;height:6px;border-radius:50%;background:var(--connection-color)}
+.connection-domain-key{display:block;color:#72817e;font-size:10px;line-height:1.5;margin:6px 0 10px}
+
+/* Following one connection reveals both named endpoints without changing scope. */
+.canvas-connection-readout{position:absolute;top:12px;left:12px;max-width:calc(100% - 24px);padding:10px 14px;background:rgba(255,255,255,.97);border:1px solid #dae5e3;border-left:3px solid var(--connection-color);border-radius:8px;box-shadow:0 3px 16px #173f3810;pointer-events:none;z-index:3;display:grid;gap:8px}
+.canvas-connection-readout[hidden]{display:none}
+.canvas-connection-readout strong,.canvas-connection-readout span{display:block;overflow-wrap:anywhere}
+.canvas-connection-readout strong{font-size:12px;color:var(--connection-color);line-height:1.5}
+.canvas-connection-readout span{font-size:11px;color:#607873;line-height:1.5}
+.architecture-canvas-mode #graphCanvas .living-graph-svg.is-tracing-connection .graph-edge:not(.is-tracing-connection){opacity:.08}
+.architecture-canvas-mode #graphCanvas .living-graph-svg.is-tracing-connection .node-card:not(.is-tracing-connection){opacity:.22}
+.architecture-canvas-mode #graphCanvas .living-graph-svg .graph-edge.is-tracing-connection{opacity:1}
+.architecture-canvas-mode #graphCanvas .graph-edge.is-tracing-connection .graph-edge-line,
+.architecture-canvas-mode #graphCanvas .graph-edge.is-tracing-connection .graph-edge-arrow{stroke:var(--connection-color,#157d70);stroke-width:2.4}
+.architecture-canvas-mode #graphCanvas .living-graph-svg .node-card.is-tracing-connection{opacity:1}
+.architecture-canvas-mode #graphCanvas .living-graph-svg .node-card.is-tracing-connection>rect{stroke:var(--domain-color,#157d70);stroke-width:2.2}
+.canvas-connection-button.is-tracing-connection{background:#f0f6f5;box-shadow:inset 3px 0 var(--connection-color,#157d70);border-radius:5px}
+
+.canvas-trace-paint{pointer-events:none}
+.canvas-trace-paint path{fill:none;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+.canvas-trace-paint .canvas-trace-casing{stroke:#fff;stroke-width:5.8}
+.canvas-trace-paint .canvas-trace-stroke{stroke:var(--connection-color);stroke-width:2.4}
+
+/* Semantic summaries retain their individual members and source branches. */
+.architecture-canvas-mode #graphCanvas .graph-edge.is-tracing-individual{opacity:.08!important}
+.architecture-canvas-mode #graphCanvas .canvas-summary-label-leader{stroke:var(--connection-color,#7e9996);stroke-width:1;pointer-events:none}
+.architecture-canvas-mode #graphCanvas .projection-summary .canvas-edge-key-bg{stroke:var(--connection-color,#7e9996);fill:#fff}
+.architecture-canvas-mode #graphCanvas .projection-summary .canvas-edge-key{fill:var(--connection-color,#345e56)}
+.canvas-summary-reset{font-size:10px;border:1px solid #d7e4e0;background:#fff;color:#386b60;border-radius:7px;padding:7px;cursor:pointer;white-space:nowrap}
+.canvas-group-fold,.canvas-group-summary{cursor:pointer}
+.canvas-group-fold rect{fill:#fff;stroke:#d7e2df;stroke-width:1}
+.canvas-group-fold text{font-size:12px;fill:#52726a;font-weight:650;pointer-events:none}
+.canvas-group-fold:hover rect,.canvas-group-fold:focus-visible rect{stroke:#147d73;fill:#eef7f4}
+.canvas-group-summary rect{fill:#fff;stroke:#c5d6d0;stroke-width:1;stroke-dasharray:4 3}
+.canvas-group-summary text{font-size:15px;font-weight:650;fill:#365e54;pointer-events:none}
+.canvas-group-summary .canvas-group-summary-hint{font-size:11px;font-weight:400;fill:#72867f}
+.canvas-group-summary:focus-visible{outline:none}
+.canvas-group-summary:focus-visible rect{stroke:#147d73;stroke-width:2}
+
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .projection-summary .canvas-edge-key,
+.architecture-canvas-mode #graphCanvas[data-zoom-tier="overview"] .projection-summary .canvas-edge-key-bg{opacity:1}
+
+
+/* A filled dot marks only a server-authored branch junction, never a crossing. */
+.architecture-canvas-mode #graphCanvas .canvas-summary-junction-hit{fill:transparent;stroke:none;pointer-events:all}
+.architecture-canvas-mode #graphCanvas .canvas-summary-junction,
+.canvas-trace-paint .canvas-trace-junction{fill:var(--connection-color,#7e9996);stroke:none;pointer-events:none}

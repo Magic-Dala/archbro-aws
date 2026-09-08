@@ -105,3 +105,11 @@ This strict acceptance surface intentionally exposes no project-delete Site Tool
 ## Final status
 
 Report `READY` only when native discovery, ping identity, bootstrap/read/path, task lifecycle, observation invariant, Code Architecture boundary, human-review boundary, and stale-version guard all pass using WebMCP only.
+
+## Stage 3 composition
+
+This native WebMCP runbook is one verifier input, not a substitute for Architecture Canvas browser acceptance. Stage 3 composes it with `qa/frontend_acceptance.py --stage3` and the frozen same-SHA verifiers. The browser harness must consume the server-authored Canvas/path/context surfaces; it must not replay WebMCP data into a second client topology.
+
+An unavailable native Site Tools host, authenticated browser session, PostgreSQL runtime, or browser runtime is `UNAVAILABLE`, never `READY` or `PASS`. Preserve the concrete reason and continue only when the required verifier environment exists.
+
+Trace Path acceptance must preserve backend statuses such as `FOUND`, `UNREACHABLE`, `LIMIT_REACHED`, and stale-version failure. Code Truth and connected-MCP output remain evidence; ordinary Canvas interaction and Observation must not mutate accepted Living Architecture, while a structural recommendation remains `PENDING` until explicit Human Review.

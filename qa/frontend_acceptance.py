@@ -27,6 +27,87 @@ UI_REPORT_JSON = UI_REPORT_DIR / "report.json"
 UI_REPORT_HTML = UI_REPORT_DIR / "index.html"
 
 
+def _stage3_layout_fixture(size: int) -> dict:
+    nodes = []
+    edges = []
+    root_count = 4
+    for index in range(size):
+        node_id = f"node-{index:02d}"
+        parent_id = None if index < root_count else f"node-{index % root_count:02d}"
+        node = {
+            "id": node_id,
+            "semantic_kind": "SYSTEM" if parent_id is None else "SERVICE",
+            "semantic_type": "system" if parent_id is None else "service",
+        }
+        if parent_id is not None:
+            node["parent_id"] = parent_id
+        nodes.append(node)
+        if index:
+            edges.append(
+                {
+                    "id": f"edge-{index - 1:02d}-{index:02d}",
+                    "source": f"node-{index - 1:02d}",
+                    "target": node_id,
+                    "semantic_type": "DEPENDS_ON",
+                }
+            )
+    return {
+        "diagram_version": "archbro.diagram.v1",
+        "architecture_version": 1,
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def stage3_layout_probe(repeats: int = 5) -> dict:
+    """Record supported synthetic timing evidence without inventing a production SLO."""
+    from dataclasses import asdict
+
+    source_root = str(ROOT / "src")
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
+    from archbro.backend.core.diagram_layout import layout_canvas_diagram
+
+    results = {}
+    for size in (27, 40):
+        fixture = _stage3_layout_fixture(size)
+        samples_ms = []
+        rendered = None
+        for _ in range(repeats):
+            started = time.perf_counter()
+            rendered = layout_canvas_diagram(fixture)
+            samples_ms.append((time.perf_counter() - started) * 1000.0)
+        assert rendered is not None
+        encoded = json.dumps(asdict(rendered), sort_keys=True, separators=(",", ":"))
+        ordered = sorted(samples_ms)
+        results[str(size)] = {
+            "status": "PASS",
+            "fixture_nodes": size,
+            "repeats": repeats,
+            "median_ms": round(ordered[len(ordered) // 2], 3),
+            "max_ms": round(max(samples_ms), 3),
+            "payload_bytes": len(encoded.encode("utf-8")),
+            "asserted_slo": None,
+        }
+    return {
+        "status": "PASS",
+        "classification": "SYNTHETIC_LAYOUT_EVIDENCE",
+        "fixtures": results,
+        "production_slo_claimed": False,
+    }
+
+
+def _stage3_unavailable_reason(text: str) -> str | None:
+    lowered = text.lower()
+    markers = (
+        "no module named 'playwright'",
+        "executable doesn't exist",
+        "playwright install",
+        "browser executable",
+    )
+    return next((marker for marker in markers if marker in lowered), None)
+
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -212,9 +293,10 @@ def generate_report(test_exit_code: int, stdout: str, stderr: str, hierarchy_dri
             "stdout_tail": stdout[-4000:],
             "stderr_tail": stderr[-4000:],
         },
-        "hierarchy_drill": hierarchy_drill or {"status": "FAIL", "detail": "Hierarchy drill probe did not run."},
+        "legacy_hierarchy_drill": hierarchy_drill or {"status": "FAIL", "detail": "Hierarchy drill probe did not run."},
+        "hierarchy_drill_gate": "DIAGNOSTIC_ONLY_CANVAS_V2",
     }
-    if test_exit_code != 0 or combined["hierarchy_drill"].get("status") != "PASS":
+    if test_exit_code != 0:
         combined["result"] = "FAIL"
 
     UI_REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -265,7 +347,7 @@ def _drop_schema(base_dsn: str, run_dsn: str) -> None:
         pass
 
 
-def run(open_report: bool = False) -> int:
+def run(open_report: bool = False, stage3: bool = False) -> int:
     ART.mkdir(parents=True, exist_ok=True)
     SWEEP_REPORT.unlink(missing_ok=True)
 
@@ -277,7 +359,21 @@ def run(open_report: bool = False) -> int:
     env["ARCHBRO_PROVIDER"] = "fake"
     env["ARCHBRO_AUTH_MODE"] = "local"
     env["ARCHBRO_PERSISTENCE"] = "postgres"
-    base_dsn, run_dsn = _provision_schema()
+    try:
+        base_dsn, run_dsn = _provision_schema()
+    except SystemExit as exc:
+        if not stage3:
+            raise
+        UI_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        unavailable = {
+            "schema": "archbro.stage3_acceptance.v1",
+            "result": "UNAVAILABLE",
+            "reason": str(exc),
+            "hard_acceptance_passed": False,
+        }
+        UI_REPORT_JSON.write_text(json.dumps(unavailable, indent=2), encoding="utf-8")
+        print("STAGE3_ACCEPTANCE UNAVAILABLE", json.dumps({"reason": str(exc)}))
+        return 2
     env["DATABASE_URL"] = run_dsn
 
     server = subprocess.Popen(
@@ -308,7 +404,7 @@ def run(open_report: bool = False) -> int:
         wait_for_health(server, base_url)
         test_env = env.copy()
         test_env["ARCHBRO_BASE_URL"] = base_url
-        test_env["ARCHBRO_FINAL_FIX_CASES"] = "autonomous_surface_sweep"
+        test_env["ARCHBRO_FINAL_FIX_CASES"] = "autonomous_surface_sweep,architecture_canvas_interactions"
         completed = subprocess.run(
             [sys.executable, str(ROOT / "qa" / "playwright_final_fix.py")],
             cwd=ROOT,
@@ -331,7 +427,6 @@ def run(open_report: bool = False) -> int:
             text=True,
             timeout=60,
         )
-        test_exit_code = test_exit_code or drill.returncode
         test_stdout += f"\n\nHIERARCHY_DRILL_STDOUT\n{drill.stdout}"
         test_stderr += f"\n\nHIERARCHY_DRILL_STDERR\n{drill.stderr}"
         if drill.returncode == 0:
@@ -339,7 +434,6 @@ def run(open_report: bool = False) -> int:
                 hierarchy_drill = {"status": "PASS", **json.loads(drill.stdout)}
             except json.JSONDecodeError as exc:
                 hierarchy_drill = {"status": "FAIL", "detail": f"Invalid hierarchy drill JSON: {exc}", "stdout": drill.stdout[-2000:]}
-                test_exit_code = 1
         else:
             hierarchy_drill = {
                 "status": "FAIL",
@@ -359,6 +453,31 @@ def run(open_report: bool = False) -> int:
         _drop_schema(base_dsn, run_dsn)
 
     report = generate_report(test_exit_code, test_stdout, test_stderr, hierarchy_drill)
+    if stage3:
+        unavailable_reason = _stage3_unavailable_reason(test_stdout + "\n" + test_stderr)
+        if unavailable_reason:
+            report["result"] = "UNAVAILABLE"
+            report["stage3"] = {
+                "status": "UNAVAILABLE",
+                "reason": unavailable_reason,
+                "hard_acceptance_passed": False,
+            }
+        else:
+            try:
+                report["stage3"] = {
+                    "status": "PASS" if report.get("result") == "PASS" else "FAIL",
+                    "canvas_case": "architecture_canvas_interactions",
+                    "layout_probe": stage3_layout_probe(),
+                    "hard_acceptance_passed": report.get("result") == "PASS",
+                }
+            except Exception as exc:  # noqa: BLE001 - evidence is surfaced verbatim
+                report["stage3"] = {
+                    "status": "FAIL",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "hard_acceptance_passed": False,
+                }
+                report["result"] = "FAIL"
+        UI_REPORT_JSON.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     failures = [surface for surface in report.get("surfaces", []) if surface.get("status") == "FAIL"]
     print(
         "FRONTEND_ACCEPTANCE",
@@ -377,6 +496,8 @@ def run(open_report: bool = False) -> int:
     if open_report:
         webbrowser.open(UI_REPORT_HTML.resolve().as_uri())
 
+    if report.get("result") == "UNAVAILABLE":
+        return 2
     return 0 if report.get("result") == "PASS" else 1
 
 
@@ -386,12 +507,29 @@ class FrontendAcceptanceTest(unittest.TestCase):
     def test_frontend_acceptance(self) -> None:
         self.assertEqual(run(open_report=False), 0)
 
+    def test_stage3_layout_probe_contract(self) -> None:
+        report = stage3_layout_probe(repeats=2)
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["classification"], "SYNTHETIC_LAYOUT_EVIDENCE")
+        self.assertFalse(report["production_slo_claimed"])
+        self.assertEqual(set(report["fixtures"]), {"27", "40"})
+        for size, evidence in report["fixtures"].items():
+            self.assertEqual(evidence["status"], "PASS")
+            self.assertEqual(evidence["fixture_nodes"], int(size))
+            self.assertGreater(evidence["payload_bytes"], 0)
+            self.assertIsNone(evidence["asserted_slo"])
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run ArchBro autonomous frontend acceptance.")
     parser.add_argument("--open", action="store_true", help="Open the generated HTML report in the default browser.")
+    parser.add_argument(
+        "--stage3",
+        action="store_true",
+        help="Run the Stage 3 Canvas coordinator and 27/40 synthetic layout evidence probe.",
+    )
     args = parser.parse_args()
-    return run(open_report=args.open)
+    return run(open_report=args.open, stage3=args.stage3)
 
 
 if __name__ == "__main__":

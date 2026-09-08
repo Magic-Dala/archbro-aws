@@ -70,7 +70,7 @@ These provider restrictions are independent of the normal Archbro project permis
 5. Read tools refresh current backend state before returning decision context so external evidence is not hidden behind stale browser memory.
 6. WebMCP does not write canonical persistence directly and does not bypass Archbro validation or authorization boundaries. A Code Architecture publish uses an authorized API to persist a derived evidence artifact only.
 7. `update_component` remains metadata-only. Structural decomposition uses `archbro_expand_architecture_scope`, which is additive, one-level-at-a-time, stable-ID preserving, and reviewable before acceptance.
-8. The host must use `archbro_get_architecture_diagram` for hierarchical drill-down. It must not infer, crop, or manufacture child topology from a full-tree browser snapshot.
+8. The host must use `archbro_get_architecture_diagram` for hierarchical drill-down. It must not infer, crop, or manufacture child topology from a full-tree browser snapshot. The first-party Architecture Canvas is a separate read-only presentation surface: it may request the backend-authored complete canonical Diagram IR for whole-system rendering, but it still must not infer or persist alternate topology in the browser.
 9. Code Architecture is not Living Architecture. Code nodes use `code-node:*`, require exact 40-character Git revision provenance plus source excerpts, and cannot alter accepted `node:<component_id>` topology or version.
 10. Before publishing Code Architecture, the host must inspect the connected GitHub repository at the exact revision. File names, folder proximity, or an unpinned branch HEAD are insufficient implementation evidence.
 11. Initial WebMCP planning is recursive even though persistence is atomic: the host must first choose stable SYSTEM_MAP roots, then evaluate every canonical component in preorder. Every SYSTEM_MAP root must be EXPANDED with at least one child. Below those roots, each scope must be EXPANDED with its exact immediate child ids or a JUSTIFIED_LEAF with a specific reason; only then may the host reconcile authored relationships and tasks. `planning_trace` must exactly match the submitted hierarchy; post-bootstrap structural changes still use reviewable `archbro_expand_architecture_scope` proposals.
@@ -117,3 +117,9 @@ Natural-language request
 The acceptance-safe mode is available at `/?mode=webmcp`. In this mode the human project-creation flow, built-in architecture generation, built-in agent messaging, and manual task Start/Done controls are disabled so an acceptance run cannot silently fall back to DOM automation. Human architecture Accept/Reject remains enabled.
 
 For normal production use, Code Architecture evidence should come from source inspected at the pinned revision. A deterministic synthetic evidence fixture is acceptable only for black-box contract acceptance where the verifier is intentionally restricted to Archbro's native WebMCP surface.
+
+## Canvas v2 acceptance relationship
+
+The WebMCP node/path tools and Architecture Canvas consume the same backend-owned architecture truth. Stage 3 validates visible Trace Path against the canonical path result, Context Tray against the server Agent Context Manifest and preview hash, and keeps Code Truth or MCP material in the evidence boundary rather than canonical Architecture.
+
+See `ARCHITECTURE_CANVAS_V2.md` for the Stage 3 browser, 27/40 probe, real-auth, `UNAVAILABLE`, and same-SHA acceptance rules.

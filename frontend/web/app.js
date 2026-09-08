@@ -11,10 +11,16 @@ import {
 } from './firebase-auth.js?v=20260901-auth-providers';
 
 const prototype = window.ArchbroPrototype;
-const initialUrlParams = new URLSearchParams(window.location.search);
-const requestedProjectId = initialUrlParams.get('project')?.trim() || null;
+const URL_PARAMS = new URLSearchParams(window.location.search);
+let ARCHITECTURE_CANVAS_MODE = URL_PARAMS.get('canvas') === 'architecture';
+const REQUESTED_PROJECT_ID = String(URL_PARAMS.get('project') || '').trim() || null;
+const REQUESTED_ARCHITECTURE_NODE_ID = String(URL_PARAMS.get('node') || '').trim() || null;
+const INSPECTOR_TABS = new Set(['overview','dependencies','tasks','evidence','code','decisions']);
+const REQUESTED_INSPECTOR_TAB = INSPECTOR_TABS.has(String(URL_PARAMS.get('tab') || '').trim().toLowerCase())
+  ? String(URL_PARAMS.get('tab')).trim().toLowerCase()
+  : 'overview';
 const persistedProjectId = localStorage.getItem('archbro-project-id');
-const initialProjectId = requestedProjectId || persistedProjectId;
+const initialProjectId = REQUESTED_PROJECT_ID || persistedProjectId;
 const WEBMCP_AGENT_MODE = new URLSearchParams(window.location.search).get('mode') === 'webmcp';
 const AUTH_PROVIDER_SIGN_INS = new Map([
   ['google', signInWithGoogleAccount],
@@ -34,6 +40,110 @@ function loadExpandedProjectIds(storage = localStorage) {
 function persistExpandedProjectIds(storage = localStorage) {
   storage.setItem('archbro-expanded-projects', JSON.stringify([...state.expandedProjectIds]));
 }
+
+// WORKSPACE_ASYNC_STATE_START
+function makeWorkspaceAsyncState(projectId = null) {
+  const resource = () => ({requestGeneration:0,status:'idle',error:null,refreshing:false});
+  return {
+    generation:0,
+    projectId:projectId || null,
+    architectureVersion:null,
+    phase:'idle',
+    error:null,
+    resources:{canvas:resource(),codeArchitecture:resource()},
+  };
+}
+
+function beginWorkspaceContext(asyncState, projectId) {
+  const sameProject = asyncState.projectId === (projectId || null);
+  asyncState.generation += 1;
+  asyncState.projectId = projectId || null;
+  asyncState.phase = 'loading';
+  asyncState.error = null;
+  if (!sameProject) asyncState.architectureVersion = null;
+  for (const resource of Object.values(asyncState.resources)) {
+    // Every new core-context request invalidates optional results launched by
+    // an older context. Ready data may remain visible until the replacement
+    // context has been committed, but an old request can never settle it.
+    resource.requestGeneration += 1;
+    resource.refreshing = false;
+    if (!sameProject) {
+      resource.status = 'idle';
+      resource.error = null;
+    }
+  }
+  return {generation:asyncState.generation,projectId:asyncState.projectId,architectureVersion:asyncState.architectureVersion};
+}
+
+function workspaceContextIsCurrent(asyncState, ticket) {
+  return Boolean(ticket)
+    && asyncState.generation === ticket.generation
+    && asyncState.projectId === ticket.projectId;
+}
+
+function bindWorkspaceContextArchitecture(asyncState, ticket, architectureVersion) {
+  if (!workspaceContextIsCurrent(asyncState, ticket)) return false;
+  const version = Number(architectureVersion) || 0;
+  asyncState.architectureVersion = version;
+  asyncState.phase = 'ready';
+  asyncState.error = null;
+  ticket.architectureVersion = version;
+  return true;
+}
+
+function failWorkspaceContext(asyncState, ticket, error) {
+  if (!workspaceContextIsCurrent(asyncState, ticket)) return false;
+  asyncState.phase = 'failed';
+  asyncState.error = error?.message || String(error || 'Workspace could not be restored.');
+  return true;
+}
+
+function currentWorkspaceContextTicket(asyncState) {
+  return {
+    generation:asyncState.generation,
+    projectId:asyncState.projectId,
+    architectureVersion:asyncState.architectureVersion,
+  };
+}
+
+function beginWorkspaceResource(asyncState, name, contextTicket, {retainData = false} = {}) {
+  const resource = asyncState.resources[name];
+  if (!resource || !workspaceContextIsCurrent(asyncState, contextTicket)
+      || Number(contextTicket.architectureVersion || 0) !== Number(asyncState.architectureVersion || 0)) return null;
+  resource.requestGeneration += 1;
+  const keepReady = Boolean(retainData && resource.status === 'ready');
+  resource.refreshing = keepReady;
+  resource.status = keepReady ? 'ready' : 'loading';
+  resource.error = null;
+  return {
+    name,
+    requestGeneration:resource.requestGeneration,
+    contextGeneration:contextTicket.generation,
+    projectId:contextTicket.projectId,
+    architectureVersion:Number(contextTicket.architectureVersion || 0),
+  };
+}
+
+function workspaceResourceIsCurrent(asyncState, request) {
+  if (!request) return false;
+  const resource = asyncState.resources[request.name];
+  return Boolean(resource)
+    && asyncState.generation === request.contextGeneration
+    && asyncState.projectId === request.projectId
+    && Number(asyncState.architectureVersion || 0) === Number(request.architectureVersion || 0)
+    && resource.requestGeneration === request.requestGeneration;
+}
+
+function settleWorkspaceResource(asyncState, request, status, error = null) {
+  if (!workspaceResourceIsCurrent(asyncState, request)) return false;
+  const resource = asyncState.resources[request.name];
+  resource.status = status;
+  resource.error = error ? (error?.message || String(error)) : null;
+  resource.refreshing = false;
+  return true;
+}
+// WORKSPACE_ASYNC_STATE_END
+
 const state = {
   projectId: initialProjectId,
   projects: [],
@@ -48,17 +158,37 @@ const state = {
   selectedCodeNodeId: null,
   scopeComponentId: null,
   readingMode: 'MAP',
+  canvasInspectorOpen: false,
   selectedComponentId: null,
+  selectedEdgeId: null,
+  tracePathRequest: null,
+  tracePathResult: null,
+  tracePathLoading: false,
+  tracePathError: null,
+  tracePathRequestSerial: 0,
+  inspectorTab: REQUESTED_INSPECTOR_TAB,
+  canvasDeepLinkApplied: false,
+  canvasDeepLinkFocusPending: false,
   graphFocusMode: 'all',
+  collapsedNodeIds: new Set(),
   proposals: [],
   activity: [],
   lastRun: null,
+  agentContextManifest: null,
+  agentContextKey: null,
+  agentContextLoading: false,
+  agentContextError: null,
+  agentContextPromise: null,
+  agentContextRequestSerial: 0,
+  agentContextPolicy: 'ASK_ALL',
+  agentContextTelemetryVisible: true,
   selectedTaskId: null,
   selectedProposalId: null,
   currentView: 'overview',
   taskUpdating: new Set(),
   expandedProjectIds: loadExpandedProjectIds(),
   projectSnapshots: new Map(),
+  workspaceAsync: makeWorkspaceAsyncState(initialProjectId),
   renamingProjectId: null,
   openProjectMenuId: null,
   projectMenuFocusId: null,
@@ -100,10 +230,11 @@ function commitWorkspaceContext(request, context, updates = {}, {requireSelected
 if (initialProjectId) state.expandedProjectIds.add(initialProjectId);
 
 state.experience = {
-  phase: 'landing',
+  phase: 'restoring',
   authMode: 'signin',
   selectedLens: null,
   workspaceInitialized: false,
+  workspaceError: null,
   dialogReturnFocus: new Map(),
   authClosingReturnFocus: true,
 };
@@ -121,16 +252,85 @@ const views = {
   architecture: {title: 'Architecture', subtitle: 'Compare accepted design intent with revision-pinned implementation evidence.'},
 };
 
+const architectureViewCache = {
+  projectId: null,
+  architectureVersion: null,
+  canvas: null,
+  project: null,
+};
+
+function resetArchitectureViewCache(projectId, architectureVersion) {
+  const version = Number(architectureVersion) || 0;
+  if (architectureViewCache.projectId !== projectId || architectureViewCache.architectureVersion !== version) {
+    architectureViewCache.projectId = projectId;
+    architectureViewCache.architectureVersion = version;
+    architectureViewCache.canvas = null;
+    architectureViewCache.project = null;
+  }
+  return architectureViewCache;
+}
+
+function cacheArchitectureView(kind, projectId, architectureVersion, diagram) {
+  if (!['canvas','project'].includes(kind) || !diagram) return diagram;
+  resetArchitectureViewCache(projectId, architectureVersion)[kind] = diagram;
+  return diagram;
+}
+
+function cachedArchitectureView(kind, projectId, architectureVersion) {
+  const version = Number(architectureVersion) || 0;
+  if (architectureViewCache.projectId !== projectId || architectureViewCache.architectureVersion !== version) return null;
+  return architectureViewCache[kind] || null;
+}
+
 function showExperience(phase) {
   state.experience.phase = phase;
-  $('entryExperience').classList.toggle('hidden', phase === 'workspace');
+  const bootstrapVisible = phase === 'restoring' || phase === 'failed';
+  $('bootstrapExperience')?.classList.toggle('hidden', !bootstrapVisible);
+  $('entryExperience').classList.toggle('hidden', phase === 'workspace' || bootstrapVisible);
   $('workspaceShell').classList.toggle('hidden', phase !== 'workspace');
+  if (phase === 'restoring') {
+    state.experience.workspaceError = null;
+    if ($('bootstrapExperienceMessage')) $('bootstrapExperienceMessage').textContent = 'Restoring your workspace…';
+    $('bootstrapRecoveryActions')?.classList.add('hidden');
+  }
   for (const viewName of ['landing', 'auth', 'preference']) {
     if (viewName === 'auth') continue;
     const view = $(`${viewName}View`);
     if (!view) continue;
     const shouldHide = phase === 'auth' ? viewName !== 'landing' : phase !== viewName;
     view.classList.toggle('hidden', shouldHide);
+  }
+}
+
+// WORKSPACE_RECOVERY_START
+function showWorkspaceRecovery(error) {
+  const message = error?.message || String(error || 'Workspace could not be restored.');
+  state.experience.workspaceError = message;
+  showExperience('failed');
+  if ($('bootstrapExperienceMessage')) $('bootstrapExperienceMessage').textContent = `Workspace could not be restored. ${message}`;
+  $('bootstrapRecoveryActions')?.classList.remove('hidden');
+}
+// WORKSPACE_RECOVERY_END
+
+async function retryWorkspaceRestore() {
+  const retryButton = $('bootstrapRetryBtn');
+  if (retryButton?.disabled) return false;
+  if (retryButton) retryButton.disabled = true;
+  state.experience.workspaceInitialized = false;
+  showExperience('restoring');
+  try {
+    const initialized = await initializeWorkspace();
+    if (!initialized) {
+      showWorkspaceRecovery(new Error(state.workspaceAsync.error || state.experience.workspaceError || 'Workspace could not be restored.'));
+      return false;
+    }
+    state.experience.workspaceInitialized = true;
+    showExperience('workspace');
+    renderAccountIdentity();
+    syncMobileSidebarLayers();
+    return true;
+  } finally {
+    if (retryButton) retryButton.disabled = false;
   }
 }
 
@@ -313,13 +513,19 @@ async function submitAuthentication(event) {
 }
 
 async function enterWorkspace() {
-  showExperience('workspace');
   if (!state.experience.workspaceInitialized) {
+    showExperience('restoring');
     const initialized = await initializeWorkspace();
-    if (!initialized) return;
+    if (!initialized) {
+      state.experience.workspaceInitialized = false;
+      showWorkspaceRecovery(new Error(state.workspaceAsync.error || 'Workspace could not be restored.'));
+      return false;
+    }
     state.experience.workspaceInitialized = true;
   }
+  showExperience('workspace');
   renderAccountIdentity();
+  return true;
 }
 
 async function api(path, options = {}) {
@@ -341,7 +547,8 @@ async function api(path, options = {}) {
       let detail = 'Request failed';
       try {
         const body = await res.json();
-        detail = body.detail || JSON.stringify(body);
+        const rawDetail = body.detail ?? body;
+        detail = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
       } catch {}
       throw new Error(`${res.status}: ${detail}`);
     }
@@ -489,6 +696,9 @@ function renderWorkspaceHome() {
 
 async function openPersonalWorkspace() {
   supersedeWorkspaceContextRequests();
+  beginWorkspaceContext(state.workspaceAsync, null);
+  state.workspaceAsync.phase = 'ready';
+  state.workspaceAsync.architectureVersion = 0;
   state.projectId = null;
   state.project = null;
   state.tasks = [];
@@ -502,7 +712,13 @@ async function openPersonalWorkspace() {
   state.graphFocusMode = 'all';
   state.proposals = [];
   state.lastRun = null;
+  clearAgentContextPreview();
   state.selectedComponentId = null;
+  state.selectedEdgeId = null;
+  state.inspectorTab = 'overview';
+  state.canvasDeepLinkApplied = false;
+  state.canvasDeepLinkFocusPending = false;
+  state.collapsedNodeIds.clear();
   state.scopeComponentId = null;
   state.readingMode = 'MAP';
   state.selectedTaskId = null;
@@ -754,7 +970,7 @@ function normalizeDiagramGraph(payload) {
   const layout = payload?.positioned_graph || payload?.positionedGraph || payload?.layout;
   if (!diagram || !layout) throw new Error('Positioned diagram response must include DiagramView and PositionedGraph.');
   if (diagram.diagram_version !== 'archbro.diagram.v1') throw new Error(`Unsupported diagram contract: ${diagram.diagram_version || 'missing'}`);
-  if (layout.layout_version !== 'archbro.layout.v1') throw new Error(`Unsupported layout contract: ${layout.layout_version || 'missing'}`);
+  if (!['archbro.layout.v1','archbro.canvas-layout.v2','archbro.canvas-layout.v3','archbro.canvas-layout.v4','archbro.canvas-layout.v5','archbro.canvas-layout.v6','archbro.canvas-layout.v7','archbro.canvas-layout.v8','archbro.canvas-layout.v9'].includes(layout.layout_version)) throw new Error(`Unsupported layout contract: ${layout.layout_version || 'missing'}`);
   if (Number(diagram.architecture_version) !== Number(layout.architecture_version)) throw new Error('Diagram and layout architecture versions do not match.');
   const positionedById = new Map((layout.nodes || []).map((node) => [node.node_id, node]));
   const nodes = (diagram.nodes || []).map((node) => {
@@ -793,6 +1009,88 @@ function normalizeScopedDiagramResponse(payload, requestedScopeComponentId = nul
   if (requestedScopeComponentId && componentId !== requestedScopeComponentId) throw new Error(`Scoped diagram response returned ${componentId || 'ROOT'} instead of ${requestedScopeComponentId}.`);
   const ancestorPath = Array.isArray(raw?.ancestor_path) ? raw.ancestor_path.map((item) => ({componentId:item.component_id ?? null,nodeId:item.node_id ?? null,label:String(item.label || item.component_id || 'Overview')})).filter((item) => item.componentId) : [];
   return {...graph, scope:{componentId,nodeId:raw?.node_id ?? (componentId ? `node:${componentId}` : null),label:String(raw?.label || (componentId ? componentId : 'Overview')),isLeaf:Boolean(raw?.is_leaf),ancestorPath,directRelationships:Array.isArray(raw?.direct_relationships) ? raw.direct_relationships : []}};
+}
+
+function normalizeFullCanvasResponse(payload) {
+  if (payload?.schema !== 'archbro.full_canvas.v1') throw new Error(`Unsupported full canvas envelope: ${payload?.schema || 'missing'}`);
+  const graph = normalizeDiagramGraph(payload);
+  const nodeIds = new Set(graph.nodes.map((node) => node.id));
+  const rawFrames = Array.isArray(payload.group_frames) ? payload.group_frames : [];
+  const groupFrames = rawFrames.map((frame) => {
+    const nodeId = String(frame.node_id || '');
+    const parentGroupId = frame.parent_group_id ? String(frame.parent_group_id) : null;
+    const numbers = [frame.x, frame.y, frame.width, frame.height, frame.depth, frame.order].map(Number);
+    if (!nodeIds.has(nodeId)) throw new Error(`Canvas group frame references unknown node ${nodeId || 'missing'}.`);
+    if (parentGroupId && !nodeIds.has(parentGroupId)) throw new Error(`Canvas group frame references unknown parent ${parentGroupId}.`);
+    if (numbers.slice(0,4).some((value) => !Number.isFinite(value)) || numbers[2] <= 0 || numbers[3] <= 0) throw new Error(`Invalid canvas group frame ${nodeId}.`);
+    return {nodeId,parentGroupId,x:numbers[0],y:numbers[1],width:numbers[2],height:numbers[3],depth:numbers[4],order:numbers[5]};
+  }).sort((a,b)=>a.depth-b.depth || a.order-b.order || a.nodeId.localeCompare(b.nodeId));
+  const edgeIds = new Set(graph.edges.map((edge) => edge.id));
+  const readingViews = (payload.reading_views || []).map((view) => {
+    if (Number(view.architecture_version)!==graph.architectureVersion || !view.id || !Array.isArray(view.edge_ids) || view.edge_ids.some((id) => !edgeIds.has(id))) throw new Error('Canvas reading view references an unknown relationship.');
+    if (view.node_ids && (!Array.isArray(view.node_ids) || view.node_ids.some((id) => !nodeIds.has(id)))) throw new Error('Canvas reading view references an unknown node.');
+    return {id:String(view.id), label:String(view.label || view.id), kind:view.kind || '', source:view.source || '', edgeIds:view.edge_ids, nodeIds:view.node_ids || []};
+  });
+  const summaryEnvelope=payload.connection_summaries;
+  const summaryMembers=new Set(), summaryIds=new Set();
+  if(summaryEnvelope && (summaryEnvelope.schema!=='archbro.connection-summaries.v1' || summaryEnvelope.architecture_version!==graph.architectureVersion || !Array.isArray(summaryEnvelope.groups))) throw new Error('Connection summary version does not match this architecture.');
+  const connectionSummaries=(summaryEnvelope?.groups || []).map(raw=>{
+    const members=raw.member_edge_ids;
+    if(!raw.id || summaryIds.has(raw.id) || raw.architecture_version!==graph.architectureVersion || !['IN','OUT'].includes(raw.direction) || !nodeIds.has(raw.hub_node_id) || !nodeIds.has(raw.domain_node_id) || !Array.isArray(members) || members.length<2 || new Set(members).size!==members.length || members.some(id=>!edgeIds.has(id) || summaryMembers.has(id)) || !members.includes(raw.primary_edge_id)) throw new Error('Invalid connection summary membership.');
+    const facts=members.map(id=>graph.edges.find(edge=>edge.id===id));
+    const peers=facts.map(edge=>raw.direction==='IN'?edge.source:edge.target), peerCount=new Set(peers).size;
+    if(peerCount<2 || facts.some(edge=>(raw.direction==='IN'?edge.target:edge.source)!==raw.hub_node_id || edge.relationship_category!==raw.relationship_category || graph.edges.some(other=>other.source===edge.target && other.target===edge.source)) || peers.some(id=>graph.nodes.find(node=>node.id===id)?.hierarchyPath[0]!==raw.domain_node_id)) throw new Error('Connection summary mixes boundaries, direction, or category.');
+    const points=rawPoints=>{
+      if(!Array.isArray(rawPoints) || rawPoints.length<2) throw new Error('Missing summary route.');
+      const parsed=rawPoints.map(p=>({x:Number(p.x),y:Number(p.y)}));
+      if(parsed.some((p,i)=>!Number.isFinite(p.x) || !Number.isFinite(p.y) || (i && p.x!==parsed[i-1].x && p.y!==parsed[i-1].y))) throw new Error('Invalid summary route.');
+      return parsed;
+    };
+    if(!Array.isArray(raw.paths) || raw.paths.length!==peerCount || !raw.member_paths || Object.keys(raw.member_paths).length!==members.length) throw new Error('Incomplete summary routes.');
+    const paths=raw.paths.map(points), memberPaths={};
+    const primary=facts.find(edge=>edge.id===raw.primary_edge_id);
+    for(const fact of facts) {
+      const route=points(raw.member_paths[fact.id]);
+      const startAllowed=raw.direction==='IN' ? [fact.points[0]] : [primary.points[0],fact.points[0]];
+      const endAllowed=raw.direction==='IN' ? [primary.points.at(-1),fact.points.at(-1)] : [fact.points.at(-1)];
+      if(!startAllowed.some(point=>JSON.stringify(route[0])===JSON.stringify(point)) || !endAllowed.some(point=>JSON.stringify(route.at(-1))===JSON.stringify(point))) throw new Error('Summary route changes a peer or shared endpoint.');
+      memberPaths[fact.id]=route;
+    }
+    if(JSON.stringify(paths[0])!==JSON.stringify(primary.points)) throw new Error('Summary trunk must follow the canonical primary route.');
+    if(raw.junctions!==undefined && !Array.isArray(raw.junctions)) throw new Error('Invalid summary junctions.');
+    const junctionRayCount=(point)=>{
+      const rays=new Set();
+      const ray=(other)=>other.x<point.x?'L':other.x>point.x?'R':other.y<point.y?'U':other.y>point.y?'D':null;
+      const contains=(a,b)=>a.x===b.x && a.x===point.x && Math.min(a.y,b.y)<=point.y && point.y<=Math.max(a.y,b.y)
+        || a.y===b.y && a.y===point.y && Math.min(a.x,b.x)<=point.x && point.x<=Math.max(a.x,b.x);
+      for(const route of Object.values(memberPaths)) for(let i=0;i<route.length-1;i+=1) {
+        const a=route[i],b=route[i+1];
+        if(!contains(a,b)) continue;
+        if(a.x!==point.x || a.y!==point.y) {const direction=ray(a);if(direction)rays.add(direction);}
+        if(b.x!==point.x || b.y!==point.y) {const direction=ray(b);if(direction)rays.add(direction);}
+      }
+      return rays.size;
+    };
+    const junctions=(raw.junctions || []).map(point=>{
+      if(!point || !Number.isFinite(point.x) || !Number.isFinite(point.y) || junctionRayCount(point)<3) throw new Error('Summary junction must be a real branch in the final member-path union.');
+      return {x:point.x,y:point.y};
+    });
+    summaryIds.add(raw.id);members.forEach(id=>summaryMembers.add(id));
+    return {id:raw.id,direction:raw.direction,hubId:raw.hub_node_id,domainId:raw.domain_node_id,category:raw.relationship_category,memberIds:members,primaryId:raw.primary_edge_id,peerCount,paths,memberPaths,junctions,sharedPath:points(raw.shared_path)};
+  });
+  const presentation=payload.presentation;
+  if (presentation) {
+    if (presentation.locale!=='en' || presentation.architecture_version!==graph.architectureVersion
+      || Object.keys(presentation.nodes || {}).some(id=>!nodeIds.has(id))
+      || Object.keys(presentation.edges || {}).some(id=>!edgeIds.has(id))) throw new Error('Display translation does not match this architecture.');
+    graph.nodes=graph.nodes.map(node=>({...node, canonicalLabel:node.label, canonicalResponsibility:node.responsibility, label:presentation.nodes[node.id]?.label || node.label, responsibility:presentation.nodes[node.id]?.responsibility || node.responsibility}));
+    graph.edges=graph.edges.map(edge=>{
+      const translated=presentation.edges[edge.id]?.label;
+      return translated ? {...edge,canonicalLabel:edge.label,canonicalSemanticType:edge.semantic_type,label:translated,semantic_type:translated,supporting_text:translated} : edge;
+    });
+    readingViews.forEach(view=>{view.canonicalLabel=view.label;view.label=presentation.reading_labels?.[view.id] || view.label;});
+  }
+  return {...graph, fullCanvas:true, groupFrames, readingViews, connectionSummaries, scope:null, presentation};
 }
 
 function normalizeCodeArchitectureSnapshot(payload) {
@@ -863,24 +1161,140 @@ function architectureDiagramPath(projectId, architectureVersion, scopeComponentI
   return `/projects/${projectId}/architecture/diagram${query ? `?${query}` : ''}`;
 }
 
+function architectureCanvasPath(projectId, architectureVersion, readingMode = 'MAP') {
+  const params = new URLSearchParams();
+  if (Number(architectureVersion) > 0) params.set('expected_architecture_version', String(Number(architectureVersion)));
+  if (['MAP','READ','FULL'].includes(readingMode)) params.set('reading_mode', readingMode);
+  const query=params.toString();
+  return `/projects/${projectId}/architecture/canvas${query ? `?${query}` : ''}`;
+}
+
 async function loadArchitectureDiagram(projectId, architecture, scopeComponentId = null, readingMode = 'MAP') {
   if (!architecture?.components?.length) return null;
   const payload = await api(architectureDiagramPath(projectId, architecture.version, scopeComponentId, readingMode));
   return normalizeScopedDiagramResponse(payload, scopeComponentId);
 }
 
+async function loadArchitectureCanvasDiagram(projectId, architecture, readingMode = 'MAP') {
+  if (!architecture?.components?.length) return null;
+  const payload = await api(architectureCanvasPath(projectId, architecture.version, readingMode));
+  return normalizeFullCanvasResponse(payload);
+}
+
 async function loadLatestCodeArchitecture(projectId) {
   return api(`/projects/${projectId}/code-architecture/latest`);
 }
 
-async function loadProjectContext(projectId, {scopeComponentId = null} = {}) {
-  const [project,tasks,architecture,proposals,activity,codeArchitecture] = await Promise.all([
-    api(`/projects/${projectId}`), api(`/projects/${projectId}/tasks`), api(`/projects/${projectId}/architecture`), api(`/projects/${projectId}/architecture/proposals`), api(`/projects/${projectId}/events?limit=12`), loadLatestCodeArchitecture(projectId),
+// WORKSPACE_CORE_LOADER_START
+async function loadProjectCoreContext(projectId) {
+  const architectureRequest = api(`/projects/${projectId}/architecture`);
+  const [project,tasks,architecture,proposals,activity] = await Promise.all([
+    api(`/projects/${projectId}`),
+    api(`/projects/${projectId}/tasks`),
+    architectureRequest,
+    api(`/projects/${projectId}/architecture/proposals`),
+    api(`/projects/${projectId}/events?limit=12`),
   ]);
-  let diagram=null, diagramError=null, codeDiagram=null;
-  try { diagram = await loadArchitectureDiagram(projectId, architecture, scopeComponentId); } catch (err) { diagramError=err?.message || String(err); }
-  if (codeArchitecture) codeDiagram = normalizeCodeArchitectureSnapshot(codeArchitecture);
-  return {project,tasks,architecture,diagram,diagramError,proposals,activity,codeArchitecture,codeDiagram};
+  return {project,tasks,architecture,proposals,activity};
+}
+// WORKSPACE_CORE_LOADER_END
+
+async function refreshCanvasResource(contextTicket, architecture, {scopeComponentId = null, retainData = false} = {}) {
+  const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:retainData && Boolean(state.diagram)});
+  if (!request) return false;
+  try {
+    const diagram = ARCHITECTURE_CANVAS_MODE
+      ? await loadArchitectureCanvasDiagram(contextTicket.projectId, architecture, 'FULL')
+      : await loadArchitectureDiagram(contextTicket.projectId, architecture, scopeComponentId, state.readingMode);
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    state.diagram = diagram;
+    state.diagramError = null;
+    settleWorkspaceResource(state.workspaceAsync, request, diagram ? 'ready' : 'empty');
+    resetArchitectureViewCache(contextTicket.projectId, architecture.version);
+    if (diagram) {
+      if (ARCHITECTURE_CANVAS_MODE) cacheArchitectureView('canvas', contextTicket.projectId, architecture.version, diagram);
+      else if (!scopeComponentId) cacheArchitectureView('project', contextTicket.projectId, architecture.version, diagram);
+    }
+    render();
+    return true;
+  } catch (error) {
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    state.diagramError = error?.message || String(error);
+    if (!retainData) state.diagram = null;
+    settleWorkspaceResource(state.workspaceAsync, request, 'error', error);
+    render();
+    return false;
+  }
+}
+
+async function refreshCodeArchitectureResource(contextTicket, {retainData = false} = {}) {
+  const request = beginWorkspaceResource(state.workspaceAsync, 'codeArchitecture', contextTicket, {retainData:retainData && Boolean(state.codeDiagram)});
+  if (!request) return false;
+  try {
+    const codeArchitecture = await loadLatestCodeArchitecture(contextTicket.projectId);
+    const codeDiagram = codeArchitecture ? normalizeCodeArchitectureSnapshot(codeArchitecture) : null;
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    state.codeArchitecture = codeArchitecture;
+    state.codeDiagram = codeDiagram;
+    settleWorkspaceResource(state.workspaceAsync, request, codeDiagram ? 'ready' : 'empty');
+    if (state.currentView === 'architecture') renderGraph();
+    return true;
+  } catch (error) {
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!retainData) {
+      state.codeArchitecture = null;
+      state.codeDiagram = null;
+    }
+    settleWorkspaceResource(state.workspaceAsync, request, 'error', error);
+    if (state.currentView === 'architecture') renderGraph();
+    return false;
+  }
+}
+
+function refreshWorkspaceOptionalResources(contextTicket, architecture, {scopeComponentId = null, retainData = false} = {}) {
+  return Promise.allSettled([
+    refreshCanvasResource(contextTicket, architecture, {scopeComponentId, retainData}),
+    refreshCodeArchitectureResource(contextTicket, {retainData}),
+  ]);
+}
+
+function retryWorkspaceResource(name) {
+  if (state.workspaceAsync.phase !== 'ready' || !state.projectId || !state.architecture) return false;
+  const ticket = currentWorkspaceContextTicket(state.workspaceAsync);
+  if (name === 'canvas') {
+    void refreshCanvasResource(ticket, state.architecture, {scopeComponentId:state.scopeComponentId,retainData:Boolean(state.diagram)});
+    return true;
+  }
+  if (name === 'codeArchitecture') {
+    void refreshCodeArchitectureResource(ticket, {retainData:Boolean(state.codeDiagram)});
+    return true;
+  }
+  return false;
+}
+
+function wireWorkspaceResourceRetry(container) {
+  container?.querySelectorAll?.('[data-retry-workspace-resource]').forEach((button) => button.addEventListener('click', () => {
+    retryWorkspaceResource(button.dataset.retryWorkspaceResource);
+  }));
+}
+
+function clearWorkspaceOptionalData() {
+  state.diagram = null;
+  state.diagramError = null;
+  state.codeArchitecture = null;
+  state.codeDiagram = null;
+  for (const resource of Object.values(state.workspaceAsync.resources)) {
+    resource.status = 'idle';
+    resource.error = null;
+    resource.refreshing = false;
+  }
+}
+
+function restoreDisplayedWorkspaceAsync(error = null) {
+  state.workspaceAsync.projectId = state.projectId || null;
+  state.workspaceAsync.architectureVersion = Number(state.architecture?.version || 0);
+  state.workspaceAsync.phase = state.project ? 'ready' : 'failed';
+  state.workspaceAsync.error = error ? (error?.message || String(error)) : null;
 }
 
 function persistActiveProjectSelection(projectId) {
@@ -911,30 +1325,53 @@ async function selectProject(projectId) {
     render();
     return true;
   }
+  const previousProjectId = state.projectId;
+  const previousArchitectureVersion = Number(state.architecture?.version || 0);
+  const ticket = beginWorkspaceContext(state.workspaceAsync, projectId);
   $('projectTree').setAttribute('aria-busy', 'true');
   const contextRequest = beginWorkspaceContextRequest(projectId);
   try {
-    const context = await loadProjectContext(projectId);
-    if (!commitWorkspaceContext(contextRequest, context, {
+    const context = await loadProjectCoreContext(projectId);
+    if (!workspaceContextIsCurrent(state.workspaceAsync, ticket)
+      || !isWorkspaceContextRequestCurrent(contextRequest)) return false;
+    const retainOptional = previousProjectId === projectId
+      && previousArchitectureVersion === Number(context.architecture?.version || 0);
+    if (!bindWorkspaceContextArchitecture(state.workspaceAsync, ticket, context.architecture?.version)) return false;
+    Object.assign(state, context, {
       projectId,
       lastRun: null,
+      agentContextManifest: null,
+      agentContextKey: null,
+      agentContextLoading: false,
+      agentContextError: null,
+      agentContextPromise: null,
+      agentContextRequestSerial: state.agentContextRequestSerial + 1,
+      agentContextPolicy: 'ASK_ALL',
+      agentContextTelemetryVisible: true,
       scopeComponentId: null,
       readingMode: 'MAP',
       selectedComponentId: null,
       selectedCodeNodeId: null,
       architectureGraphKind: 'living',
       graphFocusMode: 'all',
+      collapsedNodeIds: new Set(),
       selectedTaskId: null,
       selectedProposalId: null,
       currentView: 'overview',
-    })) return false;
+    });
+    if (!retainOptional) clearWorkspaceOptionalData();
     state.onboarding.active = false;
     state.expandedProjectIds.add(projectId);
     persistExpandedProjectIds();
     persistActiveProjectSelection(projectId);
     render();
+    void refreshWorkspaceOptionalResources(ticket, context.architecture, {retainData:retainOptional});
     return true;
   } catch (err) {
+    if (workspaceContextIsCurrent(state.workspaceAsync, ticket)) {
+      if (state.project) restoreDisplayedWorkspaceAsync(err);
+      else failWorkspaceContext(state.workspaceAsync, ticket, err);
+    }
     toast(`Could not open that project. ${err.message}`, true);
     return false;
   } finally {
@@ -954,30 +1391,47 @@ async function refresh() {
   }
   const projectId = state.projectId;
   const contextRequest = beginWorkspaceContextRequest(projectId);
+  const scopeComponentId = state.scopeComponentId;
+  const previousArchitectureVersion = Number(state.architecture?.version || 0);
+  const ticket = beginWorkspaceContext(state.workspaceAsync, projectId);
   try {
-    const context = await loadProjectContext(projectId, {scopeComponentId: state.scopeComponentId});
-    if (!commitWorkspaceContext(contextRequest, context, {}, {requireSelectedProject: true})) return false;
+    const context = await loadProjectCoreContext(projectId);
+    if (!workspaceContextIsCurrent(state.workspaceAsync, ticket)
+      || !isWorkspaceContextRequestCurrent(contextRequest, {requireSelectedProject: true})) return false;
+    const retainOptional = previousArchitectureVersion === Number(context.architecture?.version || 0);
+    Object.assign(state, context);
+    if (!bindWorkspaceContextArchitecture(state.workspaceAsync, ticket, context.architecture?.version)) return false;
+    if (!retainOptional) clearWorkspaceOptionalData();
+    clearAgentContextPreview();
     render();
+    void refreshWorkspaceOptionalResources(ticket, context.architecture, {scopeComponentId,retainData:retainOptional});
     return true;
   } catch (err) {
+    if (!workspaceContextIsCurrent(state.workspaceAsync, ticket)) return false;
     if (String(err.message).startsWith('404:')) {
+      supersedeWorkspaceContextRequests();
+      beginWorkspaceContext(state.workspaceAsync, null);
       clearActiveProjectSelection();
       state.projectId = null;
       state.project = null;
+      clearWorkspaceOptionalData();
       await loadProjects();
       if (state.projects.length) {
         state.expandedProjectIds.add(state.projects[0].id);
         persistExpandedProjectIds();
         await selectProject(state.projects[0].id);
       } else {
+        state.workspaceAsync.phase = 'ready';
+        state.workspaceAsync.architectureVersion = 0;
         await loadProjectSnapshots();
         renderWorkspaceHome();
       }
       return true;
-    } else {
-      toast(err.message, true);
-      return false;
     }
+    if (state.project) restoreDisplayedWorkspaceAsync(err);
+    else failWorkspaceContext(state.workspaceAsync, ticket, err);
+    toast(err.message, true);
+    return false;
   }
 }
 
@@ -1386,6 +1840,7 @@ async function deleteCurrentProject() {
       return;
     }
     supersedeWorkspaceContextRequests();
+    beginWorkspaceContext(state.workspaceAsync, null);
     state.projectId = null;
     state.project = null;
     state.tasks = [];
@@ -1397,8 +1852,10 @@ async function deleteCurrentProject() {
     state.architectureGraphKind = 'living';
     state.selectedCodeNodeId = null;
     state.graphFocusMode = 'all';
+    state.collapsedNodeIds.clear();
     state.proposals = [];
     state.lastRun = null;
+    clearAgentContextPreview();
     state.selectedComponentId = null;
     state.scopeComponentId = null;
     state.readingMode = 'MAP';
@@ -1574,6 +2031,7 @@ function resetEphemeralSessionState() {
   state.selectedTaskId = null;
   state.selectedProposalId = null;
   state.lastRun = null;
+  clearAgentContextPreview();
   state.projects = [];
   state.project = null;
   state.tasks = [];
@@ -1583,10 +2041,13 @@ function resetEphemeralSessionState() {
   state.codeArchitecture = null;
   state.codeDiagram = null;
   state.graphFocusMode = 'all';
+  state.collapsedNodeIds.clear();
   state.proposals = [];
   state.projectSnapshots = new Map();
   state.taskUpdating.clear();
   state.projectId = localStorage.getItem('archbro-project-id');
+  state.workspaceAsync = makeWorkspaceAsyncState(state.projectId);
+  state.experience.workspaceError = null;
   state.expandedProjectIds = loadExpandedProjectIds();
   if (state.projectId) state.expandedProjectIds.add(state.projectId);
   state.onboarding = {
@@ -1713,7 +2174,9 @@ function render() {
   $('graphReviewState').textContent = pending.length ? `${pending.length} item${pending.length === 1 ? '' : 's'} need review` : 'Aligned';
 
   const aligned = state.architecture.components.length && !pending.length;
-  $('alignmentFill').style.width = state.architecture.components.length ? (pending.length ? '72%' : '100%') : '0%';
+  const alignmentFill=$('alignmentFill');
+  alignmentFill.classList.toggle('is-pending', Boolean(state.architecture.components.length && pending.length));
+  alignmentFill.classList.toggle('is-aligned', Boolean(state.architecture.components.length && !pending.length));
   $('alignmentText').textContent = state.architecture.components.length ? (aligned ? 'Aligned' : 'Review required') : 'Awaiting initial architecture';
   $('architectureSummary').textContent = state.architecture.summary || 'No architecture generated yet.';
   $('overviewMessage').textContent = awaiting ? 'The Goal is saved. Architecture generation needs to complete before normal project updates begin.' : pending.length ? 'One architecture decision needs your review.' : 'The current architecture has no pending approval boundary.';
@@ -1914,12 +2377,6 @@ function architectureHealth(node) {
   return {key: 'healthy', label: 'Healthy', detail: 'Aligned · no action needed', needsAttention: false, tasks, blockedTasks, activeTasks, pendingReviews};
 }
 
-function healthVisual(health, base) {
-  if (health.key === 'blocked') return {fill:'#FFF1F0', stroke:'#D92D20', accent:'#B42318', tag:'#FEE4E2'};
-  if (health.key === 'review') return {fill:'#FFF7E8', stroke:'#D98B34', accent:'#A15C12', tag:'#FCE8C5'};
-  return base;
-}
-
 function diagramNodeByComponentId(componentId) {
   return (state.diagram?.nodes || []).find((node) => node.component_id === componentId) || null;
 }
@@ -1974,16 +2431,83 @@ function wrapGraphText(text, maxChars, maxLines = 2) {
 }
 
 function graphNodeKindMarkup(node) {
-  const label = `${String(node.semantic_kind || 'COMPONENT')} · ${node.semantic_type || 'component'}`;
-  const maxChars = Math.max(12, Math.floor((node.width - 56) / 7.2));
-  const line = wrapGraphText(label, maxChars, 1)[0] || 'COMPONENT';
+  const kind = String(node.semantic_kind || 'COMPONENT');
+  const type = String(node.semantic_type || '');
+  const text = kind.toUpperCase() === type.toUpperCase() ? kind : `${kind} · ${type}`;
+  const line = graphWrapPixels(text, node.width - 58, 1, '750 8.8px')[0] || 'COMPONENT';
   return `<text class="node-kind" x="${node.x+18}" y="${node.y+25}">${escapeHtml(line)}</text>`;
 }
 
-function graphFocusState(selectedNode, projectedEdges = state.diagram?.edges || []) {
+function graphFocusState(
+  selectedNode,
+  projectedEdges = state.diagram?.edges || [],
+  projectedNodes = state.diagram?.nodes || [],
+) {
+  const tracePath = architectureTraceForNode(selectedNode);
+  if (tracePath?.status === 'FOUND') {
+    const nodes = new Set(
+      (tracePath.nodes || []).map((node) => (
+        node?.node_id
+        || (node?.component_id ? `node:${node.component_id}` : null)
+        || node?.id
+      )).filter(Boolean),
+    );
+    nodes.add(selectedNode.id);
+    const relationshipIds = new Set(
+      (tracePath.relationships || []).map((relationship) => (
+        relationship?.relationship_id || relationship?.id
+      )).filter(Boolean),
+    );
+    const edges = new Set();
+    projectedEdges.forEach((edge) => {
+      if (
+        relationshipIds.has(edge.id)
+        || (edge.provenance || []).some((item) => relationshipIds.has(item.relationship_id))
+      ) edges.add(edge.id);
+    });
+    return {nodes, edges, trace:true};
+  }
   if (!selectedNode || state.graphFocusMode === 'all') return null;
   const nodes = new Set([selectedNode.id]);
   const edges = new Set();
+  if (state.graphFocusMode === 'hierarchy' || state.graphFocusMode === 'isolate') {
+    const diagramNodes = projectedNodes;
+    const nodeById = new Map(diagramNodes.map((node) => [node.id,node]));
+    const prefix = selectedNode.hierarchyPath?.length ? selectedNode.hierarchyPath : [selectedNode.id];
+    const subtreeNodes = new Set();
+    prefix.forEach((nodeId) => nodes.add(nodeId));
+    diagramNodes.forEach((node) => {
+      const path = node.hierarchyPath?.length ? node.hierarchyPath : [node.id];
+      if (prefix.every((part,index)=>path[index]===part)) {
+        nodes.add(node.id);
+        subtreeNodes.add(node.id);
+      }
+    });
+    projectedEdges.forEach((edge) => {
+      if (nodes.has(edge.source) && nodes.has(edge.target)) edges.add(edge.id);
+    });
+    if (state.graphFocusMode !== 'isolate') return {nodes, edges};
+
+    // Isolate is a local reading projection over the returned canonical graph:
+    // keep the selected subtree, its ancestors, and exactly one-hop crossing
+    // endpoints with their authored ancestor boundaries. No topology is
+    // manufactured and no traversal continues through those context nodes.
+    const boundaryNodes = new Set();
+    projectedEdges.forEach((edge) => {
+      const sourceInSubtree = subtreeNodes.has(edge.source);
+      const targetInSubtree = subtreeNodes.has(edge.target);
+      if (sourceInSubtree === targetInSubtree) return;
+      edges.add(edge.id);
+      const peerId = sourceInSubtree ? edge.target : edge.source;
+      const peer = nodeById.get(peerId);
+      const peerPath = peer?.hierarchyPath?.length ? peer.hierarchyPath : [peerId];
+      peerPath.forEach((nodeId) => {
+        if (!nodes.has(nodeId)) boundaryNodes.add(nodeId);
+        nodes.add(nodeId);
+      });
+    });
+    return {nodes, edges, isolate:true, boundaryNodes, subtreeNodes};
+  }
   if (state.graphFocusMode === 'connected') {
     projectedEdges.forEach((edge) => {
       if (edge.source === selectedNode.id || edge.target === selectedNode.id) { edges.add(edge.id); nodes.add(edge.source); nodes.add(edge.target); }
@@ -2032,24 +2556,54 @@ function graphNodeAction(node) {
   return node?.projectionRole === 'PRIMARY' && node.childCount > 0 ? 'drill' : 'inspect';
 }
 
+function toggleGraphNodeCollapse(nodeId) {
+  if (!ARCHITECTURE_CANVAS_MODE) return false;
+  const node = diagramNodeById(nodeId);
+  if (!node || node.childCount < 1) return false;
+  if (state.collapsedNodeIds.has(nodeId)) state.collapsedNodeIds.delete(nodeId);
+  else {
+    state.collapsedNodeIds.add(nodeId);
+    const selected=diagramNodeByComponentId(state.selectedComponentId);
+    if(selected && (selected.hierarchyPath || []).slice(0,-1).includes(nodeId)) state.selectedComponentId=node.component_id;
+  }
+  state.selectedEdgeId = null;
+  renderGraph();
+  return true;
+}
+
+function expandAllGraphNodes() {
+  if (!state.collapsedNodeIds.size) return false;
+  state.collapsedNodeIds.clear();
+  renderGraph();
+  return true;
+}
+
 async function navigateGraphScope(scopeComponentId, {focusComponentId = state.scopeComponentId, loader = loadArchitectureDiagram, render = renderGraph, notify = toast} = {}) {
   if (!state.projectId || !state.architecture) return false;
   const targetScope = scopeComponentId || null;
+  const contextTicket = currentWorkspaceContextTicket(state.workspaceAsync);
+  const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:Boolean(state.diagram)});
+  if (!request) return false;
+  const architecture = state.architecture;
   try {
     const nextMode = nextReadingModeForScope(state.readingMode, targetScope);
-    const nextDiagram = await loader(state.projectId, state.architecture, targetScope, nextMode);
+    const nextDiagram = await loader(contextTicket.projectId, architecture, targetScope, nextMode);
     if (!nextDiagram) throw new Error('Scoped diagram is unavailable.');
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
     state.scopeComponentId = targetScope;
     state.readingMode = nextMode;
     state.selectedComponentId = null;
     state.graphFocusMode = 'all';
     state.diagram = nextDiagram;
     state.diagramError = null;
+    settleWorkspaceResource(state.workspaceAsync, request, 'ready');
     render();
     if (focusComponentId && typeof document !== 'undefined') setTimeout(() => document.querySelector(`[data-component="${CSS.escape(focusComponentId)}"]`)?.focus(), 0);
     return true;
   } catch (err) {
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
     state.diagramError = err?.message || String(err);
+    settleWorkspaceResource(state.workspaceAsync, request, 'error', err);
     notify(`Could not open that architecture scope. ${state.diagramError}`, true);
     return false;
   }
@@ -2058,31 +2612,60 @@ async function navigateGraphScope(scopeComponentId, {focusComponentId = state.sc
 async function setGraphReadingMode(mode, {loader = loadArchitectureDiagram, render = renderGraph, notify = toast} = {}) {
   if (!['MAP','READ','FULL'].includes(mode)) return false;
   if (mode === state.readingMode) return true;
+  if (!state.projectId || !state.architecture) return false;
+  const contextTicket = currentWorkspaceContextTicket(state.workspaceAsync);
+  const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:Boolean(state.diagram)});
+  if (!request) return false;
+  const architecture = state.architecture;
+  const scopeComponentId = state.scopeComponentId;
   try {
-    const nextDiagram = await loader(state.projectId, state.architecture, state.scopeComponentId, mode);
+    const nextDiagram = ARCHITECTURE_CANVAS_MODE
+      ? await loadArchitectureCanvasDiagram(contextTicket.projectId, architecture, mode)
+      : await loader(contextTicket.projectId, architecture, scopeComponentId, mode);
     if (!nextDiagram) throw new Error('Diagram is unavailable for this reading mode.');
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
     state.diagram = nextDiagram;
     state.readingMode = mode;
     state.selectedComponentId = null;
     state.graphFocusMode = 'all';
+    state.diagramError = null;
+    settleWorkspaceResource(state.workspaceAsync, request, 'ready');
     render();
     return true;
   } catch (err) {
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    state.diagramError = err?.message || String(err);
+    settleWorkspaceResource(state.workspaceAsync, request, 'error', err);
     notify(err?.message || String(err), true);
     return false;
   }
 }
 
 async function activateGraphNode(node, {navigate = navigateGraphScope, render = renderGraph} = {}) {
+  if (ARCHITECTURE_CANVAS_MODE) state.canvasInspectorOpen=true;
   if (!node) return false;
+  if (ARCHITECTURE_CANVAS_MODE) {
+    (node.hierarchyPath || []).slice(0,-1).forEach((nodeId) => state.collapsedNodeIds.delete(nodeId));
+  }
   state.selectedComponentId = node.component_id;
+  state.selectedEdgeId = null;
+  state.inspectorTab = 'overview';
   state.graphFocusMode = 'connected';
+  syncArchitectureCanvasSelectionUrl();
   render();
   return true;
 }
 
 async function drillGraphNode(node, {navigate = navigateGraphScope} = {}) {
   if (!node || graphNodeAction(node) !== 'drill') return false;
+  if (ARCHITECTURE_CANVAS_MODE) {
+    state.selectedComponentId = node.component_id;
+    state.selectedEdgeId = null;
+    state.graphFocusMode = 'hierarchy';
+    syncArchitectureCanvasSelectionUrl();
+    renderGraph();
+    return true;
+  }
   return navigate(node.component_id, {focusComponentId:node.component_id});
 }
 
@@ -2102,6 +2685,371 @@ function graphScopeToolbar(diagram) {
   return `<div class="graph-scope-bar"><div class="graph-scope-copy">${graphBreadcrumbMarkup(diagram)}<div><strong>${escapeHtml(scope.label || 'Overview')}</strong><span>${scope.componentId ? 'Canonical subsystem scope' : 'Canonical root system map'}${directCount ? ` · ${directCount} direct boundary relationship${directCount === 1 ? '' : 's'}` : ''}</span></div></div><div class="graph-scope-actions">${back}<div class="graph-reading-modes" role="group" aria-label="Graph information level">${modes}</div></div></div>`;
 }
 
+const graphViewport = {
+  key: null,
+  fitViewBox: null,
+  viewBox: null,
+  panFrame: null,
+  pendingPan: null,
+};
+
+function parseGraphViewBox(value) {
+  const parts = String(value || '').trim().split(/\s+/).map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isFinite(part))) return null;
+  const [x, y, width, height] = parts;
+  if (width <= 0 || height <= 0) return null;
+  return {x, y, width, height};
+}
+
+function formatGraphViewBox(box) {
+  return `${box.x} ${box.y} ${box.width} ${box.height}`;
+}
+
+function graphViewportKey(diagram, kind = state.architectureGraphKind) {
+  if (kind === 'code') return `code:${diagram?.repository?.revision || 'none'}`;
+  return `living:${state.projectId || ''}:${diagram?.layoutVersion || ''}:${diagram?.architectureVersion ?? state.architecture?.version ?? 0}:${diagram?.scope?.componentId || 'ROOT'}`;
+}
+
+function resolvedGraphViewport(fitViewBox, key) {
+  const fit = parseGraphViewBox(fitViewBox);
+  if (!fit) return fitViewBox;
+  if (graphViewport.key !== key) {
+    graphViewport.key = key;
+    graphViewport.fitViewBox = fit;
+    graphViewport.viewBox = {...fit};
+  } else {
+    graphViewport.fitViewBox = fit;
+    if (!graphViewport.viewBox) graphViewport.viewBox = {...fit};
+  }
+  return formatGraphViewBox(graphViewport.viewBox);
+}
+
+function graphViewportControlsMarkup() {
+  const resourceName = state.architectureGraphKind === 'code' ? 'codeArchitecture' : 'canvas';
+  const resource = state.workspaceAsync.resources[resourceName];
+  const retry = resource?.status === 'error'
+    ? `<button type="button" data-retry-workspace-resource="${resourceName}">Retry ${resourceName === 'canvas' ? 'diagram' : 'Code Architecture'}</button>`
+    : '';
+  if (!ARCHITECTURE_CANVAS_MODE) return retry ? `<div class="graph-viewport-tools graph-resource-tools" role="toolbar" aria-label="Graph recovery">${retry}</div>` : '';
+  const expandAll = state.architectureGraphKind === 'living' && state.collapsedNodeIds.size
+    ? '<button type="button" data-expand-all>Expand all</button>'
+    : '';
+  return `<div class="graph-viewport-tools" role="toolbar" aria-label="Canvas navigation"><button type="button" data-canvas-inspector aria-pressed="${state.canvasInspectorOpen}">Details & Agent</button><button type="button" data-graph-viewport="zoom-out" aria-label="Zoom out">−</button><span data-graph-zoom aria-live="polite">100%</span><button type="button" data-graph-viewport="zoom-in" aria-label="Zoom in">＋</button><button type="button" data-graph-viewport="fit">Fit</button><button type="button" data-graph-viewport="actual">100%</button>${retry}${expandAll}</div>`;
+}
+
+function graphViewportWithAspect(svg, box) {
+  const rect = svg.getBoundingClientRect();
+  if (!rect.width || !rect.height) return {...box};
+  const width = Math.max(box.width, box.height * rect.width / rect.height);
+  const height = width * rect.height / rect.width;
+  return {x:box.x+(box.width-width)/2, y:box.y+(box.height-height)/2, width, height};
+}
+
+function setGraphViewportBox(svg, box, {updateDensity = true} = {}) {
+  if (!svg || !box || box.width <= 0 || box.height <= 0) return;
+  box = graphViewportWithAspect(svg, box);
+  graphViewport.viewBox = {...box};
+  svg.setAttribute('viewBox', formatGraphViewBox(box));
+  if (updateDensity) updateGraphViewportDensity(svg);
+}
+
+// GRAPH_PAN_SCHEDULER_START
+function scheduleGraphPan(svg, box) {
+  graphViewport.pendingPan = {svg, box:{...box}};
+  if (graphViewport.panFrame != null) return;
+  graphViewport.panFrame = requestAnimationFrame(() => {
+    graphViewport.panFrame = null;
+    const pending = graphViewport.pendingPan;
+    graphViewport.pendingPan = null;
+    if (!pending) return;
+    // A pan changes only the viewport origin. Scale-dependent arrows, junction
+    // radii and zoom tiers remain valid until an actual zoom/resize occurs.
+    setGraphViewportBox(pending.svg, pending.box, {updateDensity:false});
+  });
+}
+// GRAPH_PAN_SCHEDULER_END
+
+function updateGraphViewportDensity(svg) {
+  if (!svg || !ARCHITECTURE_CANVAS_MODE) return;
+  const canvas = svg.closest('#graphCanvas');
+  const box = parseGraphViewBox(svg.getAttribute('viewBox'));
+  const rect = svg.getBoundingClientRect();
+  if (!canvas || !box || rect.width <= 0 || rect.height <= 0) return;
+  const scale = Math.min(rect.width / box.width, rect.height / box.height);
+  const zoom = Math.max(1, Math.round(scale * 100));
+  // Endpoint glyphs are screen-sized; canonical ports and routes never move.
+  svg.querySelectorAll('[data-arrow-transform]').forEach((arrow) => {
+    arrow.setAttribute('transform', `${arrow.dataset.arrowTransform} scale(${1 / scale})`);
+  });
+  // Junctions stay 4 CSS pixels wide; the larger invisible hit area is local UI.
+  svg.querySelectorAll('[data-junction-radius]').forEach((circle) => {
+    circle.setAttribute('r', Number(circle.dataset.junctionRadius) / scale);
+  });
+  canvas.dataset.zoomTier = zoom < 60 ? 'overview' : zoom < 120 ? 'detail' : 'full';
+  const label = canvas.querySelector('[data-graph-zoom]');
+  if (label) label.textContent = `${zoom}%`;
+}
+
+function focusGraphNodeInViewport(svg, node) {
+  const fit = graphViewport.fitViewBox;
+  const rect = svg?.getBoundingClientRect();
+  if (!ARCHITECTURE_CANVAS_MODE || !fit || !node || !rect || rect.width <= 0 || rect.height <= 0) return false;
+  const aspect = rect.width / rect.height;
+  let width = Math.max(node.width * 2.8, fit.width / 3);
+  let height = Math.max(node.height * 2.8, width / aspect);
+  width = Math.max(width, height * aspect);
+  const scale = Math.min(1, fit.width / width, fit.height / height);
+  width *= scale;
+  height *= scale;
+  const centerX = node.x + node.width / 2;
+  const centerY = node.y + node.height / 2;
+  // A selected node near an outer canvas boundary still needs to be centered.
+  // Allow temporary whitespace outside the fit bounds rather than pinning the
+  // viewport to the full-graph rectangle; Fit remains the explicit reset.
+  setGraphViewportBox(svg, {x:centerX-width/2,y:centerY-height/2,width,height});
+  return true;
+}
+
+function zoomGraphViewport(svg, factor, clientX = null, clientY = null) {
+  const raw = parseGraphViewBox(svg?.getAttribute('viewBox'));
+  const current = raw && svg ? graphViewportWithAspect(svg, raw) : null;
+  const fit = graphViewport.fitViewBox;
+  const rect = svg?.getBoundingClientRect();
+  if (!current || !fit || !rect || rect.width <= 0 || rect.height <= 0) return;
+  const nextWidth = Math.min(fit.width * 6, Math.max(fit.width / 10, current.width * factor));
+  const nextHeight = current.height * (nextWidth / current.width);
+  const px = clientX == null ? rect.width / 2 : Math.min(rect.width, Math.max(0, clientX - rect.left));
+  const py = clientY == null ? rect.height / 2 : Math.min(rect.height, Math.max(0, clientY - rect.top));
+  const anchorX = current.x + (px / rect.width) * current.width;
+  const anchorY = current.y + (py / rect.height) * current.height;
+  setGraphViewportBox(svg, {
+    x: anchorX - (px / rect.width) * nextWidth,
+    y: anchorY - (py / rect.height) * nextHeight,
+    width: nextWidth,
+    height: nextHeight,
+  });
+}
+
+let graphViewportResizeObserver = null;
+
+function wireGraphViewport(svg) {
+  if (!ARCHITECTURE_CANVAS_MODE || !svg) return;
+  const canvas = svg.closest('#graphCanvas');
+  const fit = parseGraphViewBox(svg.dataset.fitViewBox);
+  if (fit) graphViewport.fitViewBox = fit;
+  updateGraphViewportDensity(svg);
+  graphViewportResizeObserver?.disconnect();
+  if (typeof ResizeObserver !== 'undefined') {
+    graphViewportResizeObserver = new ResizeObserver(() => updateGraphViewportDensity(svg));
+    graphViewportResizeObserver.observe(svg);
+  }
+
+  canvas.querySelectorAll('[data-graph-viewport]').forEach((button) => button.addEventListener('click', () => {
+    const action = button.dataset.graphViewport;
+    if (action === 'zoom-in') zoomGraphViewport(svg, .8);
+    if (action === 'zoom-out') zoomGraphViewport(svg, 1.25);
+    if (action === 'fit' && graphViewport.fitViewBox) setGraphViewportBox(svg, graphViewport.fitViewBox);
+    if (action === 'actual') {
+      const current = parseGraphViewBox(svg.getAttribute('viewBox'));
+      const rect = svg.getBoundingClientRect();
+      if (!current || rect.width <= 0 || rect.height <= 0) return;
+      const centerX = current.x + current.width / 2;
+      const centerY = current.y + current.height / 2;
+      setGraphViewportBox(svg, {x:centerX-rect.width/2, y:centerY-rect.height/2, width:rect.width, height:rect.height});
+    }
+  }));
+  canvas.querySelector('[data-expand-all]')?.addEventListener('click', expandAllGraphNodes);
+  canvas.querySelector('[data-canvas-inspector]')?.addEventListener('click',()=>{state.canvasInspectorOpen=!state.canvasInspectorOpen;renderGraph();});
+
+  svg.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    zoomGraphViewport(svg, Math.exp(event.deltaY * .0014), event.clientX, event.clientY);
+  }, {passive:false});
+
+  let drag = null;
+  svg.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || event.target.closest?.('[data-node],[data-code-node],[data-edge],[data-fold-group]')) return;
+    const box = parseGraphViewBox(svg.getAttribute('viewBox'));
+    if (!box) return;
+    drag = {pointerId:event.pointerId, clientX:event.clientX, clientY:event.clientY, box:graphViewportWithAspect(svg, box)};
+    svg.setPointerCapture?.(event.pointerId);
+    svg.classList.add('is-panning');
+    event.preventDefault();
+  });
+  svg.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const dx = (event.clientX - drag.clientX) * drag.box.width / rect.width;
+    const dy = (event.clientY - drag.clientY) * drag.box.height / rect.height;
+    scheduleGraphPan(svg, {...drag.box, x:drag.box.x-dx, y:drag.box.y-dy});
+  });
+  const finishPan = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    drag = null;
+    svg.classList.remove('is-panning');
+  };
+  svg.addEventListener('pointerup', finishPan);
+  svg.addEventListener('pointercancel', finishPan);
+}
+
+function syncArchitectureCanvasDomMode() {
+  document.body.dataset.architectureCanvasMode = ARCHITECTURE_CANVAS_MODE ? 'true' : 'false';
+  document.body.classList.toggle('architecture-canvas-mode', ARCHITECTURE_CANVAS_MODE);
+  const graphSide = document.querySelector('#view-architecture .graph-side');
+  const agentDock = $('globalAgentDock');
+  const workspace = $('workspace');
+  if (ARCHITECTURE_CANVAS_MODE) {
+    if (graphSide && agentDock && agentDock.parentElement !== graphSide) graphSide.appendChild(agentDock);
+  } else if (workspace && agentDock && agentDock.parentElement !== workspace) {
+    workspace.appendChild(agentDock);
+  }
+}
+
+// ARCHITECTURE_INTERACTION_STATE_START
+function snapshotArchitectureInteractionState(source = state) {
+  return {
+    currentView:source.currentView,
+    scopeComponentId:source.scopeComponentId,
+    selectedComponentId:source.selectedComponentId,
+    selectedEdgeId:source.selectedEdgeId,
+    inspectorTab:source.inspectorTab,
+    graphFocusMode:source.graphFocusMode,
+    collapsedNodeIds:new Set(source.collapsedNodeIds || []),
+    canvasDeepLinkApplied:Boolean(source.canvasDeepLinkApplied),
+    canvasDeepLinkFocusPending:Boolean(source.canvasDeepLinkFocusPending),
+    canvasInspectorOpen:Boolean(source.canvasInspectorOpen),
+    tracePathRequest:source.tracePathRequest,
+    tracePathResult:source.tracePathResult,
+    tracePathLoading:Boolean(source.tracePathLoading),
+    tracePathError:source.tracePathError,
+    diagram:source.diagram,
+    diagramError:source.diagramError,
+  };
+}
+
+function restoreArchitectureInteractionState(target, snapshot) {
+  if (!snapshot) return;
+  Object.assign(target, snapshot, {collapsedNodeIds:new Set(snapshot.collapsedNodeIds || [])});
+}
+
+function applyArchitectureNavigationToUrl(url, {enabled, projectId, selectedComponentId, inspectorTab}) {
+  if (enabled) url.searchParams.set('canvas', 'architecture');
+  else url.searchParams.delete('canvas');
+  if (projectId) url.searchParams.set('project', projectId);
+  else url.searchParams.delete('project');
+  if (enabled && selectedComponentId) url.searchParams.set('node', selectedComponentId);
+  else url.searchParams.delete('node');
+  if (enabled && selectedComponentId && inspectorTab && inspectorTab !== 'overview') url.searchParams.set('tab', inspectorTab);
+  else url.searchParams.delete('tab');
+  url.searchParams.delete('mode');
+  return url;
+}
+// ARCHITECTURE_INTERACTION_STATE_END
+
+let architectureCanvasModeRequest = 0;
+
+async function setArchitectureCanvasMode(enabled, {pushHistory = true} = {}) {
+  // Even a no-op navigation supersedes an older pending opposite request.
+  const requestId = ++architectureCanvasModeRequest;
+  const projectId = state.projectId, architecture = state.architecture;
+  const architectureVersion = architecture?.version, readingMode = state.readingMode;
+  const beginModeResource = () => {
+    if (!projectId || !architecture?.components?.length) return null;
+    const contextTicket = currentWorkspaceContextTicket(state.workspaceAsync);
+    return beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:Boolean(state.diagram)});
+  };
+  if (ARCHITECTURE_CANVAS_MODE === enabled && state.diagram) {
+    const noOpResource = beginModeResource();
+    if (noOpResource) settleWorkspaceResource(state.workspaceAsync, noOpResource, 'ready');
+    return true;
+  }
+  const previous = ARCHITECTURE_CANVAS_MODE;
+  const previousUrl = window.location.href;
+  const isCurrent = () => requestId === architectureCanvasModeRequest
+    && state.projectId === projectId && state.architecture === architecture
+    && state.architecture?.version === architectureVersion && state.readingMode === readingMode;
+  let previousState = null;
+  let resourceRequest = null;
+  try {
+    let nextDiagram = state.diagram, cacheKind = null;
+    if (projectId && architecture?.components?.length) {
+      resourceRequest = beginModeResource();
+      if (!resourceRequest) return false;
+      cacheKind = enabled ? 'canvas' : 'project';
+      const cached = cachedArchitectureView(cacheKind, projectId, architectureVersion);
+      nextDiagram = cached || (enabled
+        ? await loadArchitectureCanvasDiagram(projectId, architecture, 'FULL')
+        : await loadArchitectureDiagram(projectId, architecture, null, readingMode));
+    }
+    if (!isCurrent() || (resourceRequest && !workspaceResourceIsCurrent(state.workspaceAsync, resourceRequest))) return false;
+
+    // Fetch/normalize first, then commit synchronously. Capture at commit time
+    // so interactions made while waiting also survive a failed commit.
+    previousState = snapshotArchitectureInteractionState(state);
+    const url = applyArchitectureNavigationToUrl(new URL(window.location.href), {
+      enabled,
+      projectId,
+      selectedComponentId:null,
+      inspectorTab:'overview',
+    });
+    if (pushHistory && typeof history !== 'undefined') history.pushState({}, '', url.toString());
+    ARCHITECTURE_CANVAS_MODE = enabled;
+    syncArchitectureCanvasDomMode();
+    state.currentView = 'architecture';
+    state.scopeComponentId = null;
+    state.selectedComponentId = null;
+    state.selectedEdgeId = null;
+    state.graphFocusMode = 'all';
+    clearArchitectureTracePath({render:false});
+    if (cacheKind) {
+      state.diagram = nextDiagram;
+      cacheArchitectureView(cacheKind, projectId, architectureVersion, nextDiagram);
+      state.diagramError = null;
+    }
+    if (resourceRequest) settleWorkspaceResource(state.workspaceAsync, resourceRequest, nextDiagram ? 'ready' : 'empty');
+    render();
+    return true;
+  } catch (error) {
+    if (!isCurrent() || (resourceRequest && !workspaceResourceIsCurrent(state.workspaceAsync, resourceRequest))) return false;
+    if (previousState) {
+      restoreArchitectureInteractionState(state, previousState);
+      ARCHITECTURE_CANVAS_MODE = previous;
+    }
+    if (resourceRequest) settleWorkspaceResource(state.workspaceAsync, resourceRequest, state.diagram ? 'ready' : 'empty');
+    try {
+      // popstate changed the URL before this request; restore the mode that is
+      // actually displayed even when no product state was committed.
+      if ((previousState || !pushHistory) && typeof history !== 'undefined') {
+        const restoredUrl = applyArchitectureNavigationToUrl(new URL(previousUrl), {
+          enabled:previous,
+          projectId,
+          selectedComponentId:previousState?.selectedComponentId || null,
+          inspectorTab:previousState?.inspectorTab || 'overview',
+        });
+        history.replaceState({}, '', restoredUrl.toString());
+      }
+      if (previousState) { syncArchitectureCanvasDomMode(); render(); }
+    } catch (rollbackError) {
+      console.error('Architecture view rollback failed.', rollbackError);
+    }
+    toast(`Could not switch architecture view. ${error?.message || String(error)}`, true);
+    return false;
+  }
+}
+
+async function openArchitectureCanvas() {
+  return setArchitectureCanvasMode(true);
+}
+
+async function leaveArchitectureCanvas() {
+  return setArchitectureCanvasMode(false);
+}
+
+async function toggleArchitectureCanvas() {
+  return ARCHITECTURE_CANVAS_MODE ? leaveArchitectureCanvas() : openArchitectureCanvas();
+}
+
 function setArchitectureGraphKind(kind, {render = renderGraph} = {}) {
   if (!['living','code'].includes(kind)) return false;
   state.architectureGraphKind = kind;
@@ -2115,33 +3063,40 @@ function setArchitectureGraphKind(kind, {render = renderGraph} = {}) {
 
 function renderArchitectureChrome() {
   const codeMode = state.architectureGraphKind === 'code';
+  if ($('graphCanvas')) $('graphCanvas').dataset.graphKind=state.architectureGraphKind;
   const graphSide = document.querySelector('.graph-side');
   if (graphSide) {
     graphSide.dataset.graphKind = state.architectureGraphKind;
-    graphSide.dataset.readingMode = state.readingMode;
+    graphSide.dataset.readingMode = ARCHITECTURE_CANVAS_MODE ? 'FULL' : state.readingMode;
   }
   document.querySelectorAll('[data-architecture-graph-kind]').forEach((button) => {
     const active = button.dataset.architectureGraphKind === state.architectureGraphKind;
     button.classList.toggle('active', active);
     button.setAttribute('aria-pressed', String(active));
   });
-  if ($('architectureViewTitle')) $('architectureViewTitle').textContent = codeMode ? 'Code Graph' : 'Living Graph';
+  if ($('architectureViewTitle')) $('architectureViewTitle').textContent = codeMode ? 'Code Graph' : (ARCHITECTURE_CANVAS_MODE ? (state.diagram?.presentation?.title || 'System architecture') : 'Living Graph');
   if ($('architectureViewSubtitle')) $('architectureViewSubtitle').textContent = codeMode
     ? 'Implementation evidence generated from source inspected at one exact GitHub commit.'
-    : 'Start with the system health map, then open canonical subsystems one level at a time.';
-  if ($('graphPanelTitle')) $('graphPanelTitle').textContent = codeMode ? 'Implementation map' : 'System health map';
+    : ARCHITECTURE_CANVAS_MODE
+      ? (state.diagram?.presentation?.subtitle || 'The whole system. Every connection, in context.')
+      : 'Start with the system health map, then open canonical subsystems one level at a time.';
+  if ($('graphPanelTitle')) $('graphPanelTitle').textContent = codeMode ? 'Implementation map' : 'System architecture';
   if ($('graphPanelSubtitle')) $('graphPanelSubtitle').textContent = codeMode
     ? 'Derived evidence only. This graph never overwrites accepted Living Architecture.'
-    : 'Red or amber areas need attention. Healthy areas require no inspection.';
+    : 'Follow the project backbone. Select a component to reveal its other connections.';
   if ($('graphHealthLegend')) $('graphHealthLegend').classList.toggle('hidden', codeMode);
-  if ($('graphEvidenceTitle')) $('graphEvidenceTitle').textContent = codeMode ? 'Source evidence' : 'Why this status?';
+  if ($('graphEvidenceTitle')) $('graphEvidenceTitle').textContent = codeMode ? 'Source evidence' : 'Component details';
   if ($('graphDecisionTitle')) $('graphDecisionTitle').textContent = codeMode ? 'Repository snapshot' : 'Architecture decisions';
   if ($('graphRiskTitle')) $('graphRiskTitle').textContent = codeMode ? 'Evidence boundary' : 'Risks & assumptions';
+  if ($('architectureCanvasBtn')) $('architectureCanvasBtn').textContent = ARCHITECTURE_CANVAS_MODE ? 'Project View' : 'Open Canvas ↗';
+  if (ARCHITECTURE_CANVAS_MODE && state.project) document.title = `${state.diagram?.presentation?.title || 'System architecture'} · Archbro`;
   if (state.currentView === 'architecture') {
     $('pageTitle').textContent = codeMode ? 'Code Architecture' : 'Living Architecture';
     $('pageSubtitle').textContent = codeMode
       ? 'Revision-pinned implementation evidence from connected repository analysis.'
-      : 'Human-approved design intent with backend-authored hierarchical drilldown.';
+      : ARCHITECTURE_CANVAS_MODE
+        ? 'Human-approved design intent as one backend-authored full-system architecture canvas.'
+        : 'Human-approved design intent with backend-authored hierarchical drilldown.';
   }
 }
 
@@ -2181,12 +3136,23 @@ function renderCodeSelectedNode() {
 function renderCodeGraph() {
   const canvas = $('graphCanvas');
   const diagram = state.codeDiagram;
+  const resource = state.workspaceAsync.resources.codeArchitecture;
   if (!diagram) {
-    $('graphVersion').textContent = 'No snapshot';
-    $('graphReviewState').textContent = 'Awaiting GitHub evidence';
-    canvas.innerHTML = '<div class="graph-empty code-graph-empty"><div><strong>No Code Architecture snapshot yet</strong><p class="muted">Connect GitHub and ask the agent to inspect the repository at an exact commit, then publish evidence-backed implementation architecture.</p></div></div>';
+    const loading = resource.status === 'loading';
+    const failed = resource.status === 'error';
+    $('graphVersion').textContent = loading ? 'Loading' : failed ? 'Unavailable' : 'No snapshot';
+    $('graphReviewState').textContent = loading ? 'Loading GitHub evidence' : failed ? 'Code evidence unavailable' : 'Awaiting GitHub evidence';
+    const title = loading ? 'Loading Code Architecture…' : failed ? 'Code Architecture unavailable' : 'No Code Architecture snapshot yet';
+    const detail = failed
+      ? escapeHtml(resource.error || 'The latest Code Architecture could not be loaded.')
+      : loading
+        ? 'The last published implementation evidence is being loaded.'
+        : 'Connect GitHub and ask the agent to inspect the repository at an exact commit, then publish evidence-backed implementation architecture.';
+    const retry = failed ? '<button class="btn secondary" type="button" data-retry-workspace-resource="codeArchitecture">Retry Code Architecture</button>' : '';
+    canvas.innerHTML = `<div class="graph-empty code-graph-empty"><div><strong>${title}</strong><p class="muted">${detail}</p>${retry}</div></div>`;
+    wireWorkspaceResourceRetry(canvas);
     renderCodeSelectedNode();
-    $('decisionList').innerHTML = '<p class="muted">No repository snapshot has been published for this project.</p>';
+    $('decisionList').innerHTML = failed ? '<p class="muted">The previous Code Architecture load failed. Retry without leaving this workspace.</p>' : '<p class="muted">No repository snapshot has been published for this project.</p>';
     $('riskList').innerHTML = '<p class="muted">Code Architecture is derived evidence. It never becomes accepted Living Architecture without a separate human-reviewed architecture proposal.</p>';
     return;
   }
@@ -2210,9 +3176,11 @@ function renderCodeGraph() {
     return `<g class="node-card code-node-card${active ? ' selected' : ''}" data-code-node="${escapeHtml(node.id)}" role="button" tabindex="0" aria-label="Inspect code evidence for ${escapeHtml(node.label)}"><rect class="node-surface" x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="16"/>${graphNodeKindMarkup(node)}${names}${responsibility}<text class="code-node-evidence-count" x="${node.x+18}" y="${node.y+node.height-13}">${node.sources.length} source${node.sources.length === 1 ? '' : 's'} · depth ${node.depth}</text></g>`;
   }).join('');
   $('graphVersion').textContent = `@${diagram.repository.revision.slice(0, 8)}`;
-  $('graphReviewState').textContent = `${diagram.nodes.length} implementation node${diagram.nodes.length === 1 ? '' : 's'}`;
+  $('graphReviewState').textContent = `${diagram.nodes.length} implementation node${diagram.nodes.length === 1 ? '' : 's'}${resource.refreshing ? ' · refreshing' : ''}`;
   const meta = `<div class="graph-meta code-graph-meta"><span>${escapeHtml(diagram.repository.slug)}</span><span>${diagram.nodes.length} nodes</span><span>${diagram.edges.length} evidence-backed relationship${diagram.edges.length === 1 ? '' : 's'}</span><span>Exact commit · ${escapeHtml(diagram.repository.revision.slice(0, 12))}</span><span class="graph-meta-ok">Living architecture unchanged</span></div>`;
-  canvas.innerHTML = `<div class="code-snapshot-bar"><div><strong>${escapeHtml(diagram.repository.slug)}</strong><span>Implementation evidence at exact Git revision</span></div><a href="${escapeHtml(`${diagram.repository.url}/tree/${diagram.repository.revision}`)}" target="_blank" rel="noreferrer"><code>${escapeHtml(diagram.repository.revision)}</code> ↗</a></div><div class="graph-stage">${meta}<svg class="living-graph-svg code-graph-svg" viewBox="0 0 ${diagram.width} ${diagram.height}" role="img" aria-label="Revision-pinned code architecture graph"><defs><marker id="code-arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M1 1 L8 4.5 L1 8 Z"/></marker></defs>${hierarchy}${edges}${nodes}</svg></div>`;
+  const fitViewBox = `0 0 ${diagram.width} ${diagram.height}`;
+  const viewBox = ARCHITECTURE_CANVAS_MODE ? resolvedGraphViewport(fitViewBox, graphViewportKey(diagram, 'code')) : fitViewBox;
+  canvas.innerHTML = `<div class="code-snapshot-bar"><div><strong>${escapeHtml(diagram.repository.slug)}</strong><span>Implementation evidence at exact Git revision</span></div><a href="${escapeHtml(`${diagram.repository.url}/tree/${diagram.repository.revision}`)}" target="_blank" rel="noreferrer"><code>${escapeHtml(diagram.repository.revision)}</code> ↗</a></div><div class="graph-stage">${meta}${graphViewportControlsMarkup()}<svg class="living-graph-svg code-graph-svg" data-fit-view-box="${escapeHtml(fitViewBox)}" viewBox="${escapeHtml(viewBox)}" role="img" aria-label="Revision-pinned code architecture graph"><defs><marker id="code-arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M1 1 L8 4.5 L1 8 Z"/></marker></defs>${hierarchy}${edges}${nodes}</svg></div>`;
   const activate = (element) => {
     state.selectedCodeNodeId = element.dataset.codeNode;
     renderCodeGraph();
@@ -2226,6 +3194,8 @@ function renderCodeGraph() {
       activate(element);
     });
   });
+  wireWorkspaceResourceRetry(canvas);
+  wireGraphViewport(canvas.querySelector('.living-graph-svg'));
   renderCodeSelectedNode();
   $('decisionList').innerHTML = `<ul><li><strong>${escapeHtml(diagram.repository.slug)}</strong></li><li><code>${escapeHtml(diagram.repository.revision)}</code></li><li>${escapeHtml(diagram.summary || 'No implementation summary.')}</li></ul>`;
   $('riskList').innerHTML = `<ul><li>Classification: ${escapeHtml(diagram.classification || 'IMPLEMENTATION_EVIDENCE')}</li><li>Canonical state mutated: ${diagram.canonicalStateMutated ? 'YES' : 'NO'}</li><li>${escapeHtml(diagram.evidenceVerification.note || 'Evidence is pinned to the supplied Git revision.')}</li></ul>`;
@@ -2233,12 +3203,74 @@ function renderCodeGraph() {
 
 function graphDisplayModel(diagram) {
   const scoped = Boolean(diagram?.scope?.componentId);
-  const nodes = scoped
+  const canonicalNodes = scoped
     ? (diagram?.nodes || []).filter((node) => node.projectionRole !== 'SCOPE')
     : (diagram?.nodes || []);
-  const nodeIds = new Set(nodes.map((node) => node.id));
-  const edges = (diagram?.edges || []).filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
-  return {scoped, nodes, edges};
+  const nodeIds = new Set(canonicalNodes.map((node) => node.id));
+  const canonicalEdges = (diagram?.edges || []).filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
+  const canonicalGroupFrames = diagram?.fullCanvas ? (diagram.groupFrames || []) : [];
+  if (!ARCHITECTURE_CANVAS_MODE || !diagram?.fullCanvas || !state.collapsedNodeIds.size) {
+    return {
+      scoped,
+      nodes:canonicalNodes,
+      edges:canonicalEdges,
+      groupFrames:canonicalGroupFrames,
+      collapsedNodeIds:new Set(),
+      hiddenNodeCounts:new Map(),
+    };
+  }
+
+  const nodeById = new Map(canonicalNodes.map((node) => [node.id,node]));
+  const validCollapsed = new Set(
+    [...state.collapsedNodeIds].filter((nodeId) => (nodeById.get(nodeId)?.childCount || 0) > 0)
+  );
+  if (validCollapsed.size !== state.collapsedNodeIds.size) state.collapsedNodeIds = validCollapsed;
+  const hiddenOwnerByNode = new Map();
+  canonicalNodes.forEach((node) => {
+    const path = node.hierarchyPath?.length ? node.hierarchyPath : [node.id];
+    const owner = path.slice(0,-1).find((nodeId) => validCollapsed.has(nodeId));
+    if (owner) hiddenOwnerByNode.set(node.id, owner);
+  });
+  const hiddenNodeCounts = new Map();
+  hiddenOwnerByNode.forEach((owner) => hiddenNodeCounts.set(owner, (hiddenNodeCounts.get(owner) || 0) + 1));
+  const nodes = canonicalNodes.filter((node) => !hiddenOwnerByNode.has(node.id));
+  const visibleNodeById = new Map(nodes.map((node) => [node.id,node]));
+  const endpoint = (nodeId) => hiddenOwnerByNode.get(nodeId) || nodeId;
+  const frameById=new Map(canonicalGroupFrames.map((frame)=>[frame.nodeId,frame]));
+  const clipAtFrame=(route, ownerId)=>{
+    const frame=frameById.get(ownerId);
+    if (!frame) return route;
+    const inside=(p)=>p.x>=frame.x && p.x<=frame.x+frame.width && p.y>=frame.y && p.y<=frame.y+frame.height;
+    for (let i=1;i<route.length;i++) {
+      const a=route[i-1],b=route[i];
+      if (!inside(a) || inside(b)) continue;
+      const exit=a.x===b.x
+        ? {x:a.x,y:b.y>frame.y+frame.height?frame.y+frame.height:frame.y}
+        : {x:b.x>frame.x+frame.width?frame.x+frame.width:frame.x,y:a.y};
+      return [exit,...route.slice(i)];
+    }
+    return route;
+  };
+  const edges = canonicalEdges.flatMap((edge) => {
+    const source = endpoint(edge.source), target = endpoint(edge.target);
+    if (!visibleNodeById.has(source) || !visibleNodeById.has(target)) return [];
+    if (source === target && (source !== edge.source || target !== edge.target)) return [];
+    if (source === edge.source && target === edge.target) return [edge];
+    let points = (edge.points || []).map((point) => ({...point}));
+    if (source !== edge.source) points=clipAtFrame(points,source);
+    if (target !== edge.target) points=clipAtFrame([...points].reverse(),target).reverse();
+    return [{
+      ...edge,
+      source,
+      target,
+      points,
+      projection_kind:'COLLAPSED',
+      canonical_source:edge.source,
+      canonical_target:edge.target,
+    }];
+  });
+  const groupFrames = canonicalGroupFrames.filter((frame) => !hiddenOwnerByNode.has(frame.nodeId));
+  return {scoped,nodes,edges,groupFrames,collapsedNodeIds:validCollapsed,hiddenNodeCounts};
 }
 
 function graphVisualConnections(edges = [], nodes = []) {
@@ -2281,6 +3313,24 @@ function graphVisualConnections(edges = [], nodes = []) {
 }
 
 function graphDisplayViewBox(diagram, nodes, edges) {
+  if (diagram?.fullCanvas) {
+    const xs = [], ys = [];
+    nodes.forEach((node) => {
+      xs.push(node.x, node.x + node.width);
+      ys.push(node.y, node.y + node.height);
+    });
+    (diagram.groupFrames || []).forEach((frame) => {
+      xs.push(frame.x, frame.x + frame.width);
+      ys.push(frame.y, frame.y + frame.height);
+    });
+    edges.forEach((edge) => (edge.points || []).forEach((point) => { xs.push(point.x); ys.push(point.y); }));
+    if (xs.length && ys.length) {
+      const padding = 24;
+      const minX=Math.min(...xs)-padding, maxX=Math.max(...xs)+padding;
+      const minY=Math.min(...ys)-padding, maxY=Math.max(...ys)+padding;
+      return `${minX} ${minY} ${maxX-minX} ${maxY-minY}`;
+    }
+  }
   if (!diagram?.scope?.componentId || !nodes.length) return `0 0 ${diagram.width} ${diagram.height}`;
   const xs = [];
   const ys = [];
@@ -2337,6 +3387,174 @@ function graphSegmentHitsRect(start, end, rect, padding = 0) {
   return false;
 }
 
+function syncArchitectureCanvasSelectionUrl() {
+  if (!ARCHITECTURE_CANVAS_MODE || typeof history === 'undefined') return;
+  const url = applyArchitectureNavigationToUrl(new URL(window.location.href), {
+    enabled:true,
+    projectId:state.projectId,
+    selectedComponentId:state.selectedComponentId,
+    inspectorTab:state.inspectorTab,
+  });
+  history.replaceState(null, '', url.toString());
+}
+
+function setArchitectureInspectorTab(tab) {
+  const normalized = String(tab || '').toLowerCase();
+  if (!INSPECTOR_TABS.has(normalized)) return false;
+  state.inspectorTab = normalized;
+  syncArchitectureCanvasSelectionUrl();
+  renderSelectedNode();
+  return true;
+}
+
+function architectureInspectorTabsMarkup() {
+  const labels = {
+    overview:'Overview', dependencies:'Dependencies', tasks:'Tasks', evidence:'Evidence', code:'Code', decisions:'Decisions',
+  };
+  return `<nav class="architecture-inspector-tabs" aria-label="Architecture inspector sections">${[...INSPECTOR_TABS].map((tab)=>`<button type="button" data-inspector-tab="${tab}" class="${state.inspectorTab===tab?'active':''}" aria-pressed="${state.inspectorTab===tab}">${labels[tab]}</button>`).join('')}</nav>`;
+}
+
+function wireArchitectureInspectorTabs() {
+  $('nodeEvidence')?.querySelectorAll('[data-inspector-tab]').forEach((button)=>button.addEventListener('click',()=>setArchitectureInspectorTab(button.dataset.inspectorTab)));
+}
+
+function graphEdgeById(edgeId, diagram = state.diagram) {
+  return (diagram?.edges || []).find((edge)=>edge.id===edgeId) || null;
+}
+
+function clearArchitectureTracePath({render = true} = {}) {
+  state.tracePathRequestSerial += 1;
+  state.tracePathRequest = null;
+  state.tracePathResult = null;
+  state.tracePathLoading = false;
+  state.tracePathError = null;
+  if (render) renderGraph();
+}
+
+function architectureTraceRequestForNode(node) {
+  const request = state.tracePathRequest;
+  const version = state.diagram?.architectureVersion ?? state.architecture?.version;
+  if (
+    !node
+    || !request
+    || request.source_id !== node.id
+    || Number(request.expected_architecture_version) !== Number(version)
+  ) return null;
+  return request;
+}
+
+function architectureTraceForNode(node) {
+  const request = architectureTraceRequestForNode(node);
+  const result = request ? state.tracePathResult : null;
+  if (!result || Number(result.architecture_version) !== Number(request.expected_architecture_version)) return null;
+  return result;
+}
+
+async function requestArchitectureTracePath(sourceNodeId, targetNodeId) {
+  const architectureVersion = Number(state.architecture?.version || 0);
+  if (!state.projectId || !architectureVersion || !sourceNodeId || !targetNodeId) return false;
+  const request = {
+    source_id: sourceNodeId,
+    target_id: targetNodeId,
+    max_hops: 8,
+    expected_architecture_version: architectureVersion,
+  };
+  const serial = ++state.tracePathRequestSerial;
+  state.tracePathRequest = request;
+  state.tracePathResult = null;
+  state.tracePathError = null;
+  state.tracePathLoading = true;
+  renderGraph();
+  const query = new URLSearchParams({
+    source_id: request.source_id,
+    target_id: request.target_id,
+    max_hops: String(request.max_hops),
+    expected_architecture_version: String(request.expected_architecture_version),
+  });
+  try {
+    const result = await api(
+      `/projects/${encodeURIComponent(state.projectId)}/architecture/path?${query.toString()}`,
+    );
+    if (serial !== state.tracePathRequestSerial) return false;
+    if (result?.schema !== 'archbro.architecture_path.v1') {
+      throw new Error('Trace Path returned an unsupported backend contract.');
+    }
+    if (Number(result.architecture_version) !== architectureVersion) {
+      throw new Error(`Trace Path is stale: expected Architecture v${architectureVersion}.`);
+    }
+    state.tracePathResult = result;
+    return result.status === 'FOUND';
+  } catch (error) {
+    if (serial === state.tracePathRequestSerial) {
+      state.tracePathError = error?.message || String(error);
+    }
+    return false;
+  } finally {
+    if (serial === state.tracePathRequestSerial) {
+      state.tracePathLoading = false;
+      renderGraph();
+    }
+  }
+}
+
+function architectureTraceControlsMarkup(node, diagram) {
+  if (!ARCHITECTURE_CANVAS_MODE) return '';
+  const targets = (diagram?.nodes || [])
+    .filter((candidate) => candidate.id !== node.id)
+    .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
+  const request = architectureTraceRequestForNode(node);
+  const result = architectureTraceForNode(node);
+  const selectedTarget = request?.target_id || targets[0]?.id || '';
+  let status = '';
+  if (request && state.tracePathLoading) {
+    status = 'Tracing canonical path…';
+  } else if (request && state.tracePathError) {
+    status = state.tracePathError;
+  } else if (result?.status === 'FOUND') {
+    const labels = (result.nodes || []).map((item) => item.name || item.label || item.component_id || item.node_id).filter(Boolean);
+    status = `FOUND · ${result.hops} hop${result.hops === 1 ? '' : 's'}${labels.length ? ` · ${labels.join(' → ')}` : ''}`;
+  } else if (result?.status === 'UNREACHABLE') {
+    status = 'No authored directed path.';
+  } else if (result?.status === 'LIMIT_REACHED') {
+    status = 'Path exceeds the 8-hop trace limit.';
+  }
+  const options = targets.map((target) => (
+    `<option value="${escapeHtml(target.id)}"${target.id === selectedTarget ? ' selected' : ''}>${escapeHtml(target.label)}</option>`
+  )).join('');
+  const traceControls = targets.length
+    ? `<label>Trace Path <select data-trace-target aria-label="Trace Path target">${options}</select></label><button type="button" data-trace-path${state.tracePathLoading ? ' disabled' : ''}>Trace Path</button>`
+    : '<span class="muted">No other canonical node is available to trace.</span>';
+  return `<div class="graph-focus-controls graph-trace-controls">${traceControls}${request ? '<button type="button" data-clear-trace>Clear path</button>' : ''}<button type="button" data-agent-explore>Explore from here</button>${status ? `<span data-trace-status aria-live="polite">${escapeHtml(status)}</span>` : ''}</div>`;
+}
+
+function selectGraphEdge(edgeId) {
+  if (ARCHITECTURE_CANVAS_MODE) state.canvasInspectorOpen=true;
+  const edge = graphEdgeById(edgeId);
+  if (!edge) return false;
+  clearArchitectureTracePath({render:false});
+  state.selectedEdgeId = edge.id;
+  state.selectedComponentId = null;
+  state.inspectorTab = 'overview';
+  state.graphFocusMode = 'all';
+  syncArchitectureCanvasSelectionUrl();
+  renderGraph();
+  return true;
+}
+
+function graphRelationshipVisualClass(edge) {
+  const category = String(edge?.relationship_category || 'SUPPORT').toUpperCase();
+  return {
+    FLOW:'relationship-flow',
+    DATA:'relationship-data',
+    EVENT:'relationship-event',
+    ACCESS:'relationship-access',
+    OBSERVABILITY:'relationship-observability',
+    VALIDATION:'relationship-validation',
+    DELIVERY:'relationship-delivery',
+    SUPPORT:'relationship-support',
+  }[category] || 'relationship-support';
+}
+
 let graphLabelMeasureContext = null;
 
 function graphMeasuredLabelWidth(label) {
@@ -2344,6 +3562,268 @@ function graphMeasuredLabelWidth(label) {
   const family = getComputedStyle(document.body).fontFamily || 'Arial, sans-serif';
   graphLabelMeasureContext.font = `750 9.5px ${family}`;
   return Math.max(42, Math.ceil(graphLabelMeasureContext.measureText(label).width) + 12);
+}
+
+// Grapheme-aware measured wrapping handles CJK and long identifiers safely.
+function graphWrapPixels(value, width, maxLines, font = '750 14px') {
+  if (!graphLabelMeasureContext) graphLabelMeasureContext = document.createElement('canvas').getContext('2d');
+  graphLabelMeasureContext.font = `${font} ${getComputedStyle(document.body).fontFamily || 'Arial, sans-serif'}`;
+  const source = String(value || '').replace(/\s+/g, ' ').trim();
+  const graphemes=text=>typeof Intl.Segmenter === 'function'
+    ? [...new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(text)].map(item=>item.segment) : Array.from(text);
+  // Keep English words intact; split long identifiers and CJK by grapheme.
+  const tokens=(source.match(/[A-Za-z0-9][A-Za-z0-9'&/−-]*|\s+|./gu) || [])
+    .flatMap(token=>graphLabelMeasureContext.measureText(token).width>width ? graphemes(token) : [token]);
+  const lines=[]; let line='';
+  for (const token of tokens) {
+    const next=line+token;
+    if (graphLabelMeasureContext.measureText(next).width<=width) {line=next;continue;}
+    if (lines.length===maxLines-1) {
+      let chars=graphemes(line.trimEnd());
+      while(chars.length && graphLabelMeasureContext.measureText(chars.join('')+'…').width>width)chars.pop();
+      lines.push(chars.join('')+'…');return lines;
+    }
+    if (line.trim()) lines.push(line.trim());
+    line=token.trimStart();
+  }
+  if(line.trim())lines.push(line.trim());
+  return lines;
+}
+
+let canvasReadingView = {key:null, id:'backbone'};
+let canvasSummaryState = {key:null,expanded:new Set()};
+
+function activeCanvasReadingView(diagram) {
+  const key = graphViewportKey(diagram);
+  if (canvasReadingView.key !== key) {canvasReadingView = {key, id:'backbone'};canvasSummaryState={key,expanded:new Set()};}
+  return (diagram.readingViews || []).find((view) => view.id === canvasReadingView.id) || null;
+}
+
+function canvasReadingToolbar(diagram) {
+  const view = activeCanvasReadingView(diagram);
+  const journey=view?.kind==='AUTHORED_JOURNEY';
+  const allRelationships=!view;
+  const steps=journey ? `<div class="canvas-journey-strip" aria-label="Journey sequence">${view.nodeIds.map((id,index)=>`<button type="button" data-journey-node="${escapeHtml(id)}"><span>${String(index+1).padStart(2,'0')}</span>${escapeHtml(diagramNodeById(id)?.label || id)}</button>${index<view.nodeIds.length-1?'<i aria-hidden="true">→</i>':''}`).join('')}</div>` : '';
+  const hint=journey ? 'Follow the journey. Select a step to explore.' : allRelationships ? 'Every accepted relationship is visible. Compatible connections remain grouped.' : 'Primary system structure. Select a component to reveal its other connections.';
+  return `<div class="canvas-reading-toolbar"><div class="canvas-reading-choice"><span class="canvas-view-icon" aria-hidden="true">◈</span><label><span>DETAIL LEVEL</span><select data-canvas-reading-view aria-label="Architecture detail level">${(diagram.readingViews || []).map(item=>`<option value="${escapeHtml(item.id)}"${item.id===view?.id?' selected':''}>${escapeHtml(item.id==='backbone'?'Overview':item.label)}</option>`).join('')}<option value="all"${!view?' selected':''}>Complete detail</option></select></label></div><span class="canvas-reading-hint">${hint}</span><span class="canvas-readonly"><i></i>Accepted architecture</span>${canvasSummaryState.expanded.size?'<button type="button" class="canvas-summary-reset" data-regroup-connections>Regroup lines</button>':''}${graphViewportControlsMarkup()}</div>${steps}`;
+}
+
+function canvasDomainForNode(node, diagram) {
+  if(!node || !diagram) return null;
+  const roots=diagram.nodes.filter(item=>!item.parent_id);
+  const rootId=node.hierarchyPath?.[0] || node.id;
+  const index=roots.findIndex(item=>item.id===rootId);
+  if(index<0) return null;
+  const tones=[['#147d73','#f0f8f6'],['#5265ad','#f3f5fc'],['#97602e','#fcf7f0'],['#307dac','#f0f7fc'],['#875794','#f8f3fa'],['#71834a','#f6f8f1']];
+  const [color,wash]=tones[index%tones.length];
+  return {id:rootId,label:roots[index].label || rootId,color,wash,tone:index%tones.length};
+}
+
+function canvasDomainToneAttr(node, diagram) {
+  const domain=canvasDomainForNode(node,diagram);
+  return domain ? `data-domain-tone=\"${domain.tone}\"` : '';
+}
+
+
+function canvasConnectionDomain(edge, selected, diagram) {
+  if(!selected || !diagram?.fullCanvas) return null;
+  const peerId=edge.source===selected.id ? edge.target : edge.target===selected.id ? edge.source : null;
+  return canvasDomainForNode(diagram.nodes.find(node=>node.id===peerId),diagram);
+}
+
+function canvasReciprocalPartner(edge, edges) {
+  if (edge.routing!=='ORTHOGONAL_CANVAS_RECIPROCAL' || edge.source===edge.target || edge.projection_kind==='COLLAPSED') return null;
+  const pair=edges.filter(other=>(other.source===edge.source && other.target===edge.target) || (other.source===edge.target && other.target===edge.source));
+  if(pair.length!==2) return null;
+  const other=pair.find(other=>other.id!==edge.id);
+  return other?.routing===edge.routing && other.source===edge.target && other.target===edge.source
+    && other.points.length===edge.points.length && edge.points.every((p,i)=>{
+      const q=other.points[other.points.length-1-i];return p.x===q.x && p.y===q.y;
+    }) ? other : null;
+}
+
+function canvasVisibleConnections(diagram, display, focus, selected) {
+  const view = activeCanvasReadingView(diagram);
+  const primary = view ? new Set(view.edgeIds) : null;
+  const selectedRelationship=display.edges.find(edge=>edge.id===state.selectedEdgeId);
+  const selectedPartner=selectedRelationship && view?.kind!=='AUTHORED_JOURNEY' && !state.tracePathResult ? canvasReciprocalPartner(selectedRelationship,display.edges) : null;
+  const visible=display.edges.filter((edge) => !primary || primary.has(edge.id) || focus?.edges.has(edge.id)
+    || (selected && (edge.source===selected.id || edge.target===selected.id)) || edge.id===state.selectedEdgeId || edge.id===selectedPartner?.id);
+  // Overview reads a reciprocal pair as one complete connection. Include the
+  // server-provided return relationship even if only its peer is backbone.
+  // Directed journeys/trace results retain their exact member selection.
+  if(view?.kind!=='AUTHORED_JOURNEY' && !state.tracePathResult) {
+    const visibleIds=new Set(visible.map(edge=>edge.id));
+    for(const edge of [...visible]) {
+      const partner=canvasReciprocalPartner(edge,display.edges);
+      if(partner && !visibleIds.has(partner.id)) {visible.push(partner);visibleIds.add(partner.id);}
+    }
+  }
+  const seen=new Set(), result=[];
+  for(const edge of visible) {
+    if(seen.has(edge.id)) continue;
+    const partner=view?.kind==='AUTHORED_JOURNEY' || state.tracePathResult ? null : canvasReciprocalPartner(edge,display.edges);
+    const members=partner && visible.some(other=>other.id===partner.id) ? [edge,partner] : [edge];
+    members.forEach(member=>seen.add(member.id));
+    result.push({...edge, canvasLabel:members.length===2 ? '2 directed relationships' : graphWrapPixels(String(edge.label || edge.semantic_type || '').split(' · ')[0],120,1,'750 11px')[0] || '',
+      memberIds:members.map(member=>member.id),bidirectional:members.length===2});
+  }
+  const parallelGroups=new Map(), ungrouped=[];
+  for(const edge of result) {
+    if(edge.memberIds.length!==1 || edge.bidirectional || edge.source===edge.target) {ungrouped.push(edge);continue;}
+    const key=`${edge.source}\u0000${edge.target}\u0000${edge.relationship_category || ''}`;
+    if(!parallelGroups.has(key)) parallelGroups.set(key,[]);
+    parallelGroups.get(key).push(edge);
+  }
+  for(const group of parallelGroups.values()) {
+    if(group.length<2) {ungrouped.push(...group);continue;}
+    const ordered=[...group].sort((a,b)=>a.id.localeCompare(b.id));
+    const primary=ordered[0];
+    const labels=[...new Set(ordered.map(edge=>String(edge.label || edge.semantic_type || '').split(' · ')[0]).filter(Boolean))];
+    ungrouped.push({...primary,memberIds:ordered.map(edge=>edge.id),parallelActions:true,bidirectional:false,canvasLabel:labels.join(' + ') || `${ordered.length} related actions`});
+  }
+  return canvasSummarizeConnections(ungrouped,diagram,display,view,selected,focus);
+}
+
+function canvasSummarizeConnections(connections,diagram,display,view,selected,focus) {
+  if(!diagram.connectionSummaries?.length || view?.kind==='AUTHORED_JOURNEY' || state.tracePathResult) return connections;
+  const key=graphViewportKey(diagram);
+  if(canvasSummaryState.key!==key) canvasSummaryState={key,expanded:new Set()};
+  let result=connections;
+  for(const summary of diagram.connectionSummaries) {
+    if(canvasSummaryState.expanded.has(summary.id) || summary.memberIds.includes(state.selectedEdgeId)) continue;
+    if(selected && selected.id!==summary.hubId && summary.memberIds.some(id=>{const e=diagram.edges.find(e=>e.id===id);return e.source===selected.id || e.target===selected.id;})) continue;
+    if(focus && summary.memberIds.some(id=>focus.edges.has(id)) && !summary.memberIds.every(id=>focus.edges.has(id))) continue;
+    const originals=result.filter(edge=>edge.memberIds.some(id=>summary.memberIds.includes(id)));
+    const covered=new Set(originals.flatMap(edge=>edge.memberIds));
+    if(covered.size!==summary.memberIds.length || summary.memberIds.some(id=>!covered.has(id)) || originals.some(edge=>edge.bidirectional || edge.projection_kind==='COLLAPSED' || edge.memberIds.some(id=>!summary.memberIds.includes(id)))) continue;
+    const primary=originals.find(edge=>edge.memberIds.includes(summary.primaryId));
+    if(!primary) continue;
+    const label=`${summary.peerCount || summary.memberIds.length} ${summary.direction==='IN'?'sources':'targets'}`;
+    result=result.filter(edge=>!edge.memberIds.some(id=>summary.memberIds.includes(id)));
+    result.push({...primary,memberIds:summary.memberIds,bidirectional:false,summary,canvasLabel:label});
+  }
+  return result;
+}
+
+function expandCanvasConnectionSummary(summaryId) {
+  if(!state.diagram?.connectionSummaries?.some(group=>group.id===summaryId)) return;
+  canvasSummaryState.expanded.add(summaryId);
+  previewCanvasConnection(null);
+  renderGraph();
+}
+
+// Local inspection only: highlight exact canonical members and their endpoints.
+// The temporary paint order never changes route geometry or selection state.
+let canvasConnectionRestore = null;
+function previewCanvasConnection(edgeId, individual=false) {
+  canvasConnectionRestore?.(); canvasConnectionRestore=null;
+  const canvas=$('graphCanvas'), svg=canvas?.querySelector('.living-graph-svg');
+  if(!svg || !state.diagram?.fullCanvas) return;
+  svg.classList.remove('is-tracing-connection');
+  canvas.querySelectorAll('.is-tracing-individual').forEach(el=>el.classList.remove('is-tracing-individual'));
+  canvas.querySelectorAll('.is-tracing-connection').forEach(el=>el.classList.remove('is-tracing-connection'));
+  document.querySelectorAll('[data-related-edge].is-tracing-connection').forEach(el=>el.classList.remove('is-tracing-connection'));
+  const readout=canvas.querySelector('.canvas-connection-readout');
+  if(readout) {readout.hidden=true;readout.replaceChildren();}
+  if(!edgeId) return;
+  const group=[...svg.querySelectorAll('.graph-edge[data-member-edges]')].find(el=>JSON.parse(el.dataset.memberEdges).includes(edgeId));
+  if(!group || group.classList.contains('is-isolated-out')) return;
+  const summary=state.diagram.connectionSummaries?.find(item=>item.id===group.dataset.summaryId);
+  const members=individual && summary ? [edgeId] : JSON.parse(group.dataset.memberEdges);
+  const facts=members.map(id=>state.diagram.edges.find(edge=>edge.id===id)).filter(Boolean);
+  const endpointIds=new Set(facts.flatMap(edge=>[edge.source,edge.target]));
+  svg.classList.add('is-tracing-connection'); group.classList.add('is-tracing-connection');
+  svg.querySelectorAll('[data-node]').forEach(el=>el.classList.toggle('is-tracing-connection',endpointIds.has(el.dataset.node)));
+  document.querySelectorAll('[data-related-edge]').forEach(el=>el.classList.toggle('is-tracing-connection',members.includes(el.dataset.relatedEdge)));
+  const paint=document.createElementNS('http://www.w3.org/2000/svg','g');
+  paint.classList.add('canvas-trace-paint');paint.setAttribute('aria-hidden','true');
+  const domainTone=group.getAttribute('data-domain-tone');
+  if(domainTone!==null) paint.setAttribute('data-domain-tone',domainTone);
+  group.querySelectorAll('.graph-edge-casing,.graph-edge-line,.graph-edge-arrow,.canvas-summary-junction').forEach(path=>{
+    const copy=path.cloneNode(true);
+    copy.setAttribute('class',path.classList.contains('canvas-summary-junction')?'canvas-trace-junction':path.classList.contains('graph-edge-casing')?'canvas-trace-casing':'canvas-trace-stroke');
+    paint.append(copy);
+  });
+  if(individual && summary) {
+    group.classList.add('is-tracing-individual');paint.replaceChildren();
+    const points=summary.memberPaths[edgeId],d=graphPathData(points,4),end=points.at(-1),previous=points.at(-2);
+    for(const cls of ['canvas-trace-casing','canvas-trace-stroke']) {
+      const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('class',cls);path.setAttribute('d',d);paint.append(path);
+    }
+    const arrow=document.createElementNS('http://www.w3.org/2000/svg','path');
+    arrow.setAttribute('class','canvas-trace-stroke');arrow.setAttribute('d','M -6 -3 L 0 0 L -6 3');
+    arrow.setAttribute('data-arrow-transform',`translate(${end.x} ${end.y}) rotate(${Math.atan2(end.y-previous.y,end.x-previous.x)*180/Math.PI})`);paint.append(arrow);
+  }
+  svg.insertBefore(paint,svg.querySelector('[data-node]'));
+  updateGraphViewportDensity(svg);
+  canvasConnectionRestore=()=>paint.remove();
+  if(readout) {
+    if(domainTone!==null) readout.setAttribute('data-domain-tone',domainTone); else readout.removeAttribute('data-domain-tone');
+    for(const fact of facts) {
+      const row=document.createElement('div'), heading=document.createElement('strong'), detail=document.createElement('span');
+      const name=id=>state.diagram.nodes.find(node=>node.id===id)?.label || id;
+      heading.textContent=`${name(fact.source)} → ${name(fact.target)}`;
+      detail.textContent=fact.label || fact.semantic_type || '';
+      row.append(heading,detail);readout.append(row);
+    }
+    readout.hidden=false;
+  }
+}
+
+// Short action labels stay on their route; full action text lives beside the
+// selected component and in the relationship Inspector, never in a remote lane.
+function canvasEdgeLabelPlacements(edges, nodes, labelledIds) {
+  const placements = new Map(), occupied = [];
+  for (const edge of edges) {
+    if (!labelledIds.has(edge.id) || !edge.canvasLabel) continue;
+    const labelWidth=Math.max(32,graphMeasuredLabelWidth(edge.canvasLabel)*1.18+8);
+    if(edge.summary) {
+      const shared=edge.summary.sharedPath;
+      const candidates=shared.slice(1).map((end,i)=>({start:shared[i],end,length:Math.abs(end.x-shared[i].x)+Math.abs(end.y-shared[i].y)})).filter(seg=>seg.start.y===seg.end.y && seg.length>=labelWidth+24).sort((a,b)=>b.length-a.length);
+      let slot=null;
+      for(const seg of candidates) {
+        for(const fraction of [.7,.5,.3]) {
+          const x=seg.start.x+(seg.end.x-seg.start.x)*fraction;
+          for(const offset of [-24,24,-36,36]) {
+            const y=seg.start.y+offset,box={x:x-labelWidth/2,y:y-10,width:labelWidth,height:20};
+            if(nodes.some(node=>graphRectOverlaps(box,node,6)) || occupied.some(other=>graphRectOverlaps(box,other,5)) || edges.some(other=>other.id!==edge.id && other.points.slice(1).some((end,i)=>graphSegmentHitsRect(other.points[i],end,box,3)))) continue;
+            slot={x,y:y+3,box,attachment:{x,y:seg.start.y}};break;
+          }
+          if(slot) break;
+        }
+        if(slot) break;
+      }
+      if(!slot) {
+        for(let i=1;i<shared.length;i++) {
+          const start=shared[i-1],end=shared[i];
+          if(start.x!==end.x || Math.abs(start.y-end.y)<24) continue;
+          for(const dx of [16,-16,0,24,-24]) {
+            const x=start.x+dx,y=(start.y+end.y)/2,box={x:x-labelWidth/2,y:y-10,width:labelWidth,height:20};
+            if(nodes.some(node=>graphRectOverlaps(box,node,4)) || occupied.some(other=>graphRectOverlaps(box,other,5))) continue;
+            slot={x,y:y+3,box,attachment:{x:start.x,y}};break;
+          }
+          if(slot) break;
+        }
+      }
+      if(slot) {placements.set(edge.id,slot);occupied.push(slot.box);continue;}
+    }
+    const segments = edge.points.slice(1).map((end,index) => ({start:edge.points[index],end,index,length:Math.abs(end.x-edge.points[index].x)+Math.abs(end.y-edge.points[index].y)})).sort((a,b) => b.length-a.length || a.index-b.index);
+    let slot = null;
+    for (const segment of segments) {
+      if (segment.length < (segment.start.y===segment.end.y ? labelWidth+20 : 40)) continue;
+      for (const fraction of [.5,.3,.7]) {
+        const x=segment.start.x+(segment.end.x-segment.start.x)*fraction, y=segment.start.y+(segment.end.y-segment.start.y)*fraction;
+        const box={x:x-labelWidth/2,y:y-10,width:labelWidth,height:20};
+        if (nodes.some((node) => graphRectOverlaps(box,node,6)) || occupied.some((other) => graphRectOverlaps(box,other,5))) continue;
+        if (edges.some((other) => other.id!==edge.id && other.points.slice(1).some((end,index) => graphSegmentHitsRect(other.points[index],end,box,3)))) continue;
+        slot={x,y:y+3,box}; break;
+      }
+      if (slot) break;
+    }
+    if (slot) { placements.set(edge.id,slot); occupied.push(slot.box); }
+  }
+  return placements;
 }
 
 function graphEdgeLabelPlacements(edges, nodes) {
@@ -2431,6 +3911,7 @@ function graphEdgeLabelPlacements(edges, nodes) {
 
 function renderGraph() {
   renderArchitectureChrome();
+  document.querySelector('#view-architecture .graph-layout')?.classList.toggle('has-canvas-inspector', state.architectureGraphKind === 'code' || state.canvasInspectorOpen);
   if (state.architectureGraphKind === 'code') {
     renderCodeGraph();
     return;
@@ -2441,46 +3922,143 @@ function renderGraph() {
     renderSelectedNode(); renderLists(); return;
   }
   if (!state.diagram) {
-    canvas.innerHTML = `<div class="graph-empty"><div><strong>Positioned diagram unavailable</strong><p class="muted">${escapeHtml(state.diagramError || 'The backend has not published the scoped positioned Diagram View for this architecture version.')}</p></div></div>`;
-    $('graphReviewState').textContent = 'Diagram unavailable'; renderSelectedNode(); renderLists(); return;
+    const resource = state.workspaceAsync.resources.canvas;
+    const loading = resource.status === 'loading';
+    const failed = resource.status === 'error';
+    const title = loading ? 'Loading positioned diagram…' : failed ? 'Positioned diagram unavailable' : 'Positioned diagram unavailable';
+    const detail = failed
+      ? escapeHtml(resource.error || state.diagramError || 'The positioned diagram could not be loaded.')
+      : loading
+        ? 'The workspace is ready. Canvas geometry is loading independently.'
+        : escapeHtml(state.diagramError || 'The backend has not published the scoped positioned Diagram View for this architecture version.');
+    const retry = failed ? '<button class="btn secondary" type="button" data-retry-workspace-resource="canvas">Retry diagram</button>' : '';
+    canvas.innerHTML = `<div class="graph-empty"><div><strong>${title}</strong><p class="muted">${detail}</p>${retry}</div></div>`;
+    wireWorkspaceResourceRetry(canvas);
+    $('graphReviewState').textContent = loading ? 'Diagram loading' : 'Diagram unavailable'; renderSelectedNode(); renderLists(); return;
   }
   const diagram = state.diagram;
   const display = graphDisplayModel(diagram);
+  if (ARCHITECTURE_CANVAS_MODE && !state.canvasDeepLinkApplied) {
+    const requestedNode = REQUESTED_ARCHITECTURE_NODE_ID
+      ? diagram.nodes.find((node)=>node.component_id===REQUESTED_ARCHITECTURE_NODE_ID)
+      : null;
+    if (requestedNode) {
+      state.selectedComponentId = requestedNode.component_id;
+      state.selectedEdgeId = null;
+      state.inspectorTab = REQUESTED_INSPECTOR_TAB;
+      state.graphFocusMode = 'connected';
+      state.canvasDeepLinkFocusPending = true;
+      state.canvasInspectorOpen = true;
+    } else if (REQUESTED_ARCHITECTURE_NODE_ID) {
+      state.selectedComponentId = null;
+      state.selectedEdgeId = null;
+      state.inspectorTab = 'overview';
+      state.graphFocusMode = 'all';
+      state.canvasDeepLinkFocusPending = false;
+    }
+    state.canvasDeepLinkApplied = true;
+  }
+  document.querySelector('#view-architecture .graph-layout')?.classList.toggle('has-canvas-inspector',state.canvasInspectorOpen);
   const selected = diagramNodeByComponentId(state.selectedComponentId);
   if (state.selectedComponentId && !selected) state.selectedComponentId = null;
-  const focus = graphFocusState(selected, display.edges);
+  if (state.selectedEdgeId && !graphEdgeById(state.selectedEdgeId, diagram)) state.selectedEdgeId = null;
+  const selectedEdge = graphEdgeById(state.selectedEdgeId, diagram);
+  const displayedSelectedEdge = selectedEdge
+    ? display.edges.find((edge) => edge.id === selectedEdge.id)
+    : null;
+  const selectedEdgeFocus = displayedSelectedEdge
+    ? {nodes:new Set([displayedSelectedEdge.source,displayedSelectedEdge.target]),edges:new Set([selectedEdge.id]),isolate:false}
+    : null;
+  const focus = selectedEdgeFocus || graphFocusState(selected, display.edges, display.nodes);
   const nodeById = new Map(diagram.nodes.map((node) => [node.id,node]));
   const attentionNodes = display.nodes.filter((node) => diagramNodeHealth(node).needsAttention);
   const activeTaskCount = state.tasks.filter((task) => task.status === 'IN_PROGRESS').length;
-  const hierarchy = display.scoped ? '' : diagram.nodes.map((node) => {
+  const groupFrames = diagram.fullCanvas ? display.groupFrames : [];
+  const groupFrameByNode = new Map(groupFrames.map((frame) => [frame.nodeId, frame]));
+  const currentReadingView=diagram.fullCanvas ? activeCanvasReadingView(diagram) : null;
+  const journeyNodes=currentReadingView?.kind==='AUTHORED_JOURNEY' ? new Set(currentReadingView.nodeIds) : null;
+  const groups = groupFrames.map((frame) => {
+    const owner = nodeById.get(frame.nodeId);
+    if (!owner) return '';
+    const highlighted=focus ? (focus.nodes.has(owner.id) || diagram.nodes.some(node=>focus.nodes.has(node.id) && (node.hierarchyPath || []).includes(owner.id))) : (!journeyNodes || journeyNodes.has(owner.id) || diagram.nodes.some(node=>journeyNodes.has(node.id) && (node.hierarchyPath || []).includes(owner.id)));
+    const boundaryContext=Boolean(focus?.boundaryNodes?.has(owner.id));
+    const collapsed=Boolean(display.collapsedNodeIds?.has(owner.id));
+    const visibilityClass=focus?.isolate && !highlighted ? ' is-isolated-out' : highlighted ? ' is-focused' : ' is-dimmed';
+    return `<g class="architecture-group-frame depth-${frame.depth}${collapsed?' is-collapsed':''}${boundaryContext?' is-boundary-context':''}${visibilityClass}" ${canvasDomainToneAttr(owner,diagram)} data-group-node="${escapeHtml(frame.nodeId)}"><rect x="${frame.x}" y="${frame.y}" width="${frame.width}" height="${frame.height}" rx="18"/></g>`;
+  }).join('');
+  const hierarchy = display.scoped || diagram.fullCanvas ? '' : diagram.nodes.map((node) => {
     if (!node.parent_id) return '';
     const parent=nodeById.get(node.parent_id); if (!parent) return '';
     return `<line class="graph-hierarchy" x1="${parent.x+parent.width/2}" y1="${parent.y+parent.height/2}" x2="${node.x+node.width/2}" y2="${node.y+node.height/2}"/>`;
   }).join('');
-  const visibleEdges = graphVisualConnections(display.edges, display.nodes);
-  const labelPlacements = graphEdgeLabelPlacements(visibleEdges, display.nodes);
-  const edges = visibleEdges.map((edge) => {
-    const highlighted=!focus || edge.memberIds.some((edgeId)=>focus.edges.has(edgeId)); const label=edge.label || edge.semantic_type || ''; const labelPlacement=labelPlacements.get(edge.id);
-    const projectionKind=edge.memberIds.length > 1 ? 'merged' : String(edge.projection_kind || 'AUTHORED').toLowerCase();
+  const visibleEdges = diagram.fullCanvas ? canvasVisibleConnections(diagram, display, focus, selected) : graphVisualConnections(display.edges, display.nodes);
+  const readingView = diagram.fullCanvas ? activeCanvasReadingView(diagram) : null;
+  const numberedIds = new Set(diagram.fullCanvas ? visibleEdges.filter((edge) => edge.summary || edge.parallelActions || edge.memberIds.includes(state.selectedEdgeId) || (readingView?.kind==='AUTHORED_JOURNEY' && readingView.edgeIds.includes(edge.id))).map((edge) => edge.id) : []);
+  const labelPlacements = diagram.fullCanvas ? canvasEdgeLabelPlacements(visibleEdges, display.nodes, numberedIds) : graphEdgeLabelPlacements(visibleEdges, display.nodes);
+  const edges = [...visibleEdges].sort((a,b) => Number(a.memberIds.some(id=>focus?.edges.has(id))) - Number(b.memberIds.some(id=>focus?.edges.has(id)))).map((edge) => {
+    const highlighted=Boolean(focus ? edge.memberIds.some(edgeId=>focus.edges.has(edgeId)) : (journeyNodes && currentReadingView.edgeIds.includes(edge.id))); const label=edge.label || edge.semantic_type || ''; const labelPlacement=labelPlacements.get(edge.id);
+    const projectionKind=edge.summary ? 'summary' : edge.parallelActions ? 'parallel-actions' : edge.memberIds.length > 1 ? 'merged' : String(edge.projection_kind || 'AUTHORED').toLowerCase();
     const sourcePoint=edge.points[0];
-    const sourcePort=edge.bidirectional ? '' : `<circle class="graph-edge-source-port" cx="${sourcePoint.x}" cy="${sourcePoint.y}" r="2.25"/>`;
-    const startMarker=edge.bidirectional ? ' marker-start="url(#arrow-backbone)"' : '';
-    return `<g class="graph-edge projection-${escapeHtml(projectionKind)} layout-backbone${highlighted ? ' is-focused' : ' is-dimmed'}" data-edge="${escapeHtml(edge.id)}">${sourcePort}<path d="${graphPathData(edge.points)}"${startMarker} marker-end="url(#arrow-backbone)"/>${label && labelPlacement ? `<text class="graph-edge-label graph-detail-read" data-edge-label="${escapeHtml(edge.id)}" x="${labelPlacement.x}" y="${labelPlacement.y}" text-anchor="middle">${escapeHtml(label)}</text>` : ''}</g>`;
+    const sourcePort=diagram.fullCanvas || edge.bidirectional ? '' : `<circle class="graph-edge-source-port" cx="${sourcePoint.x}" cy="${sourcePoint.y}" r="2.25"/>`;
+    const startMarker=!diagram.fullCanvas && edge.bidirectional ? ' marker-start="url(#arrow-backbone)"' : '';
+    const tip=edge.points.at(-1), approach=edge.points.at(-2);
+    const arrowTransform=tip && approach ? `translate(${tip.x} ${tip.y}) rotate(${Math.atan2(tip.y-approach.y,tip.x-approach.x)*180/Math.PI})` : '';
+    const endArrow=diagram.fullCanvas && arrowTransform ? `<path class="graph-edge-arrow" d="M -6 -3 L 0 0 L -6 3" data-arrow-transform="${arrowTransform}" transform="${arrowTransform}"/>` : '';
+    const departure=edge.points[1];
+    const startTransform=sourcePoint && departure ? `translate(${sourcePoint.x} ${sourcePoint.y}) rotate(${Math.atan2(sourcePoint.y-departure.y,sourcePoint.x-departure.x)*180/Math.PI})` : '';
+    const startArrow=diagram.fullCanvas && edge.bidirectional ? `<path class="graph-edge-arrow graph-edge-arrow-start" d="M -6 -3 L 0 0 L -6 3" data-arrow-transform="${startTransform}" transform="${startTransform}"/>` : '';
+    const connectionTitle=edge.memberIds.map(id=>{const member=diagram.edges.find(item=>item.id===id);return `${nodeById.get(member.source)?.label || member.source} → ${nodeById.get(member.target)?.label || member.target}: ${member.label || member.semantic_type || ''}`;}).join('\n');
+    const endMarker=diagram.fullCanvas ? '' : ' marker-end="url(#arrow-backbone)"';
+    const routeData=edge.summary ? edge.summary.paths.map(points=>graphPathData(points,4)).join(' ') : graphPathData(edge.points,diagram.fullCanvas?4:8);
+    const junctionDots=(edge.summary?.junctions || []).map(point=>`<circle class="canvas-summary-junction-hit" cx="${point.x}" cy="${point.y}" r="8" data-junction-radius="8" aria-hidden="true"/><circle class="canvas-summary-junction" cx="${point.x}" cy="${point.y}" r="2" data-junction-radius="2" aria-hidden="true"/>`).join('');
+    const casing=diagram.fullCanvas ? `<path class="graph-edge-casing" d="${routeData}"/>` : '';
+    const branchArrows=edge.summary?.direction==='OUT' ? edge.summary.paths.slice(1).map(points=>{
+      const end=points.at(-1),previous=points.at(-2),transform=`translate(${end.x} ${end.y}) rotate(${Math.atan2(end.y-previous.y,end.x-previous.x)*180/Math.PI})`;
+      return `<path class="graph-edge-arrow" d="M -6 -3 L 0 0 L -6 3" data-arrow-transform="${transform}" transform="${transform}"/>`;
+    }).join('') : '';
+
+    const selectedVisual=edge.memberIds.includes(state.selectedEdgeId);
+    const visibilityClass=focus?.isolate && !highlighted ? ' is-isolated-out' : highlighted ? ' is-focused' : focus ? ' is-dimmed' : '';
+    const selectableEdgeId=selectedVisual ? state.selectedEdgeId : edge.memberIds[0];
+    const relationClass=graphRelationshipVisualClass(edge);
+    const directIncoming=selected && edge.memberIds.some(id=>diagram.edges.find(item=>item.id===id)?.target===selected.id);
+    const directOutgoing=selected && edge.memberIds.some(id=>diagram.edges.find(item=>item.id===id)?.source===selected.id);
+    const flowDirection=directIncoming && directOutgoing ? 'both' : directIncoming ? 'in' : directOutgoing ? 'out' : '';
+    const connectionDomain=canvasConnectionDomain(edge,selected,diagram);
+
+    return `<g class="graph-edge projection-${escapeHtml(projectionKind)} layout-backbone ${relationClass}${visibilityClass}${selectedVisual?' selected':''}" data-edge="${escapeHtml(selectableEdgeId)}" data-member-edges="${escapeHtml(JSON.stringify(edge.memberIds))}" data-summary-id="${escapeHtml(edge.summary?.id || '')}" data-flow-direction="${flowDirection}" data-connection-domain="${escapeHtml(connectionDomain?.id || '')}" data-domain-tone="${connectionDomain?.tone ?? ''}" role="button" tabindex="0" aria-label="${edge.summary?'Expand '+edge.canvasLabel:'Inspect '+(edge.bidirectional?'two-way connection':'relationship')} ${escapeHtml(connectionTitle)}"><title>${escapeHtml(connectionTitle)}</title><path class="graph-edge-hit" d="${routeData}"/>${sourcePort}${casing}<path class="graph-edge-line" d="${routeData}"${startMarker}${endMarker}/>${endArrow}${startArrow}${branchArrows}${junctionDots}${label && labelPlacement ? `${labelPlacement.attachment?`<path class="canvas-summary-label-leader" d="M ${labelPlacement.attachment.x} ${labelPlacement.attachment.y} L ${labelPlacement.x} ${labelPlacement.y-3}"/>`: ''}${diagram.fullCanvas ? `<rect class="canvas-edge-key-bg" x="${labelPlacement.box.x}" y="${labelPlacement.box.y}" width="${labelPlacement.box.width}" height="20" rx="6"/>` : ''}<text class="graph-edge-label ${diagram.fullCanvas?'canvas-edge-key':'graph-detail-read'}" data-edge-label="${escapeHtml(edge.id)}" x="${labelPlacement.x}" y="${labelPlacement.y}" text-anchor="middle">${escapeHtml(diagram.fullCanvas?edge.canvasLabel:label)}</text>` : ''}</g>`;
   }).join('');
   const nodes = display.nodes.map((node) => {
-    const health=diagramNodeHealth(node), selectedNode=state.selectedComponentId===node.component_id, highlighted=!focus || focus.nodes.has(node.id);
-    const names=wrapGraphText(node.label,Math.max(12,Math.floor((node.width-48)/8.8)),2).map((line,index)=>`<text class="node-name" x="${node.x+18}" y="${node.y+55+index*17}">${escapeHtml(line)}</text>`).join('');
-    const responsibility=wrapGraphText(node.responsibility,Math.max(16,Math.floor((node.width-48)/7.4)),2).map((line,index)=>`<text class="node-responsibility graph-detail-read" x="${node.x+18}" y="${node.y+96+index*14}">${escapeHtml(line)}</text>`).join('');
+    const health=diagramNodeHealth(node), selectedNode=state.selectedComponentId===node.component_id, highlighted=focus ? focus.nodes.has(node.id) : (!journeyNodes || journeyNodes.has(node.id) || diagram.nodes.some(child=>journeyNodes.has(child.id) && (child.hierarchyPath || []).includes(node.id)));
+    const boundaryContext=Boolean(focus?.boundaryNodes?.has(node.id));
+    const collapsed=Boolean(display.collapsedNodeIds?.has(node.id));
+    const visibilityClass=focus?.isolate && !highlighted ? ' is-isolated-out' : highlighted ? ' is-focused' : ' is-dimmed';
+    const groupFrame=groupFrameByNode.get(node.id);
+    if (groupFrame) {
+      const contained=diagram.nodes.filter(item=>(item.hierarchyPath || []).slice(0,-1).includes(node.id));
+      const count=contained.length;
+      const foldControl=`<g class="canvas-group-fold" data-fold-group="${escapeHtml(node.id)}" role="button" tabindex="0" aria-label="${collapsed?'Expand':'Group'} ${escapeHtml(node.label)}: ${count} components"><rect x="${node.x+node.width-52}" y="${node.y+5}" width="46" height="24" rx="6"/><text x="${node.x+node.width-29}" y="${node.y+22}" text-anchor="middle">${collapsed?'+':'−'} ${count}</text></g>`;
+      const summaryCard=collapsed?`<g class="canvas-group-summary" data-fold-group="${escapeHtml(node.id)}" role="button" tabindex="0" aria-label="Expand ${escapeHtml(node.label)}: ${count} components"><rect x="${groupFrame.x+20}" y="${groupFrame.y+48}" width="${groupFrame.width-40}" height="64" rx="10"/><text x="${groupFrame.x+36}" y="${groupFrame.y+74}">${count} components grouped</text><text class="canvas-group-summary-hint" x="${groupFrame.x+36}" y="${groupFrame.y+96}">Expand to follow individual components</text></g>`:'';
+      const role=node.projectionRole || 'PRIMARY', action='drill';
+      const ariaLabel=`Inspect ${node.label}; ${collapsed?'collapsed':'expanded'} subsystem with ${node.childCount} child${node.childCount===1?'':'ren'}`;
+      return `<g class="node-card architecture-group-owner projection-${role.toLowerCase()} health-${health.key} is-${action}${selectedNode ? ' selected' : ''}${collapsed?' is-collapsed':''}${boundaryContext?' is-boundary-context':''}${visibilityClass}" ${canvasDomainToneAttr(node,diagram)} data-node="${escapeHtml(node.id)}" data-component="${escapeHtml(node.component_id)}" data-child-count="${node.childCount}" data-collapsed="${collapsed}" data-projection-role="${role}" data-node-action="${action}" role="button" aria-label="${escapeHtml(ariaLabel)}" tabindex="0"><rect class="architecture-group-owner-hit" x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="12"/><text class="architecture-group-owner-name" x="${node.x+14}" y="${node.y+22}">${escapeHtml(graphWrapPixels(node.label,node.width-52,1,'700 17px')[0] || '')}</text></g>${foldControl}${summaryCard}`;
+    }
+    const nameLines=graphWrapPixels(node.label,node.width-44,2,diagram.fullCanvas?'650 17px':'750 13.5px');
+    const names=nameLines.map((line,index)=>`<text class="node-name" x="${node.x+22}" y="${node.y+(diagram.fullCanvas?(nameLines.length>1?36:46):55)+index*21}">${escapeHtml(line)}</text>`).join('');
+    const responsibility=graphWrapPixels(diagram.fullCanvas?'':node.responsibility,node.width-40,2,'500 10.2px').map((line,index)=>`<text class="node-responsibility graph-detail-read" x="${node.x+18}" y="${node.y+96+index*14}">${escapeHtml(line)}</text>`).join('');
     const drillable=graphNodeAction(node)==='drill', role=node.projectionRole || 'PRIMARY', action=drillable ? 'drill' : 'inspect';
-    const cue=drillable ? `<g class="node-drill-action" aria-hidden="true"><rect x="${node.x+node.width-126}" y="${node.y+node.height-31}" width="110" height="22" rx="11"/><text class="node-drill-cue" x="${node.x+node.width-25}" y="${node.y+node.height-16}" text-anchor="end">OPEN · ${node.childCount} CHILD${node.childCount===1?'':'REN'} ›</text></g>` : role==='SCOPE' ? `<text class="node-scope-cue" x="${node.x+node.width-16}" y="${node.y+node.height-13}" text-anchor="end">CURRENT SCOPE</text>` : role==='CONTEXT' ? `<text class="node-context-cue" x="${node.x+node.width-16}" y="${node.y+node.height-13}" text-anchor="end">CONTEXT</text>` : '';
-    return `<g class="node-card projection-${role.toLowerCase()} health-${health.key} is-${action}${selectedNode ? ' selected' : ''}${highlighted ? ' is-focused' : ' is-dimmed'}" data-node="${escapeHtml(node.id)}" data-component="${escapeHtml(node.component_id)}" data-child-count="${node.childCount}" data-projection-role="${role}" data-node-action="${action}" role="button" aria-label="${escapeHtml(drillable ? `Inspect ${node.label}; double click to open subsystem with ${node.childCount} child${node.childCount===1?'':'ren'}` : `Inspect ${node.label}`)}" tabindex="0"><rect class="node-surface" x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="16"/>${graphNodeKindMarkup(node)}<circle class="node-health-dot" cx="${node.x+node.width-20}" cy="${node.y+21}" r="4.5"/>${names}${responsibility}<text class="node-status graph-detail-full" x="${node.x+18}" y="${node.y+node.height-13}">${escapeHtml(health.label)} · depth ${node.depth}</text>${cue}</g>`;
+    const drillLabel=ARCHITECTURE_CANVAS_MODE ? `FOCUS · ${node.childCount} CHILD${node.childCount===1?'':'REN'} ›` : `OPEN · ${node.childCount} CHILD${node.childCount===1?'':'REN'} ›`;
+    const cue=drillable ? `<g class="node-drill-action" aria-hidden="true"><rect x="${node.x+node.width-126}" y="${node.y+node.height-31}" width="110" height="22" rx="11"/><text class="node-drill-cue" x="${node.x+node.width-25}" y="${node.y+node.height-16}" text-anchor="end">${escapeHtml(drillLabel)}</text></g>` : role==='SCOPE' ? `<text class="node-scope-cue" x="${node.x+node.width-16}" y="${node.y+node.height-13}" text-anchor="end">CURRENT SCOPE</text>` : role==='CONTEXT' ? `<text class="node-context-cue" x="${node.x+node.width-16}" y="${node.y+node.height-13}" text-anchor="end">CONTEXT</text>` : '';
+    return `<g class="node-card projection-${role.toLowerCase()} health-${health.key} is-${action}${selectedNode ? ' selected' : ''}${collapsed?' is-collapsed':''}${boundaryContext?' is-boundary-context':''}${visibilityClass}" ${canvasDomainToneAttr(node,diagram)} data-node="${escapeHtml(node.id)}" data-component="${escapeHtml(node.component_id)}" data-child-count="${node.childCount}" data-collapsed="${collapsed}" data-projection-role="${role}" data-node-action="${action}" role="button" aria-label="${escapeHtml(drillable ? `Inspect ${node.label}; ${collapsed?'collapsed':'expanded'} subsystem with ${node.childCount} child${node.childCount===1?'':'ren'}` : `Inspect ${node.label}`)}" tabindex="0"><rect class="node-surface" x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="16"/>${graphNodeKindMarkup(node)}<path class="node-domain-tick" d="M${node.x+10} ${node.y+node.height/2-9}v18"/><circle class="node-health-dot" cx="${node.x+node.width-20}" cy="${node.y+21}" r="4.5"/>${names}${responsibility}<text class="node-status graph-detail-full${diagram.fullCanvas?' canvas-hidden-detail':''}" x="${node.x+18}" y="${node.y+node.height-13}">${escapeHtml(health.label)} · depth ${node.depth}</text>${cue}</g>`;
   }).join('');
   $('graphReviewState').textContent=attentionNodes.length ? `${attentionNodes.length} node${attentionNodes.length===1?'':'s'} need attention` : 'All projected nodes aligned';
   const boundaryRelationshipCount = diagram.scope?.directRelationships?.length || 0;
   const collapsedConnectionMeta = visibleEdges.length !== display.edges.length
     ? ` · ${visibleEdges.length} visual connection${visibleEdges.length===1?'':'s'}`
     : '';
-  const relationshipMeta = display.scoped
+  const relationshipMeta = diagram.fullCanvas
+    ? `${visibleEdges.filter((edge)=>!focus?.isolate || edge.memberIds.some(id=>focus.edges.has(id))).reduce((sum,edge)=>sum+edge.memberIds.length,0)} shown / ${diagram.edges.length} total relationships${visibleEdges.some(edge=>edge.bidirectional)?` · ${visibleEdges.length} lines`:''}`
+    : display.scoped
     ? `${display.edges.length} direct child relationship${display.edges.length===1?'':'s'}${collapsedConnectionMeta}`
     : `${display.edges.length} projected relationship${display.edges.length===1?'':'s'}${collapsedConnectionMeta}`;
   const scopeMeta = display.scoped && boundaryRelationshipCount
@@ -2488,14 +4066,31 @@ function renderGraph() {
     : display.scoped && display.edges.length === 0
       ? '<span class="graph-meta-scope">No authored child-to-child links</span>'
       : '';
-  const meta=`<div class="graph-meta"><span>${display.nodes.length} visible nodes</span><span>${relationshipMeta}</span>${scopeMeta}<span>${activeTaskCount} task${activeTaskCount===1?'':'s'} active</span><span>Accepted v${diagram.architectureVersion}</span>${attentionNodes.length ? `<span class="graph-meta-attention">${attentionNodes.length} need attention</span>` : '<span class="graph-meta-ok">No action needed</span>'}</div>`;
-  const viewBox = graphDisplayViewBox(diagram, display.nodes, visibleEdges);
-  canvas.innerHTML=`${graphScopeToolbar(diagram)}<div class="graph-stage" data-reading-mode="${state.readingMode}">${meta}<svg class="living-graph-svg" viewBox="${viewBox}" role="img" aria-label="Accepted scoped project architecture graph"><defs><marker id="arrow-backbone" markerUnits="userSpaceOnUse" markerWidth="7" markerHeight="7" viewBox="0 0 7 7" refX="6.35" refY="3.5" orient="auto-start-reverse" overflow="visible"><path d="M1.2 1.1 L5.8 3.5 L1.2 5.9" fill="none" stroke="var(--brand-deep)" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>${hierarchy}${edges}${nodes}</svg></div>`;
-  canvas.querySelectorAll('[data-reading-mode]').forEach((button)=>button.addEventListener('click',()=>setGraphReadingMode(button.dataset.readingMode)));
+  const hierarchyMeta=diagram.fullCanvas ? `<span>${groupFrames.length} architecture boundar${groupFrames.length===1?'y':'ies'}</span>` : '';
+  const collapsedMeta=display.collapsedNodeIds?.size ? `<span>${display.collapsedNodeIds.size} collapsed</span>` : '';
+  const meta=`<div class="graph-meta"><span>${display.nodes.length} components</span>${hierarchyMeta}<span>${relationshipMeta}</span>${collapsedMeta}${scopeMeta}<span>${activeTaskCount} task${activeTaskCount===1?'':'s'} active</span><span>Accepted v${diagram.architectureVersion}</span>${attentionNodes.length ? `<span class="graph-meta-attention">${attentionNodes.length} need attention</span>` : ''}</div>`;
+  const fitNodes = focus?.isolate ? display.nodes.filter((node)=>focus.nodes.has(node.id)) : display.nodes;
+  const fitEdges = focus?.isolate ? visibleEdges.filter((edge)=>edge.memberIds.some((edgeId)=>focus.edges.has(edgeId))) : (diagram.fullCanvas ? display.edges : visibleEdges);
+  const fitGroupFrames = focus?.isolate ? groupFrames.filter((frame)=>focus.nodes.has(frame.nodeId)) : groupFrames;
+  const fitViewBox = graphDisplayViewBox(diagram.fullCanvas ? {...diagram,groupFrames:fitGroupFrames} : diagram, fitNodes, fitEdges);
+  const viewBox = ARCHITECTURE_CANVAS_MODE ? resolvedGraphViewport(fitViewBox, graphViewportKey(diagram)) : fitViewBox;
+  const toolbar=diagram.fullCanvas ? canvasReadingToolbar(diagram) : graphScopeToolbar(diagram);
+  canvas.dataset.journey=Boolean(journeyNodes);
+  const graphAria=diagram.fullCanvas ? 'Accepted full-system Living Architecture canvas' : 'Accepted scoped project architecture graph';
+  canvas.innerHTML=`${toolbar}<div class="graph-stage" data-reading-mode="${state.readingMode}">${meta}${diagram.fullCanvas?'':graphViewportControlsMarkup()}<svg class="living-graph-svg" data-fit-view-box="${escapeHtml(fitViewBox)}" viewBox="${escapeHtml(viewBox)}" role="img" aria-label="${graphAria}"><defs><marker id="arrow-backbone" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" viewBox="0 0 10 10" refX="8.5" refY="5" orient="auto-start-reverse" overflow="visible"><path d="M1.5 1.5 L8.5 5 L1.5 8.5" fill="none" stroke="var(--brand-deep)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>${groups}${hierarchy}${edges}${nodes}</svg>${diagram.fullCanvas?'<div class="canvas-connection-readout" hidden aria-live="polite"></div>':''}</div>`;
+  canvas.querySelectorAll('button[data-reading-mode]').forEach((button)=>button.addEventListener('click',()=>setGraphReadingMode(button.dataset.readingMode)));
   canvas.querySelector('[data-graph-back]')?.addEventListener('click',()=>navigateGraphScope(parentGraphScopeComponentId(diagram),{focusComponentId:state.scopeComponentId}));
   canvas.querySelectorAll('[data-scope-target]').forEach((button)=>button.addEventListener('click',()=>navigateGraphScope(button.dataset.scopeTarget || null,{focusComponentId:state.scopeComponentId})));
-  const focusNode=async(el)=>{ const node=diagramNodeById(el.dataset.node); await activateGraphNode(node); setTimeout(()=>document.querySelector(`[data-component="${CSS.escape(node.component_id)}"]`)?.focus(),0); };
+  canvas.querySelector('[data-canvas-reading-view]')?.addEventListener('change', (event) => {
+    canvasReadingView.id=event.target.value;
+    state.selectedComponentId=null; state.selectedEdgeId=null; state.graphFocusMode='all'; state.canvasInspectorOpen=false; clearArchitectureTracePath({render:false}); syncArchitectureCanvasSelectionUrl();
+    renderGraph();
+  });
+  canvas.querySelector('[data-regroup-connections]')?.addEventListener('click',()=>{canvasSummaryState.expanded.clear();renderGraph();});
+  canvas.querySelectorAll('[data-journey-node]').forEach(button=>button.addEventListener('click',()=>activateGraphNode(diagramNodeById(button.dataset.journeyNode))));
+  const focusNode=async(el)=>{ const node=diagramNodeById(el.dataset.node); await activateGraphNode(node); setTimeout(()=>{if(state.selectedComponentId===node.component_id)document.querySelector(`[data-component="${CSS.escape(node.component_id)}"]`)?.focus();},0); };
   const drillNode=async(el)=>{ const node=diagramNodeById(el.dataset.node); await drillGraphNode(node); };
+  canvas.querySelectorAll('[data-fold-group]').forEach(el=>{const fold=event=>{event.stopPropagation();toggleGraphNodeCollapse(el.dataset.foldGroup);};el.addEventListener('click',fold);el.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();fold(event);}});});
   canvas.querySelectorAll('[data-node]').forEach((el)=>{
     el.addEventListener('click',()=>{focusNode(el);});
     el.addEventListener('dblclick',(event)=>{ event.preventDefault(); drillNode(el); });
@@ -2505,36 +4100,142 @@ function renderGraph() {
       if(event.key==='Enter'||event.key===' '){event.preventDefault();focusNode(el);}
     });
   });
+  canvas.querySelectorAll('.graph-edge[data-edge]').forEach((el)=>{
+    for(const eventName of ['pointerenter','focus']) el.addEventListener(eventName,()=>previewCanvasConnection(el.dataset.edge));
+    for(const eventName of ['pointerleave','blur']) el.addEventListener(eventName,()=>previewCanvasConnection(null));
+    el.addEventListener('click',(event)=>{event.stopPropagation();if(el.dataset.summaryId) expandCanvasConnectionSummary(el.dataset.summaryId); else selectGraphEdge(el.dataset.edge);});
+    el.addEventListener('keydown',(event)=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();if(el.dataset.summaryId) expandCanvasConnectionSummary(el.dataset.summaryId); else selectGraphEdge(el.dataset.edge);}});
+  });
+  const graphSvg=canvas.querySelector('.living-graph-svg');
+  wireWorkspaceResourceRetry(canvas);
+  wireGraphViewport(graphSvg);
+  if (state.canvasDeepLinkFocusPending) {
+    requestAnimationFrame(() => {
+      if (!state.canvasDeepLinkFocusPending) return;
+      const target=diagramNodeByComponentId(state.selectedComponentId);
+      const currentSvg=canvas.querySelector('.living-graph-svg');
+      if (target && focusGraphNodeInViewport(currentSvg, target)) {
+        state.canvasDeepLinkFocusPending=false;
+      }
+    });
+  }
   renderSelectedNode(); renderLists(); updateInstructionContext();
 }
 
 function renderSelectedNode() {
+  for (const panel of [$('selectedNode'),$('nodeEvidence')]) {
+    if (panel) {
+      const preview=(event)=>{const button=event.target.closest('[data-related-edge]');previewCanvasConnection(button?.dataset.relatedEdge || null,true);};
+      panel.onpointerover=preview; panel.onfocusin=preview;
+      panel.onpointerleave=()=>previewCanvasConnection(null);
+      panel.onfocusout=()=>previewCanvasConnection(null);
+    }
+    if (panel) panel.onclick = (event) => {
+      const button=event.target.closest('[data-related-edge]');
+      if (button && panel.contains(button)) selectGraphEdge(button.dataset.relatedEdge);
+    };
+  }
   const c=diagramNodeByComponentId(state.selectedComponentId), diagram=state.diagram;
+  const selectedEdge=graphEdgeById(state.selectedEdgeId, diagram);
+  if (selectedEdge && diagram) {
+    const source=diagramNodeById(selectedEdge.source), target=diagramNodeById(selectedEdge.target);
+    const reciprocal=canvasReciprocalPartner(selectedEdge,diagram.edges);
+    const directionPicker=reciprocal ? `<div class="connection-directions"><small>TWO-WAY CONNECTION · 2 DIRECTIONS</small>${[selectedEdge,reciprocal].sort((a,b)=>a.id.localeCompare(b.id)).map(edge=>`<button type="button" data-related-edge="${escapeHtml(edge.id)}" aria-pressed="${edge.id===selectedEdge.id}"><strong>${escapeHtml(diagramNodeById(edge.source)?.label || edge.source)} → ${escapeHtml(diagramNodeById(edge.target)?.label || edge.target)}</strong><span>${escapeHtml(edge.label || edge.semantic_type)}</span></button>`).join('')}</div>` : '';
+    const provenance=selectedEdge.provenance || [];
+    const tab=state.inspectorTab;
+    const canonicalRelationshipIds=[...new Set(provenance.map((item)=>item.relationship_id).filter(Boolean))];
+    const relationshipCategory=String(selectedEdge.relationship_category || 'SUPPORT');
+    const projectDecisionItems=[...(state.architecture?.decisions || []).map((item)=>`Decision: ${item}`),...(state.architecture?.risks || []).map((item)=>`Risk: ${item}`),...(state.architecture?.assumptions || []).map((item)=>`Assumption: ${item}`)];
+    const projectDecisionContent=projectDecisionItems.length
+      ? `<section class="inspector-responsibility"><h4>Project-level context</h4><p>These accepted items are not linked specifically to this relationship by the current Architecture contract.</p></section><div class="bullet-list"><ul>${projectDecisionItems.map((item)=>`<li>${escapeHtml(item)}</li>`).join('')}</ul></div>`
+      : '<p class="muted">No project-level accepted decisions, risks, or assumptions are recorded.</p>';
+    const overview=`<section class="inspector-responsibility"><h4>Canonical relationship</h4><p><strong>${escapeHtml(source?.label || selectedEdge.source)}</strong> → <strong>${escapeHtml(target?.label || selectedEdge.target)}</strong></p><p>${escapeHtml(selectedEdge.supporting_text || selectedEdge.semantic_type || selectedEdge.label || 'Accepted dependency')}</p></section><dl class="inspector-facts"><div><dt>Type</dt><dd>${escapeHtml(selectedEdge.semantic_type || 'relationship')}</dd></div><div><dt>Category</dt><dd>${escapeHtml(relationshipCategory)}</dd></div><div><dt>Direction</dt><dd>${escapeHtml(source?.label || selectedEdge.source)} → ${escapeHtml(target?.label || selectedEdge.target)}</dd></div><div><dt>Diagram ID</dt><dd><code>${escapeHtml(selectedEdge.id)}</code></dd></div><div><dt>Canonical source IDs</dt><dd>${escapeHtml(canonicalRelationshipIds.join(', ') || 'None')}</dd></div><div><dt>Status</dt><dd>Accepted · v${diagram.architectureVersion}</dd></div></dl>`;
+    const dependencies=`<div class="inspector-relationship-endpoints"><button type="button" data-inspect-component="${escapeHtml(source?.component_id || '')}">← ${escapeHtml(source?.label || selectedEdge.source)}</button><span>${escapeHtml(selectedEdge.semantic_type || 'relationship')}</span><button type="button" data-inspect-component="${escapeHtml(target?.component_id || '')}">${escapeHtml(target?.label || selectedEdge.target)} →</button></div>`;
+    const evidence=provenance.length ? `<div class="inspector-provenance">${provenance.map((item)=>`<span>${escapeHtml(item.relationship_id || selectedEdge.id)} · ${escapeHtml(item.semantic_type || selectedEdge.semantic_type || '')} · accepted v${escapeHtml(String(item.architecture_version ?? diagram.architectureVersion))}</span>`).join('')}</div>` : '<p class="muted">No additional relationship provenance is attached.</p>';
+    const content=tab==='dependencies' ? dependencies : tab==='evidence' ? evidence : tab==='tasks' ? '<p class="muted">Tasks are attached to architecture components, not directly to this relationship.</p>' : tab==='code' ? '<p class="muted">Use the endpoint components to inspect revision-pinned Code Truth for this relationship.</p>' : tab==='decisions' ? projectDecisionContent : overview;
+    $('selectedNode').innerHTML=`<small>SELECTED RELATIONSHIP</small><div class="selected-node-title"><h3>${escapeHtml(source?.label || selectedEdge.source)} → ${escapeHtml(target?.label || selectedEdge.target)}</h3><span class="health-pill health-planned">ACCEPTED</span></div><p>${escapeHtml(selectedEdge.semantic_type || selectedEdge.label || 'Canonical relationship')}</p><div class="graph-focus-controls"><button type="button" data-clear-edge>Clear</button></div>`;
+    $('nodeEvidence').innerHTML=`${directionPicker}${architectureInspectorTabsMarkup()}<div class="architecture-inspector-content">${content}</div>`;
+    wireArchitectureInspectorTabs();
+    $('nodeEvidence').querySelectorAll('[data-inspect-component]').forEach((button)=>button.addEventListener('click',()=>{
+      const node=diagram.nodes.find((item)=>item.component_id===button.dataset.inspectComponent);
+      if(node) activateGraphNode(node);
+    }));
+    $('selectedNode').querySelector('[data-clear-edge]')?.addEventListener('click',()=>{state.selectedEdgeId=null;state.inspectorTab='overview';renderGraph();});
+    return;
+  }
   if (!c || !diagram) {
+    if (diagram?.fullCanvas) {
+      const view=activeCanvasReadingView(diagram);
+      const path=(view?.nodeIds || []).map((id)=>diagramNodeById(id)?.label || id);
+      $('selectedNode').innerHTML=`<small>SYSTEM ARCHITECTURE · v${diagram.architectureVersion}</small><h3>${escapeHtml(view?.label || 'All relationships')}</h3><p>Select a component to see its incoming and outgoing relationships, or select a line to inspect its direction and purpose.</p>`;
+      $('nodeEvidence').innerHTML=path.length
+        ? `<h4>Journey order</h4><ol class="canvas-journey-steps">${path.map((name)=>`<li>${escapeHtml(name)}</li>`).join('')}</ol><p class="muted">Authored architecture journey; this is not a runtime trace.</p>`
+        : '<p class="muted">The overview shows the project backbone. All relationships remain available through selection or the All relationships view.</p>';
+      return;
+    }
     const attention=(diagram?.nodes || []).filter((node)=>diagramNodeHealth(node).needsAttention), direct=diagram?.scope?.directRelationships || [];
     $('selectedNode').innerHTML=attention.length ? `<small>CURRENT SCOPE · ${escapeHtml(state.readingMode)}</small><h3>${attention.length} node${attention.length===1?'':'s'} need attention</h3><p>Select a node to inspect exact projected facts. Non-leaf primary nodes open their canonical backend scope.</p>` : `<small>CURRENT SCOPE · ${escapeHtml(state.readingMode)}</small><h3>${escapeHtml(diagram?.scope?.label || 'Overview')}</h3><p>Select a node to inspect it. Upstream/downstream focus follows only the currently returned projected edges.</p>`;
     $('nodeEvidence').innerHTML=state.diagramError ? `<p><strong>Diagram unavailable</strong></p><p class="muted">${escapeHtml(state.diagramError)}</p>` : direct.length ? `<p><strong>${direct.length} direct scope relationship${direct.length===1?'':'s'}</strong></p><p class="muted">These authored relationships touch this scope directly and are not converted into fake child edges.</p>` : '<p><strong>Canonical projection</strong></p><p class="muted">Backend owns scope, topology, geometry, and routes. MAP/READ/FULL only changes disclosure.</p>';
     return;
   }
   const health=diagramNodeHealth(c), incoming=diagram.edges.filter((edge)=>edge.target===c.id), outgoing=diagram.edges.filter((edge)=>edge.source===c.id), linkedTasks=state.tasks.filter((task)=>task.related_component===c.component_id);
-  const connectionLine=(edge,direction)=>{ const peerId=direction==='in'?edge.source:edge.target, peer=diagramNodeById(peerId), count=Array.isArray(edge.provenance)?edge.provenance.length:0; return `<li><strong>${direction==='in'?'From':'To'} ${escapeHtml(peer?.label || peerId)}</strong><span>${escapeHtml(edge.semantic_type || edge.label || 'relationship')}${edge.supporting_text ? ` · ${escapeHtml(edge.supporting_text)}` : ''}${count ? ` · ${count} canonical source${count===1?'':'s'}` : ''}</span></li>`; };
-  const controls=`<div class="graph-focus-controls" role="group" aria-label="Graph focus">${['connected','upstream','downstream','all'].map((mode)=>`<button type="button" data-graph-focus="${mode}" class="${state.graphFocusMode===mode?'active':''}">${mode[0].toUpperCase()+mode.slice(1)}</button>`).join('')}<button type="button" data-graph-focus="clear">Clear</button></div>`;
+  const connectionLine=(edge,direction)=>{
+    const peerId=direction==='in'?edge.source:edge.target, peer=diagramNodeById(peerId);
+    const domain=diagram.fullCanvas ? canvasDomainForNode(peer,diagram) : null;
+    const domainBadge=domain ? `<span class="canvas-connection-domain" data-peer-domain="${escapeHtml(domain.id)}" data-domain-tone="${domain.tone}"><i aria-hidden="true"></i>${escapeHtml(domain.label)}</span>` : '';
+    return `<li><button type="button" class="canvas-connection-button" data-domain-tone="${domain?.tone ?? ''}" data-related-edge="${escapeHtml(edge.id)}"><span><strong>${direction==='in'?'← From':'→ To'} ${escapeHtml(peer?.label || peerId)}</strong><span>${escapeHtml(edge.label || edge.semantic_type || 'relationship')}</span>${domainBadge}</span></button></li>`;
+  };
+  const openScope = graphNodeAction(c) === 'drill'
+    ? `<button type="button" data-open-selected-scope class="graph-open-scope">${ARCHITECTURE_CANVAS_MODE ? 'Focus scope' : 'Open scope'} →</button>`
+    : '';
+  const collapsed=Boolean(state.collapsedNodeIds.has(c.id));
+  const collapseControl=ARCHITECTURE_CANVAS_MODE && c.childCount>0
+    ? `<button type="button" data-toggle-collapse="${escapeHtml(c.id)}" class="${collapsed?'active':''}" aria-pressed="${collapsed}">${collapsed?'Expand':'Collapse'}</button>`
+    : '';
+  const focusModes=[['connected','Connected'],['upstream','Upstream'],['downstream','Downstream'],['hierarchy','Focus'],['isolate','Isolate'],['all','All']];
+  const controls=`<div class="graph-focus-controls" role="group" aria-label="Graph focus">${focusModes.map(([mode,label])=>`<button type="button" data-graph-focus="${mode}" class="${state.graphFocusMode===mode?'active':''}">${label}</button>`).join('')}<button type="button" data-graph-focus="clear">Clear</button>${collapseControl}${openScope}</div>`;
+  const traceControls=architectureTraceControlsMarkup(c,diagram);
   const provenance=[...incoming,...outgoing].flatMap((edge)=>(edge.provenance || []).map((item)=>({edge,item})));
-  $('selectedNode').innerHTML=`<small>SELECTED COMPONENT · ${escapeHtml(String(c.semantic_kind))} · ${escapeHtml(state.readingMode)}</small><div class="selected-node-title"><h3>${escapeHtml(c.label)}</h3><span class="health-pill health-${health.key}">${escapeHtml(health.label)}</span></div><p>${escapeHtml(c.responsibility)}</p>${controls}<div class="component-children-summary"><strong>Scope facts</strong><span>Projection role · ${escapeHtml(c.projectionRole)}</span><span>Canonical children · ${c.childCount}</span><span>Current scope · ${escapeHtml(diagram.scope?.label || 'Overview')}</span></div><div class="component-task-summary"><strong>${linkedTasks.length} linked task${linkedTasks.length===1?'':'s'}</strong>${linkedTasks.length ? linkedTasks.map((task)=>`<span><i class="status-dot ${statusClass(task.status)}"></i>${escapeHtml(task.title)} · ${escapeHtml(task.status.replace('_',' '))}</span>`).join('') : '<span class="muted">No execution task is linked to this component.</span>'}</div><div class="component-connections">${incoming.length||outgoing.length ? `<ul>${incoming.map((edge)=>connectionLine(edge,'in')).join('')}${outgoing.map((edge)=>connectionLine(edge,'out')).join('')}</ul>` : '<p class="muted">No projected relationships for this node in the current scope.</p>'}</div>`;
+  const currentScopeLabel=diagram.fullCanvas ? 'Full system' : (diagram.scope?.label || 'Overview');
+  $('selectedNode').innerHTML=`<small>SELECTED COMPONENT · ${escapeHtml(String(c.semantic_kind))}</small><div class="selected-node-title"><h3>${escapeHtml(c.label)}</h3><span class="health-pill health-${health.key}">${escapeHtml(health.label)}</span></div><p>${escapeHtml(c.responsibility)}</p>${controls}<div class="component-connections"><strong>${incoming.length} incoming · ${outgoing.length} outgoing</strong>${diagram.fullCanvas?'<span class="connection-domain-key">Colors identify connected boundaries. Arrows show direction.</span>':''}${incoming.length||outgoing.length ? `<ul>${incoming.map((edge)=>connectionLine(edge,'in')).join('')}${outgoing.map((edge)=>connectionLine(edge,'out')).join('')}</ul>` : '<p class="muted">No direct canonical relationships.</p>'}</div>${traceControls}`;
   const provenanceMarkup=provenance.length ? `<div class="inspector-technical-block"><h4>Relationship provenance</h4><div class="inspector-provenance">${provenance.map(({edge,item})=>`<span>${escapeHtml(edge.id)} ← ${escapeHtml(item.relationship_id || 'canonical relationship')} · ${escapeHtml(item.semantic_type || edge.semantic_type || '')}</span>`).join('')}</div></div>` : '';
-  const projectedTaskEvidence=(c.supporting_text || []).map((text)=>{
-    const match=/^Task\s+([A-Z_]+):\s*(.+)$/i.exec(String(text || '').trim());
-    return match ? {status:match[1].toUpperCase(), title:match[2]} : null;
-  }).filter(Boolean);
-  const inspectorTasks=linkedTasks.length
-    ? linkedTasks.map((task)=>({status:task.status,title:task.title}))
-    : projectedTaskEvidence;
-  const nonTaskEvidence=(c.supporting_text || []).filter((text)=>!/^Task\s+[A-Z_]+:\s*/i.test(String(text || '').trim()));
+  const inspectorTasks=linkedTasks.map((task)=>({status:task.status,title:task.title}));
+  const supportingText=(c.supporting_text || []).map((text)=>String(text || '').trim()).filter(Boolean);
+  const pendingChanges=supportingText.filter((text)=>/^Pending change:\s*/i.test(text));
+  const nodeEvidence=supportingText.filter((text)=>!/^Task\s+[A-Z_]+:\s*/i.test(text) && !/^Pending change:\s*/i.test(text));
   const inspectorTaskMarkup=inspectorTasks.length
     ? `<div class="inspector-task-list">${inspectorTasks.map((task)=>`<div class="inspector-task-row"><i class="status-dot ${statusClass(task.status)}" aria-hidden="true"></i><span>${escapeHtml(task.title)}</span></div>`).join('')}</div>`
-    : `<p class="inspector-status-detail">${escapeHtml(nonTaskEvidence.join(' · ') || c.status?.canonical_status || 'No additional status evidence.')}</p>`;
-  $('nodeEvidence').innerHTML=`<div class="inspector-summary"><span class="inspector-status-label">${escapeHtml(health.label)}</span>${inspectorTaskMarkup}</div><section class="inspector-responsibility"><h4>Accepted responsibility</h4><p>${escapeHtml(c.responsibility)}</p></section><dl class="inspector-facts inspector-map-facts"><div><dt>Role</dt><dd>${escapeHtml(c.projectionRole)}</dd></div><div><dt>Children</dt><dd>${c.childCount}</dd></div><div><dt>Architecture</dt><dd>v${diagram.architectureVersion}</dd></div></dl><div class="inspector-read"><dl class="inspector-facts"><div><dt>Canonical status</dt><dd>${escapeHtml(c.status?.canonical_status || 'UNKNOWN')}</dd></div><div><dt>Current scope</dt><dd>${escapeHtml(diagram.scope?.label || 'Overview')}</dd></div></dl></div><div class="inspector-full"><div class="inspector-divider"></div><dl class="inspector-facts inspector-technical-facts"><div><dt>Stable Diagram ID</dt><dd><code>${escapeHtml(c.id)}</code></dd></div><div><dt>Component ID</dt><dd><code>${escapeHtml(c.component_id)}</code></dd></div></dl>${provenanceMarkup}</div>`;
-  $('selectedNode').querySelectorAll('[data-graph-focus]').forEach((button)=>button.addEventListener('click',()=>{ const mode=button.dataset.graphFocus; if(mode==='clear'){state.selectedComponentId=null;state.graphFocusMode='all';} else state.graphFocusMode=mode; renderGraph(); }));
+    : `<p class="inspector-status-detail">${escapeHtml(c.status?.canonical_status || 'No linked execution task.')}</p>`;
+  const dependencyContent=incoming.length||outgoing.length ? `<div class="component-connections"><ul>${incoming.map((edge)=>connectionLine(edge,'in')).join('')}${outgoing.map((edge)=>connectionLine(edge,'out')).join('')}</ul></div>` : '<p class="muted">No direct canonical dependencies are attached to this component.</p>';
+  const tasksContent=linkedTasks.length ? `<div class="inspector-task-list">${[...linkedTasks].sort((a,b)=>({BLOCKED:0,IN_PROGRESS:1,TODO:2,DONE:3}[a.status]??4)-({BLOCKED:0,IN_PROGRESS:1,TODO:2,DONE:3}[b.status]??4)).map((task)=>`<div class="inspector-task-row"><i class="status-dot ${statusClass(task.status)}" aria-hidden="true"></i><span>${escapeHtml(task.title)} · ${escapeHtml(task.status.replace('_',' '))}</span></div>`).join('')}</div>` : '<p class="muted">No execution task is linked to this component.</p>';
+  const evidenceContent=`${nodeEvidence.length ? `<div class="inspector-evidence-list">${nodeEvidence.map((text)=>`<p>${escapeHtml(text)}</p>`).join('')}</div>` : '<p class="muted">No node-linked observation or external evidence is present in this Diagram projection.</p>'}${provenanceMarkup}`;
+  const matchingCodeNodes=(state.codeDiagram?.nodes || []).filter((node)=>node.component_id===c.component_id);
+  const codeContent=!state.codeDiagram
+    ? '<p class="muted">No Code Truth snapshot yet.</p>'
+    : matchingCodeNodes.length
+      ? `<div class="inspector-code-links">${matchingCodeNodes.map((node)=>`<button type="button" data-open-code-node="${escapeHtml(node.id)}"><strong>${escapeHtml(node.label)}</strong><span>${escapeHtml(state.codeDiagram.repository.slug)}@${escapeHtml(state.codeDiagram.repository.revision.slice(0,12))} · ${node.sources?.length || 0} pinned source${node.sources?.length===1?'':'s'}</span></button>`).join('')}</div>`
+      : `<p class="muted">The current revision-pinned Code Truth snapshot has no implementation component linked to <strong>${escapeHtml(c.label)}</strong>.</p>`;
+  const projectDecisionItems=[...(state.architecture?.decisions || []).map((item)=>`Decision: ${item}`),...(state.architecture?.risks || []).map((item)=>`Risk: ${item}`),...(state.architecture?.assumptions || []).map((item)=>`Assumption: ${item}`)];
+  const pendingDecisionContent=pendingChanges.length ? `<section class="inspector-responsibility"><h4>Pending proposals affecting this component</h4><div class="bullet-list"><ul>${pendingChanges.map((item)=>`<li>${escapeHtml(item.replace(/^Pending change:\s*/i,''))}</li>`).join('')}</ul></div></section>` : '';
+  const projectDecisionContent=projectDecisionItems.length ? `<section class="inspector-responsibility"><h4>Project-level context</h4><p>These accepted items are not component-linked by the current Architecture contract.</p></section><div class="bullet-list"><ul>${projectDecisionItems.map((item)=>`<li>${escapeHtml(item)}</li>`).join('')}</ul></div>` : '';
+  const decisionsContent=pendingDecisionContent || projectDecisionContent ? `${pendingDecisionContent}${projectDecisionContent}` : '<p class="muted">No component-affecting proposal or project-level accepted decision, risk, or assumption is recorded.</p>';
+  const hierarchyLabels=(c.hierarchyPath?.length ? c.hierarchyPath : [c.id]).map((nodeId)=>diagramNodeById(nodeId)?.label || String(nodeId).replace(/^node:/,''));
+  const parentNode=c.parent_id ? diagramNodeById(c.parent_id) : null;
+  const childNodes=diagram.nodes.filter((node)=>node.parent_id===c.id).sort((a,b)=>a.order-b.order || a.id.localeCompare(b.id));
+  const overviewContent=`<div class="inspector-summary"><span class="inspector-status-label">${escapeHtml(health.label)}</span>${inspectorTaskMarkup}</div><section class="inspector-responsibility"><h4>Accepted responsibility</h4><p>${escapeHtml(c.responsibility)}</p></section><dl class="inspector-facts inspector-map-facts"><div><dt>Role</dt><dd>${escapeHtml(c.projectionRole)}</dd></div><div><dt>Children</dt><dd>${c.childCount}</dd></div><div><dt>Architecture</dt><dd>v${diagram.architectureVersion}</dd></div></dl><div class="inspector-read"><dl class="inspector-facts"><div><dt>Canonical status</dt><dd>${escapeHtml(c.status?.canonical_status || 'UNKNOWN')}</dd></div><div><dt>Hierarchy path</dt><dd>${escapeHtml(hierarchyLabels.join(' / '))}</dd></div><div><dt>Parent</dt><dd>${escapeHtml(parentNode?.label || 'Top level')}</dd></div><div><dt>Direct children</dt><dd>${escapeHtml(childNodes.map((node)=>node.label).join(', ') || 'None')}</dd></div><div><dt>Current scope</dt><dd>${escapeHtml(currentScopeLabel)}</dd></div></dl></div><div class="inspector-full"><div class="inspector-divider"></div><dl class="inspector-facts inspector-technical-facts"><div><dt>Stable Diagram ID</dt><dd><code>${escapeHtml(c.id)}</code></dd></div><div><dt>Component ID</dt><dd><code>${escapeHtml(c.component_id)}</code></dd></div></dl></div>`;
+  const tabContent={overview:overviewContent,dependencies:dependencyContent,tasks:tasksContent,evidence:evidenceContent,code:codeContent,decisions:decisionsContent}[state.inspectorTab] || overviewContent;
+  $('nodeEvidence').innerHTML=`${architectureInspectorTabsMarkup()}<div class="architecture-inspector-content">${tabContent}</div>`;
+  wireArchitectureInspectorTabs();
+  $('nodeEvidence').querySelectorAll('[data-open-code-node]').forEach((button)=>button.addEventListener('click',()=>{state.architectureGraphKind='code';state.selectedCodeNodeId=button.dataset.openCodeNode;render();}));
+  $('selectedNode').querySelectorAll('[data-graph-focus]').forEach((button)=>button.addEventListener('click',()=>{ const mode=button.dataset.graphFocus; if(mode==='clear'){clearArchitectureTracePath({render:false});state.selectedComponentId=null;state.selectedEdgeId=null;state.graphFocusMode='all';state.inspectorTab='overview';syncArchitectureCanvasSelectionUrl();} else {clearArchitectureTracePath({render:false});state.graphFocusMode=mode;} renderGraph(); }));
+  $('selectedNode').querySelector('[data-toggle-collapse]')?.addEventListener('click',()=>toggleGraphNodeCollapse(c.id));
+  $('selectedNode').querySelector('[data-open-selected-scope]')?.addEventListener('click',()=>drillGraphNode(c));
+  $('selectedNode').querySelector('[data-trace-path]')?.addEventListener('click',()=>{
+    const target=$('selectedNode').querySelector('[data-trace-target]')?.value;
+    if(target) requestArchitectureTracePath(c.id,target);
+  });
+  $('selectedNode').querySelector('[data-clear-trace]')?.addEventListener('click',()=>clearArchitectureTracePath());
+  $('selectedNode').querySelector('[data-agent-explore]')?.addEventListener('click',()=>exploreSelectedAgentContext());
 }
 
 function renderLists() {
@@ -2580,6 +4281,223 @@ function renderGlobalAgentReply() {
   reply.classList.remove('hidden');
   reply.classList.toggle('error', !ok);
   reply.innerHTML = `<div class="global-agent-reply-head"><span>${ok ? 'AGENT RESPONSE' : 'AGENT ERROR'}</span><small>${escapeHtml(state.lastRun.provider)} · ${escapeHtml(state.lastRun.model)}</small></div><p>${escapeHtml(state.lastRun.summary || state.lastRun.error || 'No response summary.')}</p>`;
+}
+
+function selectedAgentContextNode() {
+  if (
+    state.currentView !== 'architecture'
+    || state.architectureGraphKind !== 'living'
+    || !state.selectedComponentId
+    || !state.projectId
+    || !state.architecture?.version
+  ) return null;
+  return findArchitectureNode(state.selectedComponentId);
+}
+
+function agentContextRequestForNode(node) {
+  return {
+    node_id: `node:${node.id}`,
+    direction: 'both',
+    expansion_policy: state.agentContextPolicy,
+    expected_architecture_version: state.architecture.version,
+  };
+}
+
+function agentContextExecutionRequest(manifest) {
+  return {
+    node_id: manifest.selection.node_id,
+    direction: manifest.selection.direction,
+    expansion_policy: manifest.selection.expansion_policy,
+    expected_architecture_version: manifest.architecture_version,
+    preview_manifest_hash: manifest.manifest_hash,
+  };
+}
+
+async function exploreSelectedAgentContext() {
+  const node = selectedAgentContextNode();
+  if (!node) return false;
+  const manifest = await ensureAgentContextManifest();
+  if (!manifest) {
+    toast('Explore from here needs the exact bounded context preview. Retry the Context Tray.', true);
+    return false;
+  }
+  const context = currentInstructionContext();
+  const result = await sendEvent('USER_MESSAGE', {
+    message: `Explore from here: ${node.name}`,
+    ui_context: context.payload,
+    agent_context_request: agentContextExecutionRequest(manifest),
+  });
+  return result?.result === 'SUCCESS';
+}
+
+function agentContextPreviewKey(request) {
+  return [
+    state.projectId,
+    request.expected_architecture_version,
+    request.node_id,
+    request.direction,
+    request.expansion_policy,
+  ].join('\u001f');
+}
+
+function clearAgentContextPreview({preservePolicy = true} = {}) {
+  state.agentContextRequestSerial += 1;
+  state.agentContextManifest = null;
+  state.agentContextKey = null;
+  state.agentContextLoading = false;
+  state.agentContextError = null;
+  state.agentContextPromise = null;
+  if (!preservePolicy) state.agentContextPolicy = 'ASK_ALL';
+  renderAgentContextTray();
+}
+
+function agentContextNames(items, limit = 6) {
+  const values = (items || []).slice(0, limit).map((item) => (
+    item?.name
+    || item?.title
+    || item?.summary
+    || item?.symbol?.qualified_name
+    || item?.component_id
+    || item?.id
+  )).filter(Boolean);
+  const hidden = Math.max(0, (items || []).length - values.length);
+  return `${values.join(', ') || 'None'}${hidden ? ` +${hidden} more` : ''}`;
+}
+
+function renderAgentContextTray() {
+  const tray = $('agentContextTray');
+  const body = $('agentContextTrayBody');
+  const title = $('agentContextTrayTitle');
+  const policy = $('agentContextPolicy');
+  const telemetryToggle = $('agentContextTelemetryToggle');
+  if (!tray || !body || !title || !policy || !telemetryToggle) return;
+
+  const node = selectedAgentContextNode();
+  tray.classList.toggle('hidden', !node);
+  if (!node) {
+    title.textContent = 'No architecture component selected';
+    body.innerHTML = '';
+    return;
+  }
+
+  title.textContent = node.name;
+  policy.value = state.agentContextPolicy;
+  telemetryToggle.setAttribute('aria-pressed', String(state.agentContextTelemetryVisible));
+  telemetryToggle.textContent = state.agentContextTelemetryVisible ? 'Hide telemetry' : 'Show telemetry';
+
+  if (state.agentContextLoading) {
+    body.innerHTML = '<p class="agent-context-status">Building the exact server-owned preview…</p>';
+    return;
+  }
+  if (state.agentContextError) {
+    body.innerHTML = `<p class="agent-context-status error">${escapeHtml(state.agentContextError)}</p><button type="button" data-agent-context-retry>Retry preview</button>`;
+    body.querySelector('[data-agent-context-retry]')?.addEventListener('click', () => ensureAgentContextManifest({force:true}));
+    return;
+  }
+
+  const manifest = state.agentContextManifest;
+  if (!manifest) {
+    body.innerHTML = '<p class="agent-context-status">Preparing bounded context…</p>';
+    return;
+  }
+  const sections = manifest.sections || {};
+  const architecture = sections.architecture || {};
+  const lineage = architecture.lineage || [];
+  const children = architecture.children || [];
+  const dependencies = architecture.dependency_context || {nodes:[], relationships:[], counts:{}};
+  const tasks = sections.tasks || [];
+  const evidence = sections.evidence || [];
+  const codeTruth = sections.code_truth || {status:'NO_SNAPSHOT', chunks:[]};
+  const mcpRefs = sections.mcp_refs || [];
+  const usage = manifest.usage || {};
+  const limitReasons = usage.limit_reasons || [];
+  const latestContextTelemetry = state.lastRun?.context_telemetry || null;
+  const providerUsage = state.lastRun?.provider_usage || null;
+  const actualInputTokens = providerUsage?.input_tokens ?? providerUsage?.inputTokens;
+  const providerActualInput = actualInputTokens == null
+    ? (state.lastRun ? 'Unavailable' : 'Not run yet')
+    : `${Number(actualInputTokens).toLocaleString()} tokens`;
+  const parent = lineage.length > 1 ? lineage[lineage.length - 2]?.name : 'Top level';
+  const telemetry = state.agentContextTelemetryVisible
+    ? `<dl class="agent-context-telemetry"><div><dt>Preview size</dt><dd>${Number(usage.context_chars || 0).toLocaleString()} chars</dd></div><div><dt>Estimated input</dt><dd>${Number(usage.estimated_input_tokens || 0).toLocaleString()} tokens</dd></div><div><dt>Last provider actual</dt><dd>${providerActualInput}</dd></div><div><dt>Preview hash</dt><dd><code>${escapeHtml(String(manifest.manifest_hash || '').slice(0, 12))}</code></dd></div>${latestContextTelemetry ? `<div><dt>Last run hash</dt><dd><code>${escapeHtml(String(latestContextTelemetry.manifest_hash || '').slice(0, 12))}</code></dd></div>` : ''}</dl>`
+    : '';
+  body.innerHTML = `
+    <div class="agent-context-boundary${usage.truncated ? ' bounded-warning' : ''}">
+      <div><span>Selection</span><strong>${escapeHtml(architecture.origin?.name || node.name)}</strong></div>
+      <div><span>Parent</span><strong>${escapeHtml(parent || 'Top level')}</strong></div>
+      <div><span>Children</span><strong>${children.length}</strong><small>${escapeHtml(agentContextNames(children))}</small></div>
+      <div><span>Dependency neighborhood</span><strong>${dependencies.counts?.nodes || 0} nodes · ${dependencies.counts?.relationships || 0} links</strong><small>${escapeHtml(agentContextNames(dependencies.nodes || []))}</small></div>
+      <div><span>Linked tasks</span><strong>${tasks.length}</strong><small>${escapeHtml(agentContextNames(tasks))}</small></div>
+      <div><span>Evidence</span><strong>${evidence.length}</strong><small>${escapeHtml(agentContextNames(evidence))}</small></div>
+      <div><span>Code Truth</span><strong>${escapeHtml(codeTruth.status || 'NO_SNAPSHOT')}</strong><small>${escapeHtml(agentContextNames(codeTruth.chunks || []))}</small></div>
+      <div><span>Connected MCP evidence</span><strong>${mcpRefs.length}</strong><small>${mcpRefs.length ? escapeHtml(agentContextNames(mcpRefs)) : 'Not included until explicitly gathered'}</small></div>
+    </div>
+    <div class="agent-context-policy-summary"><span>${escapeHtml(manifest.selection?.expansion_policy || state.agentContextPolicy)}</span><span>≤ ${manifest.selection?.effective_max_hops ?? 0} hops</span><span>Architecture v${manifest.architecture_version}</span>${usage.truncated ? `<span class="agent-context-limit">Limited · ${escapeHtml(limitReasons.join(', ') || 'budget')}</span>` : '<span>Within budget</span>'}</div>
+    ${telemetry}`;
+}
+
+async function ensureAgentContextManifest({force = false} = {}) {
+  const node = selectedAgentContextNode();
+  if (!node) {
+    clearAgentContextPreview();
+    return null;
+  }
+  const request = agentContextRequestForNode(node);
+  const key = agentContextPreviewKey(request);
+  if (!force && state.agentContextKey === key && state.agentContextManifest) return state.agentContextManifest;
+  if (!force && state.agentContextKey === key && state.agentContextPromise) return state.agentContextPromise;
+
+  const serial = ++state.agentContextRequestSerial;
+  state.agentContextKey = key;
+  state.agentContextManifest = null;
+  state.agentContextLoading = true;
+  state.agentContextError = null;
+  renderAgentContextTray();
+  const pending = api(`/projects/${encodeURIComponent(state.projectId)}/agent-context/manifest`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+  state.agentContextPromise = pending;
+  try {
+    const manifest = await pending;
+    if (serial !== state.agentContextRequestSerial || key !== state.agentContextKey) return null;
+    state.agentContextManifest = manifest;
+    return manifest;
+  } catch (err) {
+    if (serial === state.agentContextRequestSerial && key === state.agentContextKey) {
+      state.agentContextError = err?.message || String(err);
+    }
+    return null;
+  } finally {
+    if (serial === state.agentContextRequestSerial && key === state.agentContextKey) {
+      state.agentContextLoading = false;
+      state.agentContextPromise = null;
+      renderAgentContextTray();
+    }
+  }
+}
+
+function syncAgentContextPreview() {
+  const node = selectedAgentContextNode();
+  if (!node) {
+    if (state.agentContextKey || state.agentContextManifest || state.agentContextLoading || state.agentContextError) clearAgentContextPreview();
+    else renderAgentContextTray();
+    return;
+  }
+  const request = agentContextRequestForNode(node);
+  const key = agentContextPreviewKey(request);
+  if (state.agentContextKey !== key) {
+    state.agentContextRequestSerial += 1;
+    state.agentContextKey = key;
+    state.agentContextManifest = null;
+    state.agentContextLoading = false;
+    state.agentContextError = null;
+    state.agentContextPromise = null;
+  }
+  renderAgentContextTray();
+  if (!state.agentContextManifest && !state.agentContextLoading && !state.agentContextError) {
+    queueMicrotask(() => ensureAgentContextManifest());
+  }
 }
 
 function currentInstructionContext() {
@@ -2651,19 +4569,26 @@ function updateInstructionContext() {
   chip.textContent = context.label;
   label.textContent = context.instruction;
   input.placeholder = context.placeholder;
+  syncAgentContextPreview();
 }
 
 async function sendEvent(type, payload, workingDetail = '') {
   if (!state.projectId) return null;
+  const boundedContextRequested = Boolean(payload?.agent_context_request);
   try {
     setWorking(true, workingDetail);
     const result = await api(`/projects/${state.projectId}/events`, {method: 'POST', body: JSON.stringify({type, source: 'FRONTEND', payload})});
     state.lastRun = result;
+    if (boundedContextRequested) clearAgentContextPreview();
     if (result.result === 'ERROR') toast(result.error || 'Agent run failed before state mutation.', true);
     else toast(result.architecture_review_required ? 'Agent created an architecture proposal for review.' : 'Project state updated.');
     await refresh();
     return result;
   } catch (err) {
+    if (boundedContextRequested && /agent_context_preview_stale|stale_architecture_version/.test(String(err?.message || err))) {
+      clearAgentContextPreview();
+      syncAgentContextPreview();
+    }
     toast(err.message, true);
     return null;
   } finally {
@@ -4027,7 +5952,18 @@ $('instructionForm').addEventListener('submit', async (e) => {
   input.removeAttribute('aria-invalid');
   $('instructionError').textContent = '';
   const context = currentInstructionContext();
-  const result = await sendEvent('USER_MESSAGE', {message, ui_context: context.payload});
+  const payload = {message, ui_context: context.payload};
+  if (selectedAgentContextNode()) {
+    const manifest = await ensureAgentContextManifest();
+    if (!manifest) {
+      input.setAttribute('aria-invalid', 'true');
+      $('instructionError').textContent = 'Instruction not sent. The exact bounded context preview is unavailable; retry it in the Context Tray.';
+      input.focus();
+      return;
+    }
+    payload.agent_context_request = agentContextExecutionRequest(manifest);
+  }
+  const result = await sendEvent('USER_MESSAGE', payload);
   if (result?.result === 'SUCCESS') {
     if (input.value.trim() === message) {
       input.value = '';
@@ -4038,6 +5974,19 @@ $('instructionForm').addEventListener('submit', async (e) => {
     $('instructionError').textContent = 'Instruction not sent. Your text and context are still here—review and press Send to retry.';
     input.focus();
   }
+});
+
+$('agentContextPolicy')?.addEventListener('change', (event) => {
+  const policy = event.currentTarget.value;
+  if (!['ASK_ALL', 'ALLOW_NEIGHBORHOOD', 'AUTO_BOUNDED'].includes(policy)) return;
+  state.agentContextPolicy = policy;
+  clearAgentContextPreview();
+  syncAgentContextPreview();
+});
+
+$('agentContextTelemetryToggle')?.addEventListener('click', () => {
+  state.agentContextTelemetryVisible = !state.agentContextTelemetryVisible;
+  renderAgentContextTray();
 });
 
 $('onboardingForm').addEventListener('submit', async (e) => {
@@ -4246,9 +6195,16 @@ document.querySelectorAll('[data-auth-provider]').forEach((button) => button.add
 wireLensRadioGroup(document.querySelector('.preference-grid'), selectProjectLens);
 $('preferenceContinueBtn').addEventListener('click', completePreference);
 $('authBackBtn').addEventListener('click', () => closeAuthentication());
+$('bootstrapRetryBtn')?.addEventListener('click', retryWorkspaceRestore);
+$('bootstrapLogoutBtn')?.addEventListener('click', logout);
 
 wireGoButtons();
 document.querySelectorAll('[data-architecture-graph-kind]').forEach((button) => button.addEventListener('click', () => setArchitectureGraphKind(button.dataset.architectureGraphKind)));
+$('architectureCanvasBtn')?.addEventListener('click', toggleArchitectureCanvas);
+window.addEventListener('popstate', () => {
+  const enabled = new URLSearchParams(window.location.search).get('canvas') === 'architecture';
+  void setArchitectureCanvasMode(enabled, {pushHistory:false});
+});
 window.matchMedia('(max-width: 760px)').addEventListener('change', syncMobileSidebarLayers);
 async function initializeWorkspace() {
   try {
@@ -4273,7 +6229,12 @@ async function initializeWorkspace() {
     if (state.projectId) {
       persistActiveProjectSelection(state.projectId);
       state.onboarding.active = false;
-      return (await refresh()) !== false;
+      const ready = (await refresh()) !== false;
+      if (ready && ARCHITECTURE_CANVAS_MODE) {
+        state.currentView = 'architecture';
+        render();
+      }
+      return ready;
     }
     if (!state.projectId) {
       if (WEBMCP_AGENT_MODE) {
@@ -4287,6 +6248,8 @@ async function initializeWorkspace() {
       return true;
     }
   } catch (err) {
+    state.workspaceAsync.phase = 'failed';
+    state.workspaceAsync.error = err?.message || String(err);
     toast(err.message, true);
     return false;
   }
@@ -4294,14 +6257,17 @@ async function initializeWorkspace() {
 
 async function initializeApp() {
   if (WEBMCP_AGENT_MODE && !usesFirebaseAuthentication()) {
-    showExperience('workspace');
+    showExperience('restoring');
     state.experience.workspaceInitialized = await initializeWorkspace();
+    if (state.experience.workspaceInitialized) showExperience('workspace');
+    else showWorkspaceRecovery(new Error(state.workspaceAsync.error || 'Workspace could not be restored.'));
     syncMobileSidebarLayers();
     return state.experience.workspaceInitialized;
   }
   const hadStoredSession = localStorage.getItem(prototype.KEYS.session) !== null;
   localStorage.removeItem('archbro-pending-goal');
   if (usesFirebaseAuthentication()) {
+    showExperience('restoring');
     let identity = null;
     try {
       identity = await restoreFirebaseIdentity();
@@ -4340,6 +6306,7 @@ let appInitializationPromise = null;
 async function initialize() {
   document.body.dataset.webmcpAgentMode = WEBMCP_AGENT_MODE ? 'true' : 'false';
   document.body.classList.toggle('webmcp-agent-mode', WEBMCP_AGENT_MODE);
+  syncArchitectureCanvasDomMode();
   return initializeApp();
 }
 

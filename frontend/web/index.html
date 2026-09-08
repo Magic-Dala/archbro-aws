@@ -5,11 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Archbro</title>
   <link rel="icon" href="/static/archbro-logo.svg?v=20260829-3" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260902-solid-merged-connections-v3" />
+  <link rel="stylesheet" href="/static/styles.css?v=3181c61f94b95187" />
   <link rel="stylesheet" href="/static/progress.css?v=20260829-3" />
 </head>
 <body>
-  <section id="entryExperience" class="entry-experience">
+  <section id="bootstrapExperience" class="bootstrap-experience" aria-live="polite" aria-label="Restoring Archbro workspace">
+    <div class="bootstrap-experience-card">
+      <img src="/static/archbro-logo.svg?v=20260829-3" alt="" />
+      <div class="bootstrap-experience-copy">
+        <strong>Archbro</strong>
+        <span id="bootstrapExperienceMessage">Restoring your workspace…</span>
+        <div id="bootstrapRecoveryActions" class="bootstrap-recovery-actions hidden">
+          <button id="bootstrapRetryBtn" class="btn primary" type="button">Retry</button>
+          <button id="bootstrapLogoutBtn" class="btn secondary" type="button">Log out</button>
+        </div>
+      </div>
+    </div>
+  </section>
+  <section id="entryExperience" class="entry-experience hidden">
     <header class="entry-topbar">
       <a class="entry-brand" href="#" aria-label="Archbro home">
         <img src="/static/archbro-logo.svg?v=20260829-3" alt="" />
@@ -211,7 +224,7 @@
         </div>
 
         <div id="view-architecture" class="view">
-          <div class="section-intro"><div><h2 id="architectureViewTitle">Living Graph</h2><p id="architectureViewSubtitle">Start with the system health map. Healthy areas stay quiet; colored problem areas are the ones worth opening.</p></div><div class="architecture-view-tools"><div class="architecture-mode-switch" role="group" aria-label="Architecture graph source"><button type="button" data-architecture-graph-kind="living" class="active" aria-pressed="true">Living</button><button type="button" data-architecture-graph-kind="code" aria-pressed="false">Code</button></div><span id="graphVersion" class="version-pill">v0</span></div></div>
+          <div class="section-intro"><div><h2 id="architectureViewTitle">Living Graph</h2><p id="architectureViewSubtitle">Start with the system health map. Healthy areas stay quiet; colored problem areas are the ones worth opening.</p></div><div class="architecture-view-tools"><button id="architectureCanvasBtn" class="btn secondary architecture-canvas-button" type="button">Open Canvas ↗</button><div class="architecture-mode-switch" role="group" aria-label="Architecture graph source"><button type="button" data-architecture-graph-kind="living" class="active" aria-pressed="true">Living</button><button type="button" data-architecture-graph-kind="code" aria-pressed="false">Code</button></div><span id="graphVersion" class="version-pill">v0</span></div></div>
           <div class="graph-layout">
             <article class="panel graph-panel"><div class="panel-head"><div><h3 id="graphPanelTitle">System health map</h3><p id="graphPanelSubtitle">Red or amber areas need attention. Healthy areas require no inspection.</p></div><span id="graphReviewState" class="muted">Aligned</span></div><div id="graphHealthLegend" class="graph-health-legend"><span><i class="health-dot healthy"></i>Healthy</span><span><i class="health-dot active"></i>Active, no action needed</span><span><i class="health-dot review"></i>Needs review</span><span><i class="health-dot blocked"></i>Blocked</span></div><div id="graphCanvas" class="graph-canvas"></div></article>
             <aside class="graph-side"><article id="graphEvidencePanel" class="panel graph-side-panel graph-evidence-panel"><h3 id="graphEvidenceTitle">Why this status?</h3><div id="nodeEvidence"><p class="muted">Select a node to inspect the accepted architecture.</p></div></article><article id="selectedNode" class="panel graph-side-panel selected-node"><small>SYSTEM HEALTH</small><h3>No inspection selected</h3><p>Only open a colored problem area when you need to understand what changed or what is blocked.</p></article><article id="graphDecisionPanel" class="panel graph-side-panel graph-secondary-panel"><h3 id="graphDecisionTitle">Architecture decisions</h3><div id="decisionList" class="bullet-list"></div></article><article id="graphRiskPanel" class="panel graph-side-panel graph-secondary-panel"><h3 id="graphRiskTitle">Risks & assumptions</h3><div id="riskList" class="bullet-list"></div></article></aside>
@@ -219,6 +232,22 @@
         </div>
 
         <div id="globalAgentDock" class="global-agent-dock hidden">
+          <aside id="agentContextTray" class="agent-context-tray hidden" aria-live="polite">
+            <header class="agent-context-tray-head">
+              <div><small>BOUNDED AGENT CONTEXT</small><strong id="agentContextTrayTitle">No architecture component selected</strong></div>
+              <div class="agent-context-tray-controls">
+                <label for="agentContextPolicy">Expansion
+                  <select id="agentContextPolicy">
+                    <option value="ASK_ALL">Ask before expansion</option>
+                    <option value="ALLOW_NEIGHBORHOOD">Allow neighborhood</option>
+                    <option value="AUTO_BOUNDED">Auto within budget</option>
+                  </select>
+                </label>
+                <button id="agentContextTelemetryToggle" type="button" aria-pressed="true">Hide telemetry</button>
+              </div>
+            </header>
+            <div id="agentContextTrayBody" class="agent-context-tray-body"></div>
+          </aside>
           <div id="globalAgentReply" class="global-agent-reply hidden"></div>
           <form id="instructionForm" class="instruction-box global-agent-composer">
             <div class="instruction-icon">✦</div>
@@ -388,7 +417,7 @@
   <script src="/runtime-config.js"></script>
   <script src="/static/prototype.js?v=20260901-firebase-uid"></script>
   <script src="/static/firebase-auth-client.js?v=20260901-auth-providers"></script>
-  <script type="module" src="/static/app.js?v=f5f07e6176150aa7"></script>
+  <script type="module" src="/static/app.js?v=e3bdcd14b488a140"></script>
   <script type="module" src="/static/archbro-webmcp.js?v=f514bc1df72f867e"></script>
 </body>
 </html>

@@ -236,7 +236,7 @@ test('goal refinement ask composer exposes a reduced-motion-safe vibrant full-pe
   ]);
   assert.match(html, /id="onboardingAsk"/);
   assert.match(html, /app\.js\?v=[^\"']+/);
-  assert.match(html, /styles\.css\?v=20260831-living-code-architecture/);
+  assert.match(html, /styles\.css\?v=[0-9a-f]{16}/);
   assert.match(js, /onboardingAsk.*classList\.toggle\('rainbow-active'/s);
   assert.match(css, /\.onboarding-ask\.rainbow-active/);
   assert.match(css, /\.onboarding-ask::before[,{][^}]*-webkit-mask:conic-gradient/);
@@ -319,10 +319,11 @@ test('project view composer shares the typing-only rainbow edge state', async ()
   assert.match(css, /\.global-agent-composer\.rainbow-active::before/);
 });
 
-test('automatic project recovery expands the first project before selecting it', async () => {
+test('automatic project recovery expands the selected fallback before opening it', async () => {
   const js = await readFile(new URL('app.js', webRoot), 'utf8');
 
-  assert.match(js, /state\.expandedProjectIds\.add\(state\.projects\[0\]\.id\);\s*await selectProject\(state\.projects\[0\]\.id\);/);
+  assert.match(js, /const fallbackProjectId = \([\s\S]*?\) \? persistedProjectId : state\.projects\[0\]\?\.id;/);
+  assert.match(js, /state\.expandedProjectIds\.add\(fallbackProjectId\);\s*await selectProject\(fallbackProjectId\);/);
 });
 
 test('zero-project workspace stays browsable instead of forcing onboarding', async () => {

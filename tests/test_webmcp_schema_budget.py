@@ -321,8 +321,9 @@ process.stdout.write(globalThis.__activeProjectId());
 def test_app_has_one_active_project_persistence_boundary_for_url_and_storage():
     source = APP_MODULE.read_text(encoding="utf-8")
 
-    assert "const requestedProjectId = initialUrlParams.get('project')?.trim() || null;" in source
-    assert "const initialProjectId = requestedProjectId || persistedProjectId;" in source
+    assert "const REQUESTED_PROJECT_ID = String(URL_PARAMS.get('project') || '').trim() || null;" in source
+    assert "const persistedProjectId = localStorage.getItem('archbro-project-id');" in source
+    assert "const initialProjectId = REQUESTED_PROJECT_ID || persistedProjectId;" in source
     assert source.count("localStorage.setItem('archbro-project-id'") == 1
     assert source.count("localStorage.removeItem('archbro-project-id'") == 1
     assert source.count("persistActiveProjectSelection(") >= 7
@@ -403,6 +404,8 @@ def test_workspace_exit_supersedes_pending_context_commit():
     if node is None:
         pytest.skip("Node.js is required for the workspace-exit generation check")
     source = APP_MODULE.read_text(encoding="utf-8")
+    async_helper_start = source.index("// WORKSPACE_ASYNC_STATE_START")
+    async_helper_end = source.index("// WORKSPACE_ASYNC_STATE_END") + len("// WORKSPACE_ASYNC_STATE_END")
     helper_start = source.index("let workspaceContextGeneration = 0;")
     helper_end = source.index("if (initialProjectId) state.expandedProjectIds.add(initialProjectId);")
     function_start = source.index("async function openPersonalWorkspace()")
@@ -412,7 +415,8 @@ const state = {
   projectId:'project-a', project:{id:'project-a'}, tasks:[], architecture:{version:1}, diagram:{}, diagramError:null,
   codeArchitecture:null, codeDiagram:null, architectureGraphKind:'living', selectedCodeNodeId:null, graphFocusMode:'all',
   proposals:[], lastRun:null, selectedComponentId:null, scopeComponentId:null, readingMode:'MAP', selectedTaskId:null,
-  selectedProposalId:null, currentView:'overview', openProjectMenuId:null, renamingProjectId:null,
+  selectedProposalId:null, currentView:'overview', openProjectMenuId:null, renamingProjectId:null, selectedEdgeId:null,
+  inspectorTab:'overview', canvasDeepLinkApplied:false, canvasDeepLinkFocusPending:false, collapsedNodeIds:new Set(),
 };
 const localStorage = {removeItem(){}, setItem(){}, getItem(){return null;}};
 const window = {location:{href:'http://test/?project=project-a'}, history:{state:null,replaceState(){}}};
@@ -420,8 +424,11 @@ const loadProjectSnapshots = async () => {};
 const renderWorkspaceHome = () => {};
 const closeMobileSidebar = () => {};
 const clearActiveProjectSelection = () => {};
+const clearAgentContextPreview = () => {};
 eval(process.argv[1]);
+state.workspaceAsync = makeWorkspaceAsyncState('project-a');
 eval(process.argv[2]);
+eval(process.argv[3]);
 const pending = beginWorkspaceContextRequest('project-a');
 (async () => {
   await openPersonalWorkspace();
@@ -430,7 +437,14 @@ const pending = beginWorkspaceContextRequest('project-a');
 })().catch((error) => { console.error(error); process.exit(1); });
 """
     completed = subprocess.run(
-        [node, "-e", script, source[helper_start:helper_end], source[function_start:function_end]],
+        [
+            node,
+            "-e",
+            script,
+            source[async_helper_start:async_helper_end],
+            source[helper_start:helper_end],
+            source[function_start:function_end],
+        ],
         cwd=ROOT,
         check=True,
         capture_output=True,
