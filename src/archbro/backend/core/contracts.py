@@ -357,6 +357,7 @@ class AgentRunResult(BaseModel):
     model: str
     result: Literal["SUCCESS", "ERROR"]
     error: str | None = None
+    provider_usage: dict[str, Any] | None = None
     started_at: datetime = Field(default_factory=utcnow)
     completed_at: datetime = Field(default_factory=utcnow)
     replayed: bool = False

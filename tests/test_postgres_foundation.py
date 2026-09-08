@@ -84,7 +84,11 @@ def test_postgres_repository_implements_the_full_project_repository_port(repo):
     }
     missing = sorted(name for name in required if not callable(getattr(repo, name, None)))
     assert missing == []
-    assert len(required) == 27
+    assert {
+        "get_planner_checkpoint",
+        "put_planner_checkpoint",
+        "claim_planner_checkpoint",
+    } <= required
 
 
 def test_postgres_repository_implements_archbro_project_state_contract(repo):
@@ -889,6 +893,169 @@ def test_postgres_concurrent_claims_of_one_observation_elect_a_single_runner(rep
     claimed = next(o for o in outcomes if o.state == ObservationClaimState.CLAIMED)
     in_progress = next(o for o in outcomes if o.state == ObservationClaimState.IN_PROGRESS)
     assert in_progress.run_id == claimed.run_id
+
+
+def test_postgres_concurrent_planner_phase_claims_elect_one_provider_owner(repo):
+    project = Project(name="Planner Claim", goal="Elect one planner", architecture_version=0)
+    repo.save_project(project)
+    started = {
+        "schema": "archbro.initial_planner_phase.v1",
+        "plan_id": "plan-race",
+        "project_id": project.id,
+        "phase_key": "SYSTEM_MAP",
+        "status": "STARTED",
+    }
+
+    outcomes = _run_concurrently(
+        lambda: repo.claim_planner_checkpoint(
+            project_id=project.id,
+            plan_id="plan-race",
+            phase_key="SYSTEM_MAP",
+            data=started,
+        ),
+        lambda: repo.claim_planner_checkpoint(
+            project_id=project.id,
+            plan_id="plan-race",
+            phase_key="SYSTEM_MAP",
+            data=started,
+        ),
+    )
+    for outcome in outcomes:
+        assert not isinstance(outcome, Exception), outcome
+    assert sorted(claimed for claimed, _checkpoint in outcomes) == [False, True]
+    assert all(checkpoint["status"] == "STARTED" for _claimed, checkpoint in outcomes)
+
+
+def test_postgres_retryable_planner_claim_requires_exact_input_identity(repo):
+    project = Project(name="Planner Retry Identity", goal="Preserve retry identity", architecture_version=0)
+    repo.save_project(project)
+    retryable = {
+        "schema": "archbro.initial_planner_phase.v1",
+        "plan_id": "plan-retry-identity",
+        "project_id": project.id,
+        "phase_key": "SYSTEM_MAP",
+        "input_sha256": "a" * 64,
+        "status": "RETRYABLE",
+    }
+    persisted = repo.put_planner_checkpoint(
+        project_id=project.id,
+        plan_id="plan-retry-identity",
+        phase_key="SYSTEM_MAP",
+        data=retryable,
+    )
+    replacement = {
+        **retryable,
+        "input_sha256": "b" * 64,
+        "status": "STARTED",
+    }
+
+    claimed, observed = repo.claim_planner_checkpoint(
+        project_id=project.id,
+        plan_id="plan-retry-identity",
+        phase_key="SYSTEM_MAP",
+        data=replacement,
+        retry_statuses=("RETRYABLE",),
+    )
+
+    assert claimed is False
+    assert observed == persisted
+    assert observed["input_sha256"] == retryable["input_sha256"]
+    assert observed["status"] == "RETRYABLE"
+    assert repo.get_planner_checkpoint("plan-retry-identity", "SYSTEM_MAP") == persisted
+
+
+def test_postgres_planner_recovery_fences_old_owner_and_replays_idempotently(repo):
+    project = Project(name="Planner Recovery", goal="Fence stale planner owners", architecture_version=0)
+    repo.save_project(project)
+    claimed, owner = repo.claim_planner_checkpoint(
+        project_id=project.id,
+        plan_id="plan-recovery",
+        phase_key="SYSTEM_MAP",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-recovery",
+            "project_id": project.id,
+            "phase_key": "SYSTEM_MAP",
+            "input_sha256": "a" * 64,
+            "attempt_id": "attempt-owner",
+            "delivery_stage": "PREPARED",
+            "status": "STARTED",
+        },
+    )
+    assert claimed is True
+    recovered = repo.recover_planner_checkpoint(
+        project_id=project.id,
+        plan_id="plan-recovery",
+        phase_key="SYSTEM_MAP",
+        expected_attempt_id="attempt-owner",
+        expected_revision=owner["revision"],
+        action="RECLAIM_PREPARED",
+        request_id="recovery-idempotent",
+    )
+    replay = repo.recover_planner_checkpoint(
+        project_id=project.id,
+        plan_id="plan-recovery",
+        phase_key="SYSTEM_MAP",
+        expected_attempt_id="attempt-owner",
+        expected_revision=owner["revision"],
+        action="RECLAIM_PREPARED",
+        request_id="recovery-idempotent",
+    )
+    assert replay == recovered
+    assert recovered["status"] == "RETRYABLE"
+    assert recovered["owner_generation"] > owner["owner_generation"]
+
+    with pytest.raises(RuntimeError, match="revision changed|owner generation changed"):
+        repo.put_planner_checkpoint(
+            project_id=project.id,
+            plan_id="plan-recovery",
+            phase_key="SYSTEM_MAP",
+            data={**owner, "status": "COMPLETED"},
+            expected_revision=owner["revision"],
+            expected_owner_generation=owner["owner_generation"],
+        )
+    assert repo.get_planner_checkpoint("plan-recovery", "SYSTEM_MAP") == recovered
+
+
+def test_postgres_in_flight_planner_requires_explicit_attempt_authorization(repo):
+    project = Project(name="Planner Unknown", goal="Protect ambiguous dispatch", architecture_version=0)
+    repo.save_project(project)
+    claimed, owner = repo.claim_planner_checkpoint(
+        project_id=project.id,
+        plan_id="plan-unknown",
+        phase_key="SYSTEM_MAP",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-unknown",
+            "project_id": project.id,
+            "phase_key": "SYSTEM_MAP",
+            "input_sha256": "b" * 64,
+            "attempt_id": "attempt-unknown",
+            "delivery_stage": "IN_FLIGHT",
+            "status": "UNKNOWN",
+        },
+    )
+    assert claimed is True
+    with pytest.raises(ValueError, match="forbidden after provider dispatch"):
+        repo.recover_planner_checkpoint(
+            project_id=project.id,
+            plan_id="plan-unknown",
+            phase_key="SYSTEM_MAP",
+            expected_attempt_id="attempt-unknown",
+            expected_revision=owner["revision"],
+            action="RECLAIM_PREPARED",
+            request_id="unsafe-reclaim",
+        )
+    recovered = repo.recover_planner_checkpoint(
+        project_id=project.id,
+        plan_id="plan-unknown",
+        phase_key="SYSTEM_MAP",
+        expected_attempt_id="attempt-unknown",
+        expected_revision=owner["revision"],
+        action="AUTHORIZE_NEW_ATTEMPT",
+        request_id="explicit-new-attempt",
+    )
+    assert recovered["status"] == "RETRYABLE"
 
 
 def test_postgres_expired_claim_can_be_taken_over_by_another_run(repo, dsn):

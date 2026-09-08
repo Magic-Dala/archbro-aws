@@ -58,7 +58,7 @@ def create_project_with_architecture(client: TestClient) -> str:
                         "children": [{"id": "fastapi-service", "name": "FastAPI Service", "type": "service", "responsibility": "Serve product requests"}],
                     },
                 ],
-                "relationships": [],
+                "relationships": [{"source": "react-workspace", "target": "fastapi-service", "relationship_type": "HTTPS"}],
                 "decisions": [],
                 "assumptions": [],
                 "risks": [],

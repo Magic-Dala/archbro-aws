@@ -156,6 +156,58 @@ def test_project_delete_removes_project_owned_state(dsn):
         repo.get_project(project_id)
 
 
+def test_planner_recovery_api_requires_exact_attempt_revision_and_explicit_action(dsn):
+    repo, client = make_client(dsn)
+    project = client.post(
+        "/projects",
+        json={"name": "Planner Recovery API", "goal": "Recover a staged planner safely."},
+    ).json()
+    checkpoint = repo.put_planner_checkpoint(
+        project_id=project["id"],
+        plan_id="plan-api-recovery",
+        phase_key="SYSTEM_MAP",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-api-recovery",
+            "project_id": project["id"],
+            "phase_key": "SYSTEM_MAP",
+            "attempt_id": "attempt-api",
+            "delivery_stage": "PREPARED",
+            "status": "STARTED",
+        },
+    )
+
+    inspected = client.get(
+        f"/projects/{project['id']}/planner/checkpoints/plan-api-recovery/SYSTEM_MAP"
+    )
+    assert inspected.status_code == 200
+    assert inspected.json()["attempt_id"] == "attempt-api"
+
+    recovered = client.post(
+        f"/projects/{project['id']}/planner/checkpoints/plan-api-recovery/SYSTEM_MAP/recover",
+        json={
+            "expected_attempt_id": "attempt-api",
+            "expected_revision": checkpoint["revision"],
+            "action": "RECLAIM_PREPARED",
+            "request_id": "request-api-recovery",
+        },
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "RETRYABLE"
+
+    stale = client.post(
+        f"/projects/{project['id']}/planner/checkpoints/plan-api-recovery/SYSTEM_MAP/recover",
+        json={
+            "expected_attempt_id": "attempt-api",
+            "expected_revision": checkpoint["revision"],
+            "action": "RECLAIM_PREPARED",
+            "request_id": "different-request",
+        },
+    )
+    assert stale.status_code == 409
+    assert "revision changed" in stale.json()["detail"]
+
+
 def test_ask_merges_with_current_goal_instead_of_replacing_it(dsn):
     _, client = make_client(dsn)
     current_goal = (

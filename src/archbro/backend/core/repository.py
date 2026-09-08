@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from archbro.backend.core.contracts import (
     AgentRunResult,
@@ -102,6 +102,58 @@ class ProjectRepositoryPort(Protocol):
         event_type: ProjectEventType,
     ) -> ProjectEvent | None: ...
     def list_agent_runs(self, project_id: str, limit: int = 100) -> list[AgentRunResult]: ...
+
+    def get_planner_checkpoint(self, plan_id: str, phase_key: str) -> dict[str, Any] | None:
+        """Return one durable initial-architecture planner phase checkpoint."""
+        ...
+
+    def put_planner_checkpoint(
+        self,
+        *,
+        project_id: str,
+        plan_id: str,
+        phase_key: str,
+        data: dict[str, Any],
+        expected_revision: int | None = None,
+        expected_owner_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """CAS-persist one durable planner phase checkpoint.
+
+        ``expected_revision`` plus ``expected_owner_generation`` fence late
+        workers from overwriting a newer attempt/recovery decision.
+        """
+        ...
+
+    def claim_planner_checkpoint(
+        self,
+        *,
+        project_id: str,
+        plan_id: str,
+        phase_key: str,
+        data: dict[str, Any],
+        retry_statuses: tuple[str, ...] = (),
+    ) -> tuple[bool, dict[str, Any]]:
+        """Atomically claim one planner phase or return its durable competing state.
+
+        A retryable checkpoint may only be reclaimed for the exact same
+        ``input_sha256`` identity.  Identity drift must remain observable to
+        the planner instead of being overwritten by a retry attempt.
+        """
+        ...
+
+    def recover_planner_checkpoint(
+        self,
+        *,
+        project_id: str,
+        plan_id: str,
+        phase_key: str,
+        expected_attempt_id: str,
+        expected_revision: int,
+        action: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Apply one explicit idempotent planner recovery decision."""
+        ...
 
     def claim_observation(self, event: ProjectEvent, *, run_id: str) -> ObservationClaim:
         """Atomically register/dedupe an observation and claim it for evaluation."""

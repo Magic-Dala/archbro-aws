@@ -147,7 +147,10 @@ def create_app(
         selected_provider = (
             FakeModelProvider()
             if provider_name == "fake"
-            else GeminiProvider(model_id=os.getenv("GEMINI_MODEL", "gemini-3.7-flash"))
+            else GeminiProvider(
+                model_id=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+                checkpoint_repository=selected_repository,
+            )
         )
 
     goal_timeout = float(

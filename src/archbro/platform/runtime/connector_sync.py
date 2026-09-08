@@ -144,7 +144,10 @@ def build_github_sync(settings: GitHubConnectorSettings, *, dsn: str) -> Syncabl
     provider = (
         FakeModelProvider()
         if provider_name == "fake"
-        else GeminiProvider(model_id=os.getenv("GEMINI_MODEL", "gemini-3.7-flash"))
+        else GeminiProvider(
+            model_id=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            checkpoint_repository=repository,
+        )
     )
 
     return ConnectorSync(

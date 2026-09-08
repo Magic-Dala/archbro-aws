@@ -509,7 +509,7 @@ def test_external_initial_planning_trace_requires_recursive_scope_evaluation(dsn
                 },
                 {"id": "backend", "name": "Backend", "type": "system", "responsibility": "Own request processing.", "children": [{"id": "request-handler", "name": "Request Handler", "type": "service", "responsibility": "Handle one request-processing boundary."}]},
             ],
-            "relationships": [], "decisions": [], "assumptions": [], "risks": [],
+            "relationships": [{"source": "workspace", "target": "request-handler", "relationship_type": "HTTPS"}], "decisions": [], "assumptions": [], "risks": [],
         },
         "tasks": [{"title": "Build workspace", "related_component": "workspace"}],
         "reasoning": "SYSTEM_MAP, recursive scope evaluation, then reconciliation.",
@@ -563,6 +563,41 @@ def test_external_initial_planning_trace_requires_recursive_scope_evaluation(dsn
     }
     rejected = client.post(f"/projects/{project_id}/interactive-initial-architecture", json=flat_root)
     assert rejected.status_code == 422
+
+    empty_interactions = copy.deepcopy(payload)
+    empty_interactions["architecture"]["relationships"] = []
+    activity_before = client.get(f"/projects/{project_id}/activity").json()
+    rejected = client.post(f"/projects/{project_id}/interactive-initial-architecture", json=empty_interactions)
+    assert rejected.status_code == 422
+    assert "authored relationships between distinct components" in rejected.text
+    assert client.get(f"/projects/{project_id}/activity").json() == activity_before
+
+    disconnected_leaf = copy.deepcopy(payload)
+    disconnected_leaf["architecture"]["components"].append({
+        "id": "data",
+        "name": "Data",
+        "type": "system",
+        "responsibility": "Own durable state.",
+        "children": [{
+            "id": "postgresql",
+            "name": "PostgreSQL",
+            "type": "data_store",
+            "responsibility": "Persist durable state.",
+        }],
+    })
+    disconnected_leaf["planning_trace"]["system_map_root_ids"].append("data")
+    disconnected_leaf["planning_trace"]["scope_evaluations"].extend([
+        {"scope_component_id": "data", "decomposition": "EXPANDED", "child_ids": ["postgresql"]},
+        {"scope_component_id": "postgresql", "decomposition": "JUSTIFIED_LEAF", "child_ids": [], "leaf_reason": "PostgreSQL is one durable persistence boundary with no independent subsystem below it."},
+    ])
+    rejected = client.post(
+        f"/projects/{project_id}/interactive-initial-architecture",
+        json=disconnected_leaf,
+    )
+    assert rejected.status_code == 422
+    assert "leaves isolated" in rejected.text
+    assert "postgresql" in rejected.text
+    assert client.get(f"/projects/{project_id}/activity").json() == activity_before
 
     accepted = client.post(f"/projects/{project_id}/interactive-initial-architecture", json=payload)
     assert accepted.status_code == 200, accepted.text
@@ -639,7 +674,10 @@ def test_webmcp_agent_can_create_reviewable_recommendation_without_model_provide
                 {"id": "backend", "name": "Backend Platform", "type": "backend system", "responsibility": "Own application API", "children": [{"id": "fastapi-service", "name": "FastAPI Service", "type": "service", "responsibility": "Serve application requests"}]},
                 {"id": "database", "name": "Persistence Platform", "type": "data system", "responsibility": "Own durable application state", "children": [{"id": "postgresql", "name": "PostgreSQL", "type": "database", "responsibility": "Persist application state"}]},
             ],
-            "relationships": [],
+            "relationships": [
+                {"source": "react-ui", "target": "fastapi-service", "relationship_type": "HTTPS"},
+                {"source": "fastapi-service", "target": "postgresql", "relationship_type": "SQL"},
+            ],
             "decisions": [],
             "assumptions": [],
             "risks": [],

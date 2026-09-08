@@ -12,6 +12,7 @@ from archbro.backend.agent.orchestration import AgentOrchestrator
 from archbro.backend.api.agent_surface import build_agent_surface_router
 from archbro.backend.api.provider_connections import build_provider_mcp_router
 from archbro.backend.core.action_executor import ActionExecutor
+from archbro.backend.core.architecture_validation import validate_architecture_relationship_connectivity
 from archbro.backend.core.authorization import (
     AuthenticationError,
     IdentityProviderUnavailableError,
@@ -90,6 +91,21 @@ class UpdateProjectRequest(BaseModel):
         if self.name is None and self.goal is None and self.description is None:
             raise ValueError("at least one project field is required")
         return self
+
+
+class PlannerRecoveryRequest(BaseModel):
+    expected_attempt_id: str = Field(min_length=1, max_length=128)
+    expected_revision: int = Field(ge=1)
+    action: Literal["RECLAIM_PREPARED", "AUTHORIZE_NEW_ATTEMPT", "REPROCESS_RESPONSE"]
+    request_id: str = Field(min_length=1, max_length=200)
+
+    @field_validator("expected_attempt_id", "request_id")
+    @classmethod
+    def normalize_recovery_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
 
 
 class GoalDraftRequest(BaseModel):
@@ -259,6 +275,19 @@ class InteractiveInitialArchitectureRequest(BaseModel):
                     )
             elif evaluation.decomposition != "JUSTIFIED_LEAF":
                 raise ValueError(f"planning_trace scope {component.id} has no children and must be JUSTIFIED_LEAF")
+        leaf_count = sum(not component.children for component in planned_components)
+        if leaf_count > 1 and not any(
+            relationship.source != relationship.target
+            for relationship in self.architecture.relationships
+        ):
+            raise ValueError(
+                "multi-module initial planning requires authored relationships between distinct components; "
+                "reconciled=true cannot replace interaction planning"
+            )
+        validate_architecture_relationship_connectivity(
+            self.architecture,
+            label="interactive initial architecture",
+        )
         return self
 
 
@@ -430,6 +459,45 @@ def build_router(
         if not repository.delete_project(project_id):
             raise HTTPException(status_code=404, detail="project not found")
         return None
+
+    @router.get("/projects/{project_id}/planner/checkpoints/{plan_id}/{phase_key}")
+    async def get_planner_checkpoint(
+        project_id: str,
+        plan_id: str,
+        phase_key: str,
+        http_request: Request,
+    ):
+        await authorized_project(http_request, project_id, ProjectPermission.MANAGE)
+        checkpoint = repository.get_planner_checkpoint(plan_id, phase_key)
+        if checkpoint is None or checkpoint.get("project_id") != project_id:
+            raise HTTPException(status_code=404, detail="planner checkpoint not found")
+        return checkpoint
+
+    @router.post("/projects/{project_id}/planner/checkpoints/{plan_id}/{phase_key}/recover")
+    async def recover_planner_checkpoint(
+        project_id: str,
+        plan_id: str,
+        phase_key: str,
+        request: PlannerRecoveryRequest,
+        http_request: Request,
+    ):
+        await authorized_project(http_request, project_id, ProjectPermission.MANAGE)
+        try:
+            return repository.recover_planner_checkpoint(
+                project_id=project_id,
+                plan_id=plan_id,
+                phase_key=phase_key,
+                expected_attempt_id=request.expected_attempt_id,
+                expected_revision=request.expected_revision,
+                action=request.action,
+                request_id=request.request_id,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="planner checkpoint not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     @router.post("/projects/{project_id}/events")
     async def post_event(project_id: str, request: EventRequest, http_request: Request):

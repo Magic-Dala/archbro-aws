@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
+from uuid import uuid4
+from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal
 
@@ -26,13 +30,15 @@ from archbro.backend.core.contracts import (
     TaskProposal,
 )
 from archbro.backend.core.evaluation import DriftEvaluation
+from archbro.backend.core.architecture_validation import validate_architecture_relationship_connectivity
+from archbro.backend.core.repository import ProjectRepositoryPort
 from archbro.backend.llm.provider import GoalConversationMessage, GoalDraft, ModelProvider
 
 load_dotenv()
 
 
 DEFAULT_GEMINI_CHAIN = (
-    "gemini-3.7-flash",
+    "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
@@ -43,7 +49,7 @@ DEFAULT_GEMINI_GOAL_CHAIN = (
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
-    "gemini-3.7-flash",
+    "gemini-3.8-flash",
 )
 
 DEFAULT_GEMINI_ROUTINE_CHAIN = (
@@ -51,8 +57,120 @@ DEFAULT_GEMINI_ROUTINE_CHAIN = (
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
-    "gemini-3.7-flash",
+    "gemini-3.8-flash",
 )
+
+
+class _PlannerSafeRetryError(RuntimeError):
+    """A planner phase failed before any ambiguous provider effect occurred."""
+
+
+@dataclass(frozen=True)
+class GeminiUsageTelemetry:
+    model_id: str
+    transport: str
+    latency_ms: int
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    cache_read_input_tokens: int | None
+    cache_write_input_tokens: int | None
+
+
+def _compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_responsibility_alias(value):
+    """Losslessly accept provider wording aliases for one responsibility field."""
+
+    if not isinstance(value, Mapping) or "responsibility" in value:
+        return value
+    aliases = [
+        (key, candidate.strip())
+        for key in ("summary", "description")
+        if isinstance((candidate := value.get(key)), str) and candidate.strip()
+    ]
+    if not aliases:
+        return value
+    distinct = {candidate for _, candidate in aliases}
+    if len(distinct) != 1:
+        raise ValueError("conflicting summary/description aliases for responsibility")
+    normalized = dict(value)
+    normalized["responsibility"] = aliases[0][1]
+    for key, _ in aliases:
+        normalized.pop(key, None)
+    return normalized
+
+
+def _bootstrap_project_facts(context: ProjectContext) -> dict[str, object]:
+    """Return only user-authored facts needed by the initial planner."""
+
+    project = context.project
+    facts: dict[str, object] = {"name": project.name, "goal": project.goal}
+    if project.description.strip():
+        facts["description"] = project.description
+    return facts
+
+
+def _compact_context_facts(
+    context: ProjectContext,
+    *,
+    agent_context_manifest: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Project durable state into bounded semantic facts for the model."""
+
+    project = context.project
+    project_facts: dict[str, object] = {
+        "name": project.name,
+        "goal": project.goal,
+        "status": project.status.value,
+        "architecture_version": project.architecture_version,
+    }
+    if project.description.strip():
+        project_facts["description"] = project.description
+    if (
+        isinstance(agent_context_manifest, dict)
+        and agent_context_manifest.get("schema") == "archbro.agent_context_manifest.v1"
+    ):
+        # The server rebuilt and hash-verified this exact manifest immediately
+        # before execution. The manifest already contains bounded project facts;
+        # do not append raw Goal/description, full Architecture, or all tasks or
+        # the visual context boundary would be cosmetic rather than real.
+        return {"agent_context_manifest": agent_context_manifest}
+    return {
+        "project": project_facts,
+        "architecture": context.architecture.model_dump(mode="json", exclude_none=True),
+        "tasks": [
+            task.model_dump(
+                mode="json",
+                exclude={"created_at", "updated_at"},
+                exclude_none=True,
+            )
+            for task in context.tasks
+        ],
+        "pending_proposals": [
+            proposal.model_dump(
+                mode="json",
+                exclude={"created_at", "updated_at"},
+                exclude_none=True,
+            )
+            for proposal in context.pending_proposals
+        ],
+        "recent_notes": [note[:1000] for note in context.recent_notes[-8:]],
+    }
+
+
+def _compact_event_facts(event: ProjectEvent) -> dict[str, object]:
+    payload = dict(event.payload)
+    manifest = payload.pop("agent_context_manifest", None)
+    if isinstance(manifest, dict):
+        payload["agent_context_manifest_hash"] = manifest.get("manifest_hash")
+    return {
+        "type": event.type.value,
+        "source": event.source.value,
+        "payload": payload,
+    }
 
 
 class GeminiArchitectureProposalWire(BaseModel):
@@ -84,6 +202,11 @@ class GeminiComponentWire(BaseModel):
     kind: ArchitectureNodeKind = ArchitectureNodeKind.SYSTEM
     parent_id: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_responsibility_alias(cls, value):
+        return _normalize_responsibility_alias(value)
+
 
 class ArchitectureNeedsFactError(RuntimeError):
     """Initial architecture cannot be truthful without concrete project facts."""
@@ -99,9 +222,14 @@ class ArchitectureNeedsFactError(RuntimeError):
 class GeminiPlannerRootWire(BaseModel):
     id: str
     name: str
-    type: str
+    type: str = "Architecture boundary"
     responsibility: str
     status: str = "PLANNED"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_responsibility_alias(cls, value):
+        return _normalize_responsibility_alias(value)
 
     def as_component(self) -> GeminiComponentWire:
         return GeminiComponentWire(
@@ -118,8 +246,11 @@ class GeminiPlannerRootWire(BaseModel):
 class GeminiSystemMapWire(BaseModel):
     status: Literal["READY", "NEEDS_FACT"] = "READY"
     missing_facts: list[str] = Field(default_factory=list, max_length=5)
-    summary: str = ""
-    roots: list[GeminiPlannerRootWire] = Field(default_factory=list, max_length=6)
+    summary: str = Field(default="", max_length=600)
+    # Intentionally required in the provider JSON schema. With a default_factory
+    # Google may legally omit roots entirely, producing READY + prose that only
+    # fails after the paid call. NEEDS_FACT must explicitly return roots=[].
+    roots: list[GeminiPlannerRootWire] = Field(max_length=6)
 
     @model_validator(mode="after")
     def validate_status(self) -> "GeminiSystemMapWire":
@@ -137,7 +268,7 @@ class GeminiScopeDeltaWire(BaseModel):
     status: Literal["READY", "NEEDS_FACT"] = "READY"
     missing_facts: list[str] = Field(default_factory=list, max_length=5)
     scope_id: str
-    components: list[GeminiComponentWire] = Field(default_factory=list, max_length=20)
+    components: list[GeminiComponentWire] = Field(default_factory=list, max_length=6)
 
     @model_validator(mode="after")
     def validate_status(self) -> "GeminiScopeDeltaWire":
@@ -157,7 +288,7 @@ class GeminiReconcileWire(BaseModel):
     status: Literal["READY", "NEEDS_FACT"] = "READY"
     missing_facts: list[str] = Field(default_factory=list, max_length=5)
     summary: str = ""
-    relationships: list[Relationship] = Field(default_factory=list, max_length=12)
+    relationships: list[Relationship] = Field(default_factory=list, max_length=80)
     tasks: list[TaskProposal] = Field(default_factory=list, max_length=6)
     decisions: list[str] = Field(default_factory=list, max_length=3)
     assumptions: list[str] = Field(default_factory=list, max_length=3)
@@ -187,7 +318,7 @@ class GeminiArchitectureWire(BaseModel):
     version: int = 1
     summary: str = ""
     components: list[GeminiComponentWire] = Field(min_length=1, max_length=40)
-    relationships: list[Relationship] = Field(default_factory=list, max_length=12)
+    relationships: list[Relationship] = Field(default_factory=list, max_length=80)
     decisions: list[str] = Field(default_factory=list, max_length=3)
     assumptions: list[str] = Field(default_factory=list, max_length=3)
     risks: list[str] = Field(default_factory=list, max_length=3)
@@ -311,9 +442,133 @@ class GeminiBootstrapWire(BaseModel):
 class GeminiProvider(ModelProvider):
     name = "gemini"
 
-    def __init__(self, model_id: str = "gemini-3.7-flash") -> None:
+    def _current_invocation_metadata(self) -> dict[str, object] | None:
+        context = getattr(self, "_invocation_metadata_context", None)
+        return None if context is None else context.get()
+
+    def _planner_checkpoint_control(self) -> dict[str, object] | None:
+        metadata = self._current_invocation_metadata()
+        control = None if metadata is None else metadata.get("planner_checkpoint_control")
+        return control if isinstance(control, dict) else None
+
+    def _persist_active_planner_checkpoint(self, data: dict[str, object]) -> dict[str, object]:
+        repository = getattr(self, "_checkpoint_repository", None)
+        control = self._planner_checkpoint_control()
+        if repository is None or control is None:
+            return data
+        persisted = repository.put_planner_checkpoint(
+            project_id=str(control["project_id"]),
+            plan_id=str(control["plan_id"]),
+            phase_key=str(control["phase_key"]),
+            data=data,
+            expected_revision=int(control["revision"]),
+            expected_owner_generation=int(control["owner_generation"]),
+        )
+        control["revision"] = int(persisted["revision"])
+        control["owner_generation"] = int(persisted["owner_generation"])
+        return persisted
+
+    def _transition_active_planner_checkpoint(
+        self,
+        delivery_stage: str,
+        *,
+        provider: dict[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        repository = getattr(self, "_checkpoint_repository", None)
+        control = self._planner_checkpoint_control()
+        if repository is None or control is None:
+            return None
+        current = repository.get_planner_checkpoint(str(control["plan_id"]), str(control["phase_key"]))
+        if current is None:
+            raise RuntimeError("planner checkpoint disappeared while phase was running")
+        next_checkpoint = dict(current)
+        next_checkpoint["delivery_stage"] = delivery_stage
+        if provider is not None:
+            next_checkpoint["provider"] = provider
+        return self._persist_active_planner_checkpoint(next_checkpoint)
+
+    @staticmethod
+    def _scope_id_from_prompt(prompt: str) -> str:
+        marker = "EXPAND_SCOPE phase for root scope_id="
+        terminator = ". Return only NEW descendants"
+        if marker not in prompt:
+            raise ValueError("EXPAND_SCOPE prompt is missing its server-owned scope target")
+        remainder = prompt.split(marker, 1)[1]
+        if terminator not in remainder:
+            raise ValueError("EXPAND_SCOPE prompt has an invalid server-owned scope target")
+        scope_id = remainder.split(terminator, 1)[0].strip()
+        if not scope_id:
+            raise ValueError("EXPAND_SCOPE prompt has an empty server-owned scope target")
+        return scope_id
+
+    def _parse_recorded_planner_output(self, invoke_name: str, prompt: str, output_model, raw_output: str):
+        normalized, _format_normalization = self._strip_json_fence(raw_output)
+        payload, _normalizations = self._normalize_planner_payload(
+            normalized,
+            expected_scope_id=(
+                self._scope_id_from_prompt(prompt)
+                if invoke_name == "_invoke_scope_delta"
+                else None
+            ),
+            reconcile=invoke_name == "_invoke_reconcile",
+        )
+        return output_model.model_validate(payload)
+
+    def _begin_invocation_metadata(self) -> None:
+        context = getattr(self, "_invocation_metadata_context", None)
+        if context is None:
+            context = ContextVar(f"gemini_invocation_metadata_{id(self)}", default=None)
+            self._invocation_metadata_context = context
+        context.set(
+            {
+                "model_id": self.model_id,
+                "usage": None,
+                "planner_response": None,
+                "planner_request_started": False,
+                "planner_phases": [],
+            }
+        )
+
+    @property
+    def last_model_id(self) -> str:
+        metadata = self._current_invocation_metadata()
+        if metadata is not None:
+            model_id = metadata.get("model_id")
+            if isinstance(model_id, str):
+                return model_id
+        return getattr(self, "_last_model_id", self.model_id)
+
+    @last_model_id.setter
+    def last_model_id(self, model_id: str) -> None:
+        self._last_model_id = model_id
+        metadata = self._current_invocation_metadata()
+        if metadata is not None:
+            metadata["model_id"] = model_id
+
+    @property
+    def last_usage(self):
+        metadata = self._current_invocation_metadata()
+        if metadata is not None:
+            return metadata.get("usage")
+        return getattr(self, "_last_usage", None)
+
+    @last_usage.setter
+    def last_usage(self, usage) -> None:
+        self._last_usage = usage
+        metadata = self._current_invocation_metadata()
+        if metadata is not None:
+            metadata["usage"] = usage
+
+    def __init__(
+        self,
+        model_id: str = "gemini-3.8-flash",
+        *,
+        checkpoint_repository: ProjectRepositoryPort | None = None,
+    ) -> None:
         self.model_id = model_id
+        self._checkpoint_repository = checkpoint_repository
         self.last_model_id = model_id
+        self.last_usage: GeminiUsageTelemetry | dict[str, object] | None = None
         self.fallback_model_ids = self._load_fallback_models(model_id)
         self.goal_model_id = os.getenv("GEMINI_GOAL_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite"
         self.goal_fallback_model_ids = self._load_goal_fallback_models(self.goal_model_id)
@@ -325,15 +580,25 @@ class GeminiProvider(ModelProvider):
         self.routine_model_timeout_seconds = float(os.getenv("GEMINI_ROUTINE_MODEL_TIMEOUT_SECONDS", "8"))
         if self.routine_model_timeout_seconds <= 0:
             raise ValueError("GEMINI_ROUTINE_MODEL_TIMEOUT_SECONDS must be greater than zero")
-        self.architecture_model_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_MODEL_TIMEOUT_SECONDS", "12"))
-        self.architecture_phase_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_PHASE_TIMEOUT_SECONDS", "18"))
-        self.architecture_total_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_TOTAL_TIMEOUT_SECONDS", "36"))
+        self.interaction_model_timeout_seconds = float(os.getenv("GEMINI_INTERACTION_MODEL_TIMEOUT_SECONDS", "12"))
+        self.interaction_total_timeout_seconds = float(os.getenv("GEMINI_INTERACTION_TOTAL_TIMEOUT_SECONDS", "36"))
+        self.architecture_model_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_MODEL_TIMEOUT_SECONDS", "90"))
+        self.architecture_phase_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_PHASE_TIMEOUT_SECONDS", "120"))
+        self.architecture_total_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_TOTAL_TIMEOUT_SECONDS", "900"))
+        self.architecture_max_output_tokens = int(os.getenv("GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS", "65536"))
+        self.architecture_thinking_level = os.getenv("GEMINI_ARCHITECTURE_THINKING_LEVEL", "high").strip().lower()
+        self.system_map_model_id = os.getenv("GEMINI_SYSTEM_MAP_MODEL", "").strip() or None
         if (
-            self.architecture_model_timeout_seconds <= 0
+            self.interaction_model_timeout_seconds <= 0
+            or self.interaction_total_timeout_seconds <= 0
+            or self.architecture_model_timeout_seconds <= 0
             or self.architecture_phase_timeout_seconds <= 0
             or self.architecture_total_timeout_seconds <= 0
+            or self.architecture_max_output_tokens <= 0
         ):
-            raise ValueError("Gemini architecture timeouts must be greater than zero")
+            raise ValueError("Gemini architecture timeouts/output budget must be greater than zero")
+        if self.architecture_thinking_level not in {"minimal", "low", "medium", "high"}:
+            raise ValueError("GEMINI_ARCHITECTURE_THINKING_LEVEL must be minimal, low, medium, or high")
         bootstrap_fallbacks = os.getenv(
             "GEMINI_BOOTSTRAP_FALLBACK_MODELS",
             "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.5-flash",
@@ -343,9 +608,17 @@ class GeminiProvider(ModelProvider):
             for candidate in (item.strip() for item in bootstrap_fallbacks.split(","))
             if candidate and candidate != self.model_id
         )
-        self._api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        configured_base_url = (
+            os.getenv("GEMINI_BASE_URL", "").strip()
+            or os.getenv("GOOGLE_GEMINI_BASE_URL", "").strip()
+        )
+        self._base_url = configured_base_url.rstrip("/") or None
+        self._api_key = (
+            os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
         if not self._api_key:
-            raise RuntimeError("GEMINI_API_KEY is not set")
+            raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is not set")
         # Strands Agent instances are invocation-scoped. Reusing one Agent across HTTP
         # requests raises ConcurrencyException because concurrent invocations are unsupported.
 
@@ -415,6 +688,12 @@ class GeminiProvider(ModelProvider):
                 deduped.append(candidate)
         return tuple(deduped)
 
+    def _planner_model_chain(self, invoke_name: str) -> tuple[str, ...]:
+        preferred = self.system_map_model_id if invoke_name == "_invoke_system_map" else None
+        if not preferred:
+            return self.bootstrap_model_chain
+        return (preferred, *(model_id for model_id in self.bootstrap_model_chain if model_id != preferred))
+
     def _build_agent(self, model_id: str):
         from google.genai import types as genai_types
         from strands import Agent
@@ -423,13 +702,16 @@ class GeminiProvider(ModelProvider):
         http_timeout_ms = int(os.getenv("GEMINI_HTTP_TIMEOUT_MS", "12000"))
         if http_timeout_ms <= 0:
             raise ValueError("GEMINI_HTTP_TIMEOUT_MS must be greater than zero")
+        http_options = {
+            "timeout": http_timeout_ms,
+            "retry_options": genai_types.HttpRetryOptions(attempts=1),
+        }
+        if self._base_url:
+            http_options["base_url"] = self._base_url
         model = GeminiModel(
             client_args={
                 "api_key": self._api_key,
-                "http_options": genai_types.HttpOptions(
-                    timeout=http_timeout_ms,
-                    retry_options=genai_types.HttpRetryOptions(attempts=1),
-                ),
+                "http_options": genai_types.HttpOptions(**http_options),
             },
             model_id=model_id,
             params={"temperature": 0.1, "max_output_tokens": 4096},
@@ -441,56 +723,719 @@ class GeminiProvider(ModelProvider):
 
     @staticmethod
     def _is_temporary_unavailable(exc: BaseException) -> bool:
-        current: BaseException | None = exc
+        pending: list[BaseException] = [exc]
         seen: set[int] = set()
-        while current is not None and id(current) not in seen:
+        chain: list[BaseException] = []
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
             seen.add(id(current))
-            text = str(current).lower()
-            if "503" in text and ("unavailable" in text or "high demand" in text):
+            chain.append(current)
+            for linked in (current.__cause__, current.__context__):
+                if linked is not None and id(linked) not in seen:
+                    pending.append(linked)
+
+        protected_names = {"RESOURCE_EXHAUSTED", "UNAUTHENTICATED", "PERMISSION_DENIED"}
+        availability_names = {"UNAVAILABLE"}
+        protected_codes = {401, 403, 429}
+        availability_codes = {503}
+        saw_structured_status = False
+        saw_structured_availability = False
+
+        def status_name(value: object) -> str:
+            if value is None or callable(value):
+                return ""
+            candidate = getattr(value, "name", value)
+            text = str(candidate).strip().upper()
+            return text.rsplit(".", 1)[-1]
+
+        def status_code(value: object) -> int | None:
+            if value is None or callable(value) or isinstance(value, bool):
+                return None
+            candidate = getattr(value, "value", value)
+            if isinstance(candidate, bool) or isinstance(candidate, tuple):
+                return None
+            try:
+                return int(candidate)
+            except (TypeError, ValueError):
+                return None
+
+        for item in chain:
+            response = getattr(item, "response", None)
+            structured_values = (
+                getattr(item, "status", None),
+                getattr(item, "status_code", None),
+                getattr(item, "code", None),
+                getattr(response, "status_code", None),
+            )
+            for value in structured_values:
+                if value is None or callable(value):
+                    continue
+                name = status_name(value)
+                code = status_code(value)
+                if name or code is not None:
+                    saw_structured_status = True
+                if name in protected_names or code in protected_codes:
+                    return False
+                if name in availability_names or code in availability_codes:
+                    saw_structured_availability = True
+
+        def has_explicit_http_code(message: str, code: int) -> bool:
+            text = message.strip().lower()
+            token = str(code)
+            return (
+                text.startswith(token + " ")
+                or f"http {token}" in text
+                or f"status {token}" in text
+                or f"status={token}" in text
+                or f"status_code={token}" in text
+                or f"status code {token}" in text
+            )
+
+        messages = [str(item).lower() for item in chain]
+        for message in messages:
+            if (
+                "resource_exhausted" in message
+                or "resource exhausted" in message
+                or "unauthenticated" in message
+                or "permission_denied" in message
+                or "permission denied" in message
+                or any(has_explicit_http_code(message, code) for code in protected_codes)
+            ):
+                return False
+
+        # Reliable structured status always wins over message-only heuristics.
+        # Unknown structured statuses fail closed instead of becoming retries.
+        if saw_structured_status:
+            return saw_structured_availability
+
+        for message in messages:
+            if has_explicit_http_code(message, 503):
                 return True
-            current = current.__cause__ or current.__context__
+            if "503" in message and ("unavailable" in message or "high demand" in message):
+                return True
+            if (
+                "temporarily unavailable" in message
+                or "service unavailable" in message
+                or "upstream unavailable" in message
+            ):
+                return True
         return False
 
+    @staticmethod
+    def _usage_int(usage: Mapping[str, object], key: str) -> int | None:
+        value = usage.get(key)
+        return None if value is None else int(value)
+
+    def _record_usage(self, model_id: str, result, started_at: float) -> None:
+        usage = getattr(getattr(result, "metrics", None), "accumulated_usage", None)
+        if not isinstance(usage, Mapping) or not usage:
+            self.last_usage = None
+            return
+        self.last_usage = GeminiUsageTelemetry(
+            model_id=model_id,
+            transport="gateway" if self._base_url else "google",
+            latency_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
+            input_tokens=self._usage_int(usage, "inputTokens"),
+            output_tokens=self._usage_int(usage, "outputTokens"),
+            total_tokens=self._usage_int(usage, "totalTokens"),
+            cache_read_input_tokens=self._usage_int(usage, "cacheReadInputTokens"),
+            cache_write_input_tokens=self._usage_int(usage, "cacheWriteInputTokens"),
+        )
+
     async def _invoke(self, model_id: str, prompt: str) -> GeminiDecisionWire:
+        self.last_usage = None
+        started_at = time.perf_counter()
         result = await self._agent_for(model_id).invoke_async(prompt, structured_output_model=GeminiDecisionWire)
+        self._record_usage(model_id, result, started_at)
         if result.structured_output is None:
             raise RuntimeError("Strands returned no structured GeminiDecisionWire")
         return GeminiDecisionWire.model_validate(result.structured_output)
 
     async def _invoke_goal(self, model_id: str, prompt: str) -> GoalDraft:
+        self.last_usage = None
+        started_at = time.perf_counter()
         result = await self._agent_for(model_id).invoke_async(prompt, structured_output_model=GoalDraft)
+        self._record_usage(model_id, result, started_at)
         if result.structured_output is None:
             raise RuntimeError("Strands returned no structured GoalDraft")
         return GoalDraft.model_validate(result.structured_output)
 
-    async def _invoke_bootstrap(self, model_id: str, prompt: str) -> GeminiBootstrapWire:
-        result = await self._agent_for(model_id).invoke_async(prompt, structured_output_model=GeminiBootstrapWire)
-        if result.structured_output is None:
-            raise RuntimeError("Strands returned no structured GeminiBootstrapWire")
-        return GeminiBootstrapWire.model_validate(result.structured_output)
+    @staticmethod
+    def _finish_reason_text(value: object) -> str | None:
+        if value is None:
+            return None
+        candidate = getattr(value, "value", value)
+        text = str(candidate).strip()
+        return text.rsplit(".", 1)[-1] if text else None
+
+    @staticmethod
+    def _strip_json_fence(text: str) -> tuple[str, str | None]:
+        normalized = text.strip()
+        if normalized.startswith("```json\n") and normalized.endswith("\n```"):
+            return normalized[8:-4], "removed enclosing Markdown JSON fence"
+        if normalized.startswith("```\n") and normalized.endswith("\n```"):
+            return normalized[4:-4], "removed enclosing Markdown fence"
+        return normalized, None
+
+    @staticmethod
+    def _normalize_planner_payload(
+        normalized_output: str,
+        *,
+        expected_scope_id: str | None = None,
+        reconcile: bool = False,
+    ) -> tuple[object, list[dict[str, object]]]:
+        payload = json.loads(normalized_output)
+        normalizations: list[dict[str, object]] = []
+        if expected_scope_id is not None:
+            if not isinstance(payload, dict):
+                raise ValueError("EXPAND_SCOPE provider output must be a JSON object")
+            if "scope_id" not in payload:
+                payload = dict(payload)
+                payload["scope_id"] = expected_scope_id
+                normalizations.append(
+                    {
+                        "field": "scope_id",
+                        "operation": "filled_from_server_phase_target",
+                        "value": expected_scope_id,
+                    }
+                )
+            components = payload.get("components")
+            if isinstance(components, list):
+                normalized_components: list[object] = []
+                for index, component in enumerate(components):
+                    if isinstance(component, dict) and "type" not in component:
+                        component = dict(component)
+                        component["type"] = "Architecture component"
+                        normalizations.append(
+                            {
+                                "field": f"components[{index}].type",
+                                "operation": "filled_server_display_default",
+                                "value": "Architecture component",
+                            }
+                        )
+                    normalized_components.append(component)
+                payload = dict(payload)
+                payload["components"] = normalized_components
+        if reconcile:
+            if not isinstance(payload, dict):
+                raise ValueError("RECONCILE provider output must be a JSON object")
+
+            relationships = payload.get("relationships")
+            if isinstance(relationships, list):
+                normalized_relationships: list[object] = []
+                for index, relationship in enumerate(relationships):
+                    if isinstance(relationship, dict) and "type" in relationship:
+                        relationship = dict(relationship)
+                        alias = relationship.get("type")
+                        canonical = relationship.get("relationship_type")
+                        if canonical is not None and canonical != alias:
+                            raise ValueError(
+                                f"conflicting relationships[{index}].type/relationship_type aliases"
+                            )
+                        if canonical is None:
+                            if not isinstance(alias, str) or not alias.strip():
+                                raise ValueError(
+                                    f"relationships[{index}].type alias must be a non-empty string"
+                                )
+                            relationship["relationship_type"] = alias.strip()
+                        relationship.pop("type", None)
+                        normalizations.append(
+                            {
+                                "field": f"relationships[{index}].relationship_type",
+                                "operation": "renamed_provider_alias",
+                                "source_field": "type",
+                            }
+                        )
+                    normalized_relationships.append(relationship)
+                payload = dict(payload)
+                payload["relationships"] = normalized_relationships
+
+            def normalize_structured_strings(
+                field: str,
+                expected_keys: tuple[str, ...],
+            ) -> None:
+                nonlocal payload
+                values = payload.get(field)
+                if not isinstance(values, list):
+                    return
+                normalized_values: list[object] = []
+                for index, value in enumerate(values):
+                    if not isinstance(value, dict):
+                        normalized_values.append(value)
+                        continue
+                    if set(value) != set(expected_keys) or any(
+                        not isinstance(value.get(key), str) or not value[key].strip()
+                        for key in expected_keys
+                    ):
+                        raise ValueError(
+                            f"unsupported structured {field}[{index}] provider shape"
+                        )
+                    canonical = "\n".join(
+                        f"{key.replace('_', ' ').title()}: {value[key].strip()}"
+                        for key in expected_keys
+                    )
+                    normalized_values.append(canonical)
+                    normalizations.append(
+                        {
+                            "field": f"{field}[{index}]",
+                            "operation": "canonicalized_structured_text",
+                            "source_fields": list(expected_keys),
+                        }
+                    )
+                payload = dict(payload)
+                payload[field] = normalized_values
+
+            normalize_structured_strings("decisions", ("title", "decision", "rationale"))
+            normalize_structured_strings("risks", ("risk", "mitigation"))
+        return payload, normalizations
+
+    async def _invoke_planner_structured(
+        self,
+        model_id: str,
+        prompt: str,
+        output_model,
+        *,
+        expected_scope_id: str | None = None,
+        reconcile: bool = False,
+    ):
+        from google import genai
+        from google.genai import types as genai_types
+
+        http_timeout_ms = int(
+            os.getenv(
+                "GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS",
+                str(round(self.architecture_model_timeout_seconds * 1000)),
+            )
+        )
+        if http_timeout_ms <= 0:
+            raise ValueError("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS must be greater than zero")
+        http_options: dict[str, object] = {
+            "timeout": http_timeout_ms,
+            "retry_options": genai_types.HttpRetryOptions(attempts=1),
+        }
+        if self._base_url:
+            http_options["base_url"] = self._base_url
+        client = genai.Client(
+            api_key=self._api_key,
+            http_options=genai_types.HttpOptions(**http_options),
+        )
+        started_at = time.perf_counter()
+        invocation = self._current_invocation_metadata()
+        if invocation is not None:
+            self._transition_active_planner_checkpoint(
+                "IN_FLIGHT",
+                provider={"requested_model": model_id},
+            )
+            invocation["planner_request_started"] = True
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=self.architecture_max_output_tokens,
+                    response_mime_type="application/json",
+                    response_json_schema=output_model.model_json_schema(),
+                    thinking_config=genai_types.ThinkingConfig(
+                        thinking_level=self.architecture_thinking_level,
+                        include_thoughts=False,
+                    ),
+                ),
+            )
+        finally:
+            await client.aio.aclose()
+
+        candidates = response.candidates or []
+        if not candidates:
+            raise RuntimeError("Gemini planner returned no candidates")
+        candidate = candidates[0]
+        finish_reason = self._finish_reason_text(candidate.finish_reason)
+        usage = (
+            response.usage_metadata.model_dump(mode="json", by_alias=True, exclude_none=True)
+            if response.usage_metadata is not None
+            else None
+        )
+        response_metadata = {
+            "requested_model": model_id,
+            "observed_model_version": response.model_version,
+            "finish_reason": finish_reason,
+            "response_id": response.response_id,
+            "usage": usage,
+            "latency_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
+            "transport": "gateway" if self._base_url else "google",
+            "thinking_level": self.architecture_thinking_level,
+            "response_reprocessable": finish_reason == "STOP",
+        }
+        invocation = self._current_invocation_metadata()
+        if invocation is not None:
+            invocation["planner_response"] = response_metadata
+
+        parts = candidate.content.parts if candidate.content and candidate.content.parts else []
+        output = "".join(part.text or "" for part in parts if not part.thought)
+        response_metadata["raw_model_output"] = output
+        self._transition_active_planner_checkpoint(
+            "RESPONSE_RECORDED",
+            provider=response_metadata,
+        )
+        normalized, format_normalization = self._strip_json_fence(output)
+        payload, normalizations = self._normalize_planner_payload(
+            normalized,
+            expected_scope_id=expected_scope_id,
+            reconcile=reconcile,
+        )
+        if format_normalization:
+            normalizations.insert(0, {"operation": format_normalization})
+        response_metadata["normalization"] = normalizations or None
+        response_metadata["model_output"] = normalized
+        response_metadata["output_sha256"] = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        response_metadata["normalized_payload_sha256"] = self._planner_payload_sha256(payload)
+        if finish_reason != "STOP":
+            raise RuntimeError(f"Gemini planner generation did not finish cleanly: {finish_reason or 'UNKNOWN'}")
+        return output_model.model_validate(payload)
 
     async def _invoke_system_map(self, model_id: str, prompt: str) -> GeminiSystemMapWire:
-        result = await self._agent_for(model_id).invoke_async(prompt, structured_output_model=GeminiSystemMapWire)
-        if result.structured_output is None:
-            raise RuntimeError("Strands returned no structured GeminiSystemMapWire")
-        return GeminiSystemMapWire.model_validate(result.structured_output)
+        return await self._invoke_planner_structured(model_id, prompt, GeminiSystemMapWire)
 
     async def _invoke_scope_delta(self, model_id: str, prompt: str) -> GeminiScopeDeltaWire:
-        result = await self._agent_for(model_id).invoke_async(prompt, structured_output_model=GeminiScopeDeltaWire)
-        if result.structured_output is None:
-            raise RuntimeError("Strands returned no structured GeminiScopeDeltaWire")
-        return GeminiScopeDeltaWire.model_validate(result.structured_output)
+        expected_scope_id = self._scope_id_from_prompt(prompt)
+        return await self._invoke_planner_structured(
+            model_id,
+            prompt,
+            GeminiScopeDeltaWire,
+            expected_scope_id=expected_scope_id,
+        )
 
     async def _invoke_reconcile(self, model_id: str, prompt: str) -> GeminiReconcileWire:
-        result = await self._agent_for(model_id).invoke_async(prompt, structured_output_model=GeminiReconcileWire)
-        if result.structured_output is None:
-            raise RuntimeError("Strands returned no structured GeminiReconcileWire")
-        return GeminiReconcileWire.model_validate(result.structured_output)
+        return await self._invoke_planner_structured(
+            model_id,
+            prompt,
+            GeminiReconcileWire,
+            reconcile=True,
+        )
 
     @staticmethod
     def _require_ready(wire: GeminiSystemMapWire | GeminiScopeDeltaWire | GeminiReconcileWire) -> None:
         if wire.status == "NEEDS_FACT":
             raise ArchitectureNeedsFactError(wire.missing_facts)
+
+    @staticmethod
+    def _planner_snapshot_payload(snapshot: InitialArchitecturePlannerSnapshot | None) -> dict[str, object] | None:
+        if snapshot is None:
+            return None
+        return {
+            "roots": list(snapshot.roots),
+            "components": [
+                component.model_dump(mode="json", exclude_none=True)
+                for component in snapshot.components
+            ],
+        }
+
+    @staticmethod
+    def _planner_payload_sha256(value: object) -> str:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _planner_plan_id(self, context: ProjectContext) -> str:
+        identity = {
+            "planner_contract": "archbro.initial_planner.v4",
+            "project_id": context.project.id,
+            "brief": _bootstrap_project_facts(context),
+            "model_id": self.model_id,
+            "system_map_model_id": self.system_map_model_id,
+            "bootstrap_model_chain": self.bootstrap_model_chain,
+            "thinking_level": self.architecture_thinking_level,
+            "max_output_tokens": self.architecture_max_output_tokens,
+        }
+        return "plan_" + self._planner_payload_sha256(identity)[:32]
+
+    def _set_planner_usage(self, *, plan_id: str, completed: bool) -> None:
+        metadata = self._current_invocation_metadata()
+        phases = [] if metadata is None else list(metadata.get("planner_phases") or [])
+        self.last_usage = {
+            "schema": "archbro.gemini_initial_planner_usage.v1",
+            "transport": "gateway" if self._base_url else "google",
+            "requested_model": self.model_id,
+            "thinking_level": self.architecture_thinking_level,
+            "plan_id": plan_id,
+            "completed": completed,
+            "phases": phases,
+        }
+
+    def _append_planner_phase_usage(
+        self,
+        checkpoint: dict[str, object],
+        *,
+        replayed_from_checkpoint: bool,
+    ) -> None:
+        provider = checkpoint.get("provider")
+        if isinstance(provider, Mapping):
+            provider = {
+                key: provider.get(key)
+                for key in (
+                    "requested_model",
+                    "observed_model_version",
+                    "finish_reason",
+                    "response_id",
+                    "usage",
+                    "latency_ms",
+                    "transport",
+                    "thinking_level",
+                    "normalization",
+                    "output_sha256",
+                )
+            }
+        compact = {
+            "phase": checkpoint.get("phase_key"),
+            "status": checkpoint.get("status"),
+            "requested_model": checkpoint.get("requested_model"),
+            "thinking_level": checkpoint.get("thinking_level"),
+            "input_sha256": checkpoint.get("input_sha256"),
+            "snapshot_before_sha256": checkpoint.get("snapshot_before_sha256"),
+            "snapshot_after_sha256": checkpoint.get("snapshot_after_sha256"),
+            "validation": checkpoint.get("validation"),
+            "provider": provider,
+            "replayed_from_checkpoint": replayed_from_checkpoint,
+        }
+        metadata = self._current_invocation_metadata()
+        if metadata is not None:
+            phases = metadata.setdefault("planner_phases", [])
+            phases.append(compact)
+
+    def _planner_checkpoint_identity(
+        self,
+        *,
+        phase_key: str,
+        prompt: str,
+        snapshot_before: InitialArchitecturePlannerSnapshot | None,
+        invoke_name: str,
+    ) -> dict[str, object]:
+        snapshot_payload = self._planner_snapshot_payload(snapshot_before)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        requested_model = self._planner_model_chain(invoke_name)[0]
+        identity = {
+            "phase_key": phase_key,
+            "prompt_sha256": prompt_sha256,
+            "snapshot_before_sha256": (
+                self._planner_payload_sha256(snapshot_payload)
+                if snapshot_payload is not None
+                else None
+            ),
+            "requested_model": requested_model,
+            "thinking_level": self.architecture_thinking_level,
+            "max_output_tokens": self.architecture_max_output_tokens,
+        }
+        return {
+            **identity,
+            "input_sha256": self._planner_payload_sha256(identity),
+        }
+
+    async def _run_checkpointed_planner_phase(
+        self,
+        *,
+        plan_id: str,
+        project_id: str,
+        phase_key: str,
+        invoke_name: str,
+        prompt: str,
+        output_model,
+        snapshot_before: InitialArchitecturePlannerSnapshot | None,
+        global_deadline: float,
+        validate,
+    ):
+        identity = self._planner_checkpoint_identity(
+            phase_key=phase_key,
+            prompt=prompt,
+            snapshot_before=snapshot_before,
+            invoke_name=invoke_name,
+        )
+        repository = getattr(self, "_checkpoint_repository", None)
+        started_checkpoint: dict[str, object] = {
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": plan_id,
+            "project_id": project_id,
+            **identity,
+            "status": "STARTED",
+            "attempt_id": uuid4().hex,
+            "delivery_stage": "PREPARED",
+            "input": {
+                "prompt": prompt,
+                "snapshot_before": self._planner_snapshot_payload(snapshot_before),
+            },
+            "validation": {"status": "PENDING"},
+            "provider": None,
+        }
+        claimed = True
+        existing = None
+        if repository is not None:
+            claimed, existing = repository.claim_planner_checkpoint(
+                project_id=project_id,
+                plan_id=plan_id,
+                phase_key=phase_key,
+                data=started_checkpoint,
+                retry_statuses=("RETRYABLE",),
+            )
+            if claimed:
+                started_checkpoint = existing
+
+        if not claimed and existing is not None:
+            mismatches = [
+                key
+                for key in (
+                    "input_sha256",
+                    "requested_model",
+                    "thinking_level",
+                    "snapshot_before_sha256",
+                )
+                if existing.get(key) != identity.get(key)
+            ]
+            if mismatches:
+                raise RuntimeError(
+                    f"planner checkpoint identity mismatch for {phase_key}: {', '.join(mismatches)}"
+                )
+            if existing.get("status") == "REPROCESSABLE":
+                provider = existing.get("provider")
+                raw_output = provider.get("raw_model_output") if isinstance(provider, dict) else None
+                if not isinstance(raw_output, str) or not raw_output:
+                    raise RuntimeError(f"planner phase {phase_key} has no recorded response to reprocess")
+                result = self._parse_recorded_planner_output(invoke_name, prompt, output_model, raw_output)
+                snapshot_after = validate(result)
+                completed_checkpoint = {
+                    **existing,
+                    "status": "COMPLETED",
+                    "validation": {"status": "PASS", "local_reprocess": True},
+                    "validated_output": result.model_dump(mode="json", exclude_none=True),
+                    "snapshot_after_sha256": (
+                        self._planner_payload_sha256(snapshot_after)
+                        if snapshot_after is not None
+                        else None
+                    ),
+                }
+                if repository is not None:
+                    completed_checkpoint = repository.put_planner_checkpoint(
+                        project_id=project_id,
+                        plan_id=plan_id,
+                        phase_key=phase_key,
+                        data=completed_checkpoint,
+                        expected_revision=int(existing.get("revision", 0)),
+                        expected_owner_generation=int(existing.get("owner_generation", 0)),
+                    )
+                self._append_planner_phase_usage(completed_checkpoint, replayed_from_checkpoint=True)
+                self._set_planner_usage(plan_id=plan_id, completed=False)
+                return result
+            if existing.get("status") != "COMPLETED":
+                raise RuntimeError(
+                    f"planner phase {phase_key} has durable {existing.get('status', 'UNKNOWN')} state; "
+                    "refusing automatic paid-call replay; "
+                    f"attempt_id={existing.get('attempt_id')} revision={existing.get('revision')} "
+                    f"delivery_stage={existing.get('delivery_stage', 'UNKNOWN')}"
+                )
+            validated_output = existing.get("validated_output")
+            if not isinstance(validated_output, dict):
+                raise RuntimeError(f"completed planner checkpoint {phase_key} is missing validated_output")
+            result = output_model.model_validate(validated_output)
+            validate(result)
+            self._append_planner_phase_usage(existing, replayed_from_checkpoint=True)
+            self._set_planner_usage(plan_id=plan_id, completed=False)
+            return result
+
+        invocation = self._current_invocation_metadata()
+        if invocation is not None:
+            invocation["planner_response"] = None
+            invocation["planner_request_started"] = False
+            invocation["planner_checkpoint_control"] = {
+                "project_id": project_id,
+                "plan_id": plan_id,
+                "phase_key": phase_key,
+                "attempt_id": started_checkpoint.get("attempt_id"),
+                "revision": int(started_checkpoint.get("revision", 0)),
+                "owner_generation": int(started_checkpoint.get("owner_generation", 0)),
+            }
+        phase_result_returned = False
+        try:
+            result = await self._run_planner_phase(
+                invoke_name,
+                prompt,
+                global_deadline=global_deadline,
+            )
+            phase_result_returned = True
+            snapshot_after = validate(result)
+            provider_metadata = None if invocation is None else invocation.get("planner_response")
+            checkpoint_base = (
+                repository.get_planner_checkpoint(plan_id, phase_key)
+                if repository is not None
+                else started_checkpoint
+            ) or started_checkpoint
+            completed_checkpoint = {
+                **checkpoint_base,
+                "status": "COMPLETED",
+                "validation": {"status": "PASS"},
+                "provider": provider_metadata,
+                "validated_output": result.model_dump(mode="json", exclude_none=True),
+                "snapshot_after_sha256": (
+                    self._planner_payload_sha256(snapshot_after)
+                    if snapshot_after is not None
+                    else None
+                ),
+            }
+            if repository is not None:
+                completed_checkpoint = self._persist_active_planner_checkpoint(completed_checkpoint)
+            self._append_planner_phase_usage(completed_checkpoint, replayed_from_checkpoint=False)
+            self._set_planner_usage(plan_id=plan_id, completed=False)
+            return result
+        except Exception as exc:
+            provider_metadata = None if invocation is None else invocation.get("planner_response")
+            cursor: BaseException | None = exc
+            has_timeout = False
+            seen: set[int] = set()
+            while cursor is not None and id(cursor) not in seen:
+                seen.add(id(cursor))
+                if isinstance(cursor, TimeoutError):
+                    has_timeout = True
+                    break
+                cursor = cursor.__cause__ or cursor.__context__
+            provider_request_started = bool(
+                invocation is not None
+                and invocation.get("planner_request_started") is True
+            )
+            failed_before_provider = bool(
+                invocation is not None
+                and not provider_request_started
+                and not phase_result_returned
+            )
+            checkpoint_base = (
+                repository.get_planner_checkpoint(plan_id, phase_key)
+                if repository is not None
+                else started_checkpoint
+            ) or started_checkpoint
+            delivery_stage = str(checkpoint_base.get("delivery_stage") or "PREPARED")
+            retryable = not has_timeout and failed_before_provider and delivery_stage == "PREPARED"
+            failure_status = (
+                "UNKNOWN"
+                if has_timeout or delivery_stage == "IN_FLIGHT"
+                else ("RETRYABLE" if retryable else "FAILED")
+            )
+            failed_checkpoint = {
+                **checkpoint_base,
+                "status": failure_status,
+                "validation": {
+                    "status": "UNKNOWN" if failure_status == "UNKNOWN" else ("RETRYABLE" if retryable else "FAIL"),
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+                "provider": provider_metadata,
+            }
+            if repository is not None:
+                failed_checkpoint = self._persist_active_planner_checkpoint(failed_checkpoint)
+            self._append_planner_phase_usage(failed_checkpoint, replayed_from_checkpoint=False)
+            self._set_planner_usage(plan_id=plan_id, completed=False)
+            raise
 
     async def _run_planner_phase(
         self,
@@ -503,12 +1448,16 @@ class GeminiProvider(ModelProvider):
             global_deadline,
             time.perf_counter() + self.architecture_phase_timeout_seconds,
         )
+        invocation = self._current_invocation_metadata()
+        if invocation is not None:
+            invocation["planner_response"] = None
+            invocation["planner_request_started"] = False
         timed_out: list[str] = []
         unavailable: list[str] = []
         last_unavailable: Exception | None = None
         invoke = getattr(self, invoke_name)
 
-        for candidate in self.bootstrap_model_chain:
+        for candidate in self._planner_model_chain(invoke_name):
             remaining = min(phase_deadline, global_deadline) - time.perf_counter()
             if remaining <= 0:
                 break
@@ -521,12 +1470,30 @@ class GeminiProvider(ModelProvider):
             except TimeoutError as exc:
                 timed_out.append(candidate)
                 last_unavailable = exc
-                continue
+                # A provider-side timeout is an unknown-effect boundary: the
+                # upstream may have completed or billed the request after the
+                # client stopped waiting. Never issue a fallback paid call in
+                # the same phase after that ambiguity; the durable checkpoint
+                # is marked UNKNOWN by the caller and requires explicit review.
+                break
             except Exception as exc:
+                # Once a provider response exists, parsing/schema/semantic
+                # validation failures are local deterministic failures. They
+                # must never be interpreted as availability and retried on a
+                # second paid candidate merely because their text mentions a
+                # status code such as 503.
+                if invocation is not None and invocation.get("planner_response") is not None:
+                    raise
                 if not self._is_temporary_unavailable(exc):
                     raise
                 unavailable.append(candidate)
                 last_unavailable = exc
+                # Once this phase crossed the dispatch boundary, a transport
+                # failure is an unknown-effect result. A lease/retryable HTTP
+                # classification does not prove the provider did not receive
+                # or bill the request, so never fall through to another model.
+                if invocation is not None and invocation.get("planner_request_started") is True:
+                    break
 
         details: list[str] = []
         if timed_out:
@@ -534,10 +1501,18 @@ class GeminiProvider(ModelProvider):
         if unavailable:
             details.append("503 unavailable: " + ", ".join(unavailable))
         reason = "; ".join(details) or "phase/global reasoning deadline reached"
-        raise RuntimeError(
+        message = (
             f"Gemini planner phase {invoke_name} could not complete ({reason}). "
             "No project state was changed; retry the event."
-        ) from last_unavailable
+        )
+        if unavailable and not timed_out:
+            raise _PlannerSafeRetryError(message) from last_unavailable
+        if not unavailable and not timed_out:
+            # The phase/global deadline can expire before the first provider
+            # request starts. Persisting FAILED would poison a request that is
+            # known to have had no paid/provider side effect.
+            raise _PlannerSafeRetryError(message)
+        raise RuntimeError(message) from last_unavailable
 
     @staticmethod
     def _apply_scope_delta(
@@ -579,12 +1554,13 @@ class GeminiProvider(ModelProvider):
     def _system_map_prompt(*, event: ProjectEvent, context: ProjectContext) -> str:
         return (
             "SYSTEM_MAP phase for ArchBro initial architecture. Return ONLY root system boundaries; do not return descendants, relationships, or tasks. "
+            "The roots JSON key is mandatory. READY requires 1-6 roots; NEEDS_FACT must explicitly use roots=[]. Keep summary concise (at most 600 characters). "
+            "Each root must use the exact fields id, name, type, responsibility, and optional status; do not substitute description or summary for responsibility. "
             "Normally use 3-6 truthful major boundaries for a rich project, but allow 1-2 for a genuinely simple system. Never return more than 6 roots. "
             "Roots must be independently meaningful architecture responsibilities, not files/classes/functions or technology leaves promoted merely because they are easy to name. "
             "Do not hardcode a category taxonomy; derive boundaries from the confirmed Goal. If concrete missing or contradictory facts make a truthful map impossible, return NEEDS_FACT with those facts and no roots. "
             "Use stable short lowercase IDs that later scoped passes can reference."
-            "\n\nCONFIRMED PROJECT:\n" + context.project.model_dump_json()
-            + "\n\nBOOTSTRAP EVENT:\n" + event.model_dump_json()
+            "\n\nCONFIRMED PROJECT BRIEF:\n" + _compact_json(_bootstrap_project_facts(context))
         )
 
     @staticmethod
@@ -595,15 +1571,22 @@ class GeminiProvider(ModelProvider):
         snapshot: InitialArchitecturePlannerSnapshot,
         scope_id: str,
     ) -> str:
-        accepted = [component.model_dump(mode="json") for component in snapshot.components]
+        scope_root = next(component for component in snapshot.components if component.id == scope_id)
+        reserved_ids = sorted(component.id for component in snapshot.components)
+        scope_index = snapshot.roots.index(scope_id)
+        remaining_scopes = len(snapshot.roots) - scope_index
+        remaining_node_slots = max(0, 40 - len(snapshot.components))
+        max_new_nodes = min(6, remaining_node_slots // max(1, remaining_scopes))
         return (
             f"EXPAND_SCOPE phase for root scope_id={scope_id}. Return only NEW descendants inside this named root; never regenerate or edit accepted nodes. "
+            f"Include scope_id={scope_id} exactly in the JSON response and add at most {max_new_nodes} new descendants in this phase. "
             "Use parent_id to attach each new node to the named root or another new descendant. Depth is capped at 3 canonical levels. "
+            "For kind use ONLY one canonical value from SYSTEM, UI, SERVICE, AGENT, TOOL, DATA_STORE, STATE, EXTERNAL_SERVICE, INFRASTRUCTURE. Never use C4 labels such as CONTAINER. "
             "Stop at independently addressable architecture responsibility/boundary/capability detail; do not emit files, classes, functions, methods, local code paths, arbitrary helpers, tables, or columns by default. "
             "An empty READY delta is valid when the root is already an architecture-level leaf. If a truthful expansion requires concrete missing/contradictory facts, return NEEDS_FACT and no components."
-            "\n\nACCEPTED PLANNER SNAPSHOT JSON:\n" + json.dumps(accepted, ensure_ascii=False, separators=(",", ":"))
-            + "\n\nCONFIRMED PROJECT:\n" + context.project.model_dump_json()
-            + "\n\nBOOTSTRAP EVENT:\n" + event.model_dump_json()
+            "\n\nACCEPTED SCOPE ROOT JSON:\n" + _compact_json(scope_root.model_dump(mode="json", exclude_none=True))
+            + "\n\nRESERVED COMPONENT IDS:\n" + _compact_json(reserved_ids)
+            + "\n\nCONFIRMED PROJECT BRIEF:\n" + _compact_json(_bootstrap_project_facts(context))
         )
 
     @staticmethod
@@ -619,12 +1602,20 @@ class GeminiProvider(ModelProvider):
             "RECONCILE phase for ArchBro initial architecture. The topology below is immutable. Do not rename, reparent, replace, or emit topology nodes. "
             "Return only the final concise summary, authored relationships, 1-6 critical implementation tasks, and bounded decisions/assumptions/risks. "
             "Every relationship endpoint and task.related_component must reference an accepted component ID. Do not create containment edges merely to restate hierarchy. "
+            "Author enough genuine directed interactions to cover every leaf architecture component and connect the architecture's real end-to-end workflows. "
+            "A leaf may be incoming-only when that is truthful (for example a data store), but no leaf may be isolated. Do not invent reciprocal edges merely for coverage. "
+            "Use clear relationship directions from caller/producer toward callee/consumer, and avoid duplicate source/target/type relationships. "
             "If concrete missing/contradictory facts make truthful reconciliation impossible, return NEEDS_FACT and no reconciliation output."
             "\n\nSYSTEM MAP SUMMARY:\n" + system_summary
-            + "\n\nIMMUTABLE TOPOLOGY JSON:\n" + json.dumps(accepted, ensure_ascii=False, separators=(",", ":"))
-            + "\n\nCONFIRMED PROJECT:\n" + context.project.model_dump_json()
-            + "\n\nBOOTSTRAP EVENT:\n" + event.model_dump_json()
+            + "\n\nIMMUTABLE TOPOLOGY JSON:\n" + _compact_json(accepted)
+            + "\n\nCONFIRMED PROJECT BRIEF:\n" + _compact_json(_bootstrap_project_facts(context))
         )
+
+    @staticmethod
+    def _validate_reconciled_architecture(architecture: GeminiArchitectureWire) -> dict[str, object]:
+        domain = architecture.to_domain()
+        validate_architecture_relationship_connectivity(domain, label="RECONCILE")
+        return architecture.model_dump(mode="json", exclude_none=True)
 
     async def _plan_initial_architecture(
         self,
@@ -633,65 +1624,126 @@ class GeminiProvider(ModelProvider):
         context: ProjectContext,
     ) -> GeminiBootstrapWire:
         global_deadline = time.perf_counter() + self.architecture_total_timeout_seconds
-        system_map = await self._run_planner_phase(
-            "_invoke_system_map",
-            self._system_map_prompt(event=event, context=context),
+        plan_id = self._planner_plan_id(context)
+
+        def validate_system_map(wire: GeminiSystemMapWire) -> dict[str, object]:
+            self._require_ready(wire)
+            if len(wire.roots) > 6:
+                raise ValueError("SYSTEM_MAP allows at most 6 roots")
+            root_components = tuple(root.as_component() for root in wire.roots)
+            if len({component.id for component in root_components}) != len(root_components):
+                raise ValueError("SYSTEM_MAP root ids must be unique")
+            candidate = InitialArchitecturePlannerSnapshot(
+                roots=tuple(component.id for component in root_components),
+                components=root_components,
+            )
+            GeminiArchitectureWire(version=1, components=list(candidate.components))
+            return self._planner_snapshot_payload(candidate) or {}
+
+        system_map = await self._run_checkpointed_planner_phase(
+            plan_id=plan_id,
+            project_id=context.project.id,
+            phase_key="SYSTEM_MAP",
+            invoke_name="_invoke_system_map",
+            prompt=self._system_map_prompt(event=event, context=context),
+            output_model=GeminiSystemMapWire,
+            snapshot_before=None,
             global_deadline=global_deadline,
+            validate=validate_system_map,
         )
-        self._require_ready(system_map)
-        if len(system_map.roots) > 6:
-            raise ValueError("SYSTEM_MAP allows at most 6 roots")
         root_components = tuple(root.as_component() for root in system_map.roots)
-        if len({component.id for component in root_components}) != len(root_components):
-            raise ValueError("SYSTEM_MAP root ids must be unique")
         snapshot = InitialArchitecturePlannerSnapshot(
             roots=tuple(component.id for component in root_components),
             components=root_components,
         )
-        GeminiArchitectureWire(version=1, components=list(snapshot.components))
 
         for scope_id in snapshot.roots:
-            delta = await self._run_planner_phase(
-                "_invoke_scope_delta",
-                self._scope_prompt(
+            phase_snapshot = snapshot
+
+            def validate_scope(wire: GeminiScopeDeltaWire) -> dict[str, object]:
+                updated = self._apply_scope_delta(
+                    phase_snapshot,
+                    wire,
+                    expected_scope_id=scope_id,
+                )
+                return self._planner_snapshot_payload(updated) or {}
+
+            delta = await self._run_checkpointed_planner_phase(
+                plan_id=plan_id,
+                project_id=context.project.id,
+                phase_key=f"EXPAND_SCOPE:{scope_id}",
+                invoke_name="_invoke_scope_delta",
+                prompt=self._scope_prompt(
                     event=event,
                     context=context,
-                    snapshot=snapshot,
+                    snapshot=phase_snapshot,
                     scope_id=scope_id,
                 ),
+                output_model=GeminiScopeDeltaWire,
+                snapshot_before=phase_snapshot,
                 global_deadline=global_deadline,
+                validate=validate_scope,
             )
             snapshot = self._apply_scope_delta(
-                snapshot,
+                phase_snapshot,
                 delta,
                 expected_scope_id=scope_id,
             )
 
-        reconcile = await self._run_planner_phase(
-            "_invoke_reconcile",
-            self._reconcile_prompt(
+        final_snapshot = snapshot
+
+        def validate_reconcile(wire: GeminiReconcileWire) -> dict[str, object]:
+            self._require_ready(wire)
+            candidate = GeminiArchitectureWire(
+                version=1,
+                summary=wire.summary or system_map.summary,
+                components=list(final_snapshot.components),
+                relationships=wire.relationships,
+                decisions=wire.decisions,
+                assumptions=wire.assumptions,
+                risks=wire.risks,
+            )
+            component_ids = candidate.component_ids()
+            if any(
+                task.related_component and task.related_component not in component_ids
+                for task in wire.tasks
+            ):
+                raise ValueError("RECONCILE task.related_component must reference accepted topology")
+            return self._validate_reconciled_architecture(candidate)
+
+        reconcile = await self._run_checkpointed_planner_phase(
+            plan_id=plan_id,
+            project_id=context.project.id,
+            phase_key="RECONCILE",
+            invoke_name="_invoke_reconcile",
+            prompt=self._reconcile_prompt(
                 event=event,
                 context=context,
-                snapshot=snapshot,
+                snapshot=final_snapshot,
                 system_summary=system_map.summary,
             ),
+            output_model=GeminiReconcileWire,
+            snapshot_before=final_snapshot,
             global_deadline=global_deadline,
+            validate=validate_reconcile,
         )
-        self._require_ready(reconcile)
         architecture = GeminiArchitectureWire(
             version=1,
             summary=reconcile.summary or system_map.summary,
-            components=list(snapshot.components),
+            components=list(final_snapshot.components),
             relationships=reconcile.relationships,
             decisions=reconcile.decisions,
             assumptions=reconcile.assumptions,
             risks=reconcile.risks,
         )
-        return GeminiBootstrapWire(
+        self._validate_reconciled_architecture(architecture)
+        result = GeminiBootstrapWire(
             summary=reconcile.summary or system_map.summary or "Initial architecture created.",
             architecture=architecture,
             tasks=reconcile.tasks,
         )
+        self._set_planner_usage(plan_id=plan_id, completed=True)
+        return result
 
     @staticmethod
     def _bootstrap_to_domain_decision(wire: GeminiBootstrapWire) -> AgentDecision:
@@ -717,6 +1769,7 @@ class GeminiProvider(ModelProvider):
         messages: list[GoalConversationMessage],
         current_goal: str = "",
     ) -> GoalDraft:
+        self._begin_invocation_metadata()
         baseline = current_goal.strip()
         has_user_ask = any(message.role == "user" and message.content.strip() for message in messages)
         if not has_user_ask and not baseline:
@@ -813,6 +1866,7 @@ class GeminiProvider(ModelProvider):
         )
 
     async def generate(self, *, event: ProjectEvent, context: ProjectContext, system_prompt: str) -> AgentDecision:
+        self._begin_invocation_metadata()
         is_routine_update = event.type == ProjectEventType.TASK_UPDATED
         is_bootstrap = (
             context.architecture.version == 0
@@ -824,23 +1878,30 @@ class GeminiProvider(ModelProvider):
             wire = await self._plan_initial_architecture(event=event, context=context)
             return self._bootstrap_to_domain_decision(wire)
 
+        raw_manifest = event.payload.get("agent_context_manifest")
+        agent_context_manifest = raw_manifest if isinstance(raw_manifest, dict) else None
         prompt = (
             system_prompt
             + "\n\nPROJECT CONTEXT (bounded JSON):\n"
-            + context.model_dump_json()
+            + _compact_json(
+                _compact_context_facts(
+                    context,
+                    agent_context_manifest=agent_context_manifest,
+                )
+            )
             + "\n\nOBSERVED EVENT:\n"
-            + event.model_dump_json()
+            + _compact_json(_compact_event_facts(event))
         )
         candidate_chain = self.routine_model_chain if is_routine_update else self.model_chain
         per_model_timeout = (
             self.routine_model_timeout_seconds
             if is_routine_update
-            else self.architecture_model_timeout_seconds
+            else self.interaction_model_timeout_seconds
         )
         total_timeout = (
             per_model_timeout * max(1, len(candidate_chain))
             if is_routine_update
-            else max(per_model_timeout, self.architecture_total_timeout_seconds)
+            else max(per_model_timeout, self.interaction_total_timeout_seconds)
         )
         started = time.perf_counter()
         unavailable: list[str] = []

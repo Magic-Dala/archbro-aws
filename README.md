@@ -181,7 +181,12 @@ After starting Uvicorn on port `8011`, use the normal local product surface. Ena
 
 ```env
 GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-3.7-flash
+GEMINI_MODEL=gemini-3.8-flash
+# Optional custom Gemini-compatible gateway:
+# GEMINI_BASE_URL=http://127.0.0.1:8080/gemini
+# GEMINI_API_KEY=...
+# Optional measured planner override, otherwise GEMINI_MODEL is used:
+# GEMINI_SYSTEM_MAP_MODEL=gemini-3.8-flash-medium
 ARCHBRO_PROVIDER=gemini
 ARCHBRO_ENV=local
 ARCHBRO_AUTH_MODE=local

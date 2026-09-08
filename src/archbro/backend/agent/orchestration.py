@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -24,6 +25,24 @@ from archbro.backend.core.observation import ObservationInProgressError
 from archbro.backend.core.repository import ProjectRepositoryPort
 
 logger = logging.getLogger("archbro")
+
+
+
+
+def _provider_usage(provider: ModelProvider) -> dict[str, object] | None:
+    try:
+        usage = getattr(provider, "last_usage", None)
+        if usage is None:
+            return None
+        if is_dataclass(usage):
+            return asdict(usage)
+        if hasattr(usage, "model_dump"):
+            return usage.model_dump(mode="json")
+        if isinstance(usage, dict):
+            return dict(usage)
+    except Exception:
+        logger.warning("provider usage telemetry unavailable", exc_info=True)
+    return None
 
 
 class AgentOrchestrator:
@@ -157,6 +176,7 @@ class AgentOrchestrator:
                 return result
 
             decision = await self.provider.generate(event=event, context=context, system_prompt=SYSTEM_PROMPT)
+            provider_usage = _provider_usage(self.provider)
 
             # M4 safety boundary: provider output must be fully validated before the
             # observed event or any model-derived product mutation is persisted.
@@ -184,6 +204,7 @@ class AgentOrchestrator:
                 provider=self.provider.name,
                 model=used_model,
                 result="SUCCESS",
+                provider_usage=provider_usage,
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
             )
@@ -208,6 +229,7 @@ class AgentOrchestrator:
                 model=used_model,
                 result="ERROR",
                 error=f"{type(exc).__name__}: {exc}",
+                provider_usage=_provider_usage(self.provider),
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
             )
