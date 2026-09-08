@@ -8,10 +8,25 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+try:
+    from qa.archbro_release_evidence import (
+        OwnedFixture,
+        cleanup_evidence_passes,
+        cleanup_owned_fixtures,
+    )
+except ModuleNotFoundError:  # direct `python qa/playwright_release_acceptance.py`
+    from archbro_release_evidence import (  # type: ignore[no-redef]
+        OwnedFixture,
+        cleanup_evidence_passes,
+        cleanup_owned_fixtures,
+    )
+
 BASE_URL = os.getenv("ARCHBRO_BASE_URL", "http://127.0.0.1:8011/")
+STORAGE_STATE = os.getenv("ARCHBRO_STORAGE_STATE")
 ART = Path("qa/playwright_artifacts")
 ART.mkdir(parents=True, exist_ok=True)
 STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_ID = os.getenv("ARCHBRO_ACCEPTANCE_RUN_ID", f"browser-{STAMP}")
 QA_NAME = f"QA Release Rental {STAMP}"
 SPARE_NAME = f"QA Selector Spare {STAMP}"
 
@@ -27,6 +42,8 @@ report = {
     "http_errors": [],
     "architecture": {},
     "mobile": {},
+    "auth_mode": "storage_state" if STORAGE_STATE else "local_demo",
+    "architecture_mutation_requests": [],
 }
 
 
@@ -145,10 +162,23 @@ def open_project_view(page, project_id: str, view: str):
     node.locator(f'[data-project-view="{view}"]').click()
 
 
+if STORAGE_STATE and not Path(STORAGE_STATE).is_file():
+    print(
+        "RELEASE_ACCEPTANCE_UNAVAILABLE",
+        json.dumps({"reason": "ARCHBRO_STORAGE_STATE does not exist", "path": STORAGE_STATE}),
+        flush=True,
+    )
+    raise SystemExit(2)
+
+
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
-    context = browser.new_context(viewport={"width": 1440, "height": 1000})
-    context.add_init_script("""
+    context_options = {"viewport": {"width": 1440, "height": 1000}}
+    if STORAGE_STATE:
+        context_options["storage_state"] = STORAGE_STATE
+    context = browser.new_context(**context_options)
+    if not STORAGE_STATE:
+        context.add_init_script("""
 (() => {
   const session = {id:'email:release@archbro.local', provider:'password', email:'release@archbro.local', name:'Release QA'};
   const profiles = {
@@ -167,6 +197,14 @@ with sync_playwright() as p:
     page.on("console", lambda msg: report["console_errors"].append(msg.text) if msg.type == "error" else None)
     page.on("pageerror", lambda exc: report["page_errors"].append(str(exc)))
     page.on("response", lambda res: report["http_errors"].append({"status": res.status, "url": res.url}) if res.status >= 400 else None)
+    page.on(
+        "request",
+        lambda req: report["architecture_mutation_requests"].append(
+            {"method": req.method, "url": req.url}
+        )
+        if req.method != "GET" and "/architecture" in req.url
+        else None,
+    )
 
     qa_project_id = None
     spare_id = None
@@ -400,6 +438,23 @@ with sync_playwright() as p:
         page.wait_for_function("id => document.activeElement?.dataset.taskSelect === id", arg=block_task["id"])
         step("blocked_notification_focus_pass", task=block_task["title"])
 
+        # Ordinary reading/task/notification interaction must not mutate the
+        # accepted Living Architecture. The explicit Human Review flow below
+        # is the first place where a version increment is allowed.
+        before_review_arch = api_json(page, f"/projects/{qa_project_id}/architecture")
+        assert before_review_arch["ok"], before_review_arch
+        assert before_review_arch["payload"]["version"] == arch["version"], (
+            arch["version"],
+            before_review_arch["payload"]["version"],
+        )
+        assert not report["architecture_mutation_requests"], report["architecture_mutation_requests"]
+        step(
+            "ordinary_interaction_architecture_invariant_pass",
+            architecture_version=arch["version"],
+            direct_architecture_mutations=0,
+            auth_mode=report["auth_mode"],
+        )
+
         # REAL architecture change -> pending proposal -> accept -> version increments.
         open_project_view(page, qa_project_id, "overview")
         instruction = page.locator("#instruction")
@@ -544,15 +599,9 @@ with sync_playwright() as p:
         assert not report["page_errors"], report["page_errors"]
         assert not [e for e in report["http_errors"] if e["status"] >= 500], report["http_errors"]
 
-        report["result"] = "PASS"
-        print("RELEASE_ACCEPTANCE_PASS", json.dumps({
-            "qa_project": qa_project_id,
-            "top_level": report["architecture"]["top_level"],
-            "nodes": report["architecture"]["total_nodes"],
-            "depth": report["architecture"]["depth"],
-            "architecture_attempts": attempts,
-            "proposal_attempts": proposal_attempts,
-        }, ensure_ascii=False), flush=True)
+        # Scenario completion is evidence, not the release verdict. PASS belongs
+        # exclusively to qa/verify_archbro_release.py after cleanup + identity.
+        report["scenarios_status"] = "PASS"
 
     except Exception as exc:
         report["result"] = "FAIL"
@@ -566,17 +615,77 @@ with sync_playwright() as p:
     finally:
         # Clean only projects created during this run. Pre-existing IDs are an immutable safety boundary.
         try:
-            if spare_id and spare_id not in protected_ids:
-                api_json(page, f"/projects/{spare_id}", method="DELETE")
-            if qa_project_id and qa_project_id not in protected_ids:
-                api_json(page, f"/projects/{qa_project_id}", method="DELETE")
+            fixtures = [
+                OwnedFixture(
+                    project_id=project_id,
+                    owner_run_id=RUN_ID,
+                    created_this_run=True,
+                    pre_existing=project_id in protected_ids,
+                )
+                for project_id in (spare_id, qa_project_id)
+                if project_id
+            ]
+
+            def delete_owned(project_id: str) -> int:
+                return int(api_json(page, f"/projects/{project_id}", method="DELETE")["status"])
+
+            def project_exists(project_id: str) -> bool:
+                result = api_json(page, f"/projects/{project_id}")
+                if result["status"] == 200:
+                    return True
+                if result["status"] == 404:
+                    return False
+                raise RuntimeError(
+                    f"cleanup absence probe returned HTTP {result['status']} for {project_id}"
+                )
+
+            report["cleanup"] = cleanup_owned_fixtures(
+                fixtures,
+                run_id=RUN_ID,
+                delete_project=delete_owned,
+                project_exists=project_exists,
+            )
             if original_id and original_id in protected_ids:
                 page.evaluate("id => localStorage.setItem('archbro-project-id', id)", original_id)
             else:
                 page.evaluate("() => localStorage.removeItem('archbro-project-id')")
         except Exception as cleanup_exc:
             report["cleanup_error"] = str(cleanup_exc)
+            report["cleanup"] = {
+                "status": "FAIL",
+                "run_id": RUN_ID,
+                "deleted": [],
+                "preserved": sorted(protected_ids),
+                "absence_evidence": {},
+                "failures": [{"failure": str(cleanup_exc)}],
+            }
+
+        if report.get("result") != "FAIL":
+            if cleanup_evidence_passes(report.get("cleanup") or {}):
+                report["result"] = "EVIDENCE_READY"
+                print(
+                    "RELEASE_ACCEPTANCE_EVIDENCE_READY",
+                    json.dumps(
+                        {
+                            "run_id": RUN_ID,
+                            "qa_project": qa_project_id,
+                            "cleanup": report["cleanup"],
+                            "next": "run qa/verify_archbro_release.py for the sole PASS decision",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            else:
+                report["result"] = "FAIL"
+                report["failure"] = "release acceptance cleanup did not verify"
+                print("RELEASE_ACCEPTANCE_FAIL", report["failure"], flush=True)
         with (ART / "final_report.json").open("w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
         context.close()
         browser.close()
+
+if report.get("result") == "EVIDENCE_READY":
+    raise SystemExit(2)
+if report.get("result") == "FAIL":
+    raise SystemExit(1)

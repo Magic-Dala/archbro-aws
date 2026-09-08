@@ -19,6 +19,11 @@ from archbro.backend.llm.fake import FakeModelProvider
 from archbro.backend.llm.gemini import GeminiProvider
 from archbro.backend.llm.provider import ModelProvider
 from archbro.platform.persistence.postgres import PostgresProjectRepository
+from archbro.platform.runtime.release_identity import (
+    build_public_readiness_report,
+    build_readiness_report,
+    build_runtime_identity,
+)
 
 load_dotenv()
 
@@ -167,6 +172,7 @@ def create_app(
     webmcp_asset_sha256 = hashlib.sha256(
         (frontend_dir / "archbro-webmcp.js").read_bytes()
     ).hexdigest()
+    runtime_identity_payload = build_runtime_identity(app_root=_project_root())
 
     def connected_mcp_gateway_configured() -> bool:
         raw_connected_mcp = os.getenv("ARCHBRO_MCP_SERVERS_JSON", "").strip()
@@ -201,12 +207,16 @@ def create_app(
 
     @app.middleware("http")
     async def edge_origin_guard(request, call_next):
-        # The container liveness probe runs inside the container and therefore
-        # cannot present the edge token. Exempting it is safe because /healthz
-        # discloses nothing beyond "this process is serving"; without the
-        # exemption the probe gets 403, the container never reports healthy, and
-        # a rolling deploy stalls.
-        if edge_guard_mode == "required" and request.url.path != "/healthz":
+        # Probe endpoints are deliberately non-sensitive and must be callable
+        # from inside the container where the edge token is unavailable. They do
+        # not grant an API principal or expose secret configuration.
+        probe_paths = {"/healthz", "/readyz", "/runtime-identity"}
+        if request.url.path == "/internal/readyz":
+            client_host = request.client.host if request.client is not None else ""
+            if client_host not in {"127.0.0.1", "::1", "localhost"}:
+                return JSONResponse(status_code=403, content={"detail": "internal readiness is loopback-only"})
+            return await call_next(request)
+        if edge_guard_mode == "required" and request.url.path not in probe_paths:
             presented = request.headers.get("X-ArchBro-Edge-Token", "")
             if not presented or not hmac.compare_digest(presented, edge_token):
                 return JSONResponse(status_code=403, content={"detail": "direct origin access is forbidden"})
@@ -241,6 +251,10 @@ def create_app(
             response.headers["Strict-Transport-Security"] = "max-age=86400"
         if request.url.path in {
             "/",
+            "/healthz",
+            "/readyz",
+            "/internal/readyz",
+            "/runtime-identity",
             "/runtime-config.js",
             "/webmcp-manifest.json",
             "/static/app.js",
@@ -254,10 +268,42 @@ def create_app(
     # Container liveness probe. Deliberately does not touch persistence: a probe
     # that fails during a transient database outage makes the orchestrator
     # restart the app while the database is still recovering, turning a short
-    # outage into a restart storm. The database reports its own readiness.
+    # outage into a restart storm. Readiness is reported independently below.
     @app.get("/healthz", include_in_schema=False)
     async def healthz():
         return {"status": "ok"}
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readyz():
+        # Public readiness is intentionally cheap and cannot be used to trigger
+        # database/schema work from outside the runtime boundary.
+        report, ready = build_public_readiness_report(
+            environment=environment,
+            auth_mode=auth_mode,
+            public_firebase_config=public_firebase_config,
+            principal_provider=selected_principal_provider,
+        )
+        return JSONResponse(status_code=200 if ready else 503, content=report)
+
+    @app.get("/internal/readyz", include_in_schema=False)
+    async def internal_readyz():
+        # Deep dependency readiness is loopback-only and bounded to one schema
+        # query. It never calls Gemini/Strands or any paid/live model.
+        report, ready = build_readiness_report(
+            repository=selected_repository,
+            environment=environment,
+            auth_mode=auth_mode,
+            public_firebase_config=public_firebase_config,
+            principal_provider=selected_principal_provider,
+        )
+        return JSONResponse(status_code=200 if ready else 503, content=report)
+
+    @app.get("/runtime-identity", include_in_schema=False)
+    async def runtime_identity():
+        return JSONResponse(
+            content=runtime_identity_payload,
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/", include_in_schema=False)
     async def web_app():

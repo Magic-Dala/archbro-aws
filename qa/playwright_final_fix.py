@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import sys
+import threading
 from dataclasses import asdict
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,9 +17,10 @@ from playwright.sync_api import Browser, BrowserContext, Page, Route, sync_playw
 from playwright_diagnostics import diagnostic_scope, failure_details
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from archbro.backend.agent.node_context import find_architecture_path
 from archbro.backend.core.contracts import Architecture
-from archbro.backend.core.diagram import project_scoped_diagram
-from archbro.backend.core.diagram_layout import layout_diagram
+from archbro.backend.core.diagram import map_edge_ids, project_diagram, project_scoped_diagram
+from archbro.backend.core.diagram_layout import layout_canvas_diagram, layout_diagram
 
 
 BASE_URL = os.getenv("ARCHBRO_BASE_URL", "http://127.0.0.1:8012/")
@@ -64,6 +69,109 @@ def architecture(project_id: str) -> dict:
     }
 
 
+def canvas_architecture(project_id: str) -> dict:
+    return {
+        "project_id": project_id,
+        "version": 7,
+        "summary": "Complete deterministic architecture-canvas interaction fixture.",
+        "components": [
+            {
+                "id": f"{project_id}-core",
+                "name": "Core Platform",
+                "type": "platform",
+                "kind": "SYSTEM",
+                "responsibility": "Own application processing.",
+                "status": "ACCEPTED",
+                "children": [
+                    {
+                        "id": f"{project_id}-api",
+                        "name": "API",
+                        "type": "service",
+                        "kind": "SERVICE",
+                        "responsibility": "Serve canonical requests.",
+                        "status": "ACCEPTED",
+                        "children": [
+                            {
+                                "id": f"{project_id}-validator",
+                                "name": "Validator",
+                                "type": "service",
+                                "kind": "SERVICE",
+                                "responsibility": "Validate request contracts.",
+                                "status": "ACCEPTED",
+                                "children": [],
+                            }
+                        ],
+                    },
+                    {
+                        "id": f"{project_id}-worker",
+                        "name": "Worker",
+                        "type": "service",
+                        "kind": "SERVICE",
+                        "responsibility": "Run unrelated background work.",
+                        "status": "ACCEPTED",
+                        "children": [],
+                    },
+                ],
+            },
+            {
+                "id": f"{project_id}-data",
+                "name": "Data Plane",
+                "type": "data_plane",
+                "kind": "SYSTEM",
+                "responsibility": "Own durable data.",
+                "status": "ACCEPTED",
+                "children": [
+                    {
+                        "id": f"{project_id}-catalog",
+                        "name": "Catalog",
+                        "type": "database",
+                        "kind": "DATA_STORE",
+                        "responsibility": "Persist validated records.",
+                        "status": "ACCEPTED",
+                        "children": [],
+                    }
+                ],
+            },
+            {
+                "id": f"{project_id}-experience",
+                "name": "Experience",
+                "type": "experience",
+                "kind": "SYSTEM",
+                "responsibility": "Own an unrelated user surface.",
+                "status": "ACCEPTED",
+                "children": [
+                    {
+                        "id": f"{project_id}-viewer",
+                        "name": "Viewer",
+                        "type": "ui",
+                        "kind": "UI",
+                        "responsibility": "Render the user experience.",
+                        "status": "ACCEPTED",
+                        "children": [],
+                    }
+                ],
+            },
+        ],
+        "relationships": [
+            {
+                "source": f"{project_id}-validator",
+                "target": f"{project_id}-catalog",
+                "relationship_type": "SQL",
+                "description": "Persist validated records.",
+            },
+            {
+                "source": f"{project_id}-viewer",
+                "target": f"{project_id}-worker",
+                "relationship_type": "HTTPS",
+                "description": "Submit unrelated background work.",
+            },
+        ],
+        "decisions": ["Keep canonical layout owned by the backend."],
+        "risks": [],
+        "assumptions": [],
+    }
+
+
 def task(project_id: str, task_id: str, title: str, status: str = "BLOCKED") -> dict:
     return {
         "id": task_id,
@@ -105,6 +213,8 @@ class FakeBackend:
         }
         self.fail_once: dict[tuple[str, str], int] = {}
         self.event_requests: list[dict] = []
+        self.requests: list[dict[str, str]] = []
+        self.context_manifest_requests: list[dict] = []
         self.event_result = "SUCCESS"
 
     def fail_next(self, method: str, path: str) -> None:
@@ -126,10 +236,192 @@ class FakeBackend:
             "positioned_graph": asdict(layout_diagram(projection.diagram)),
         }
 
+    def full_canvas_payload(self, project_id: str, reading_mode: str = "FULL") -> dict:
+        context = self.contexts[project_id]
+        model = Architecture.model_validate(context["architecture"])
+        full_diagram = project_diagram(model)
+        route_edge_ids = map_edge_ids(full_diagram) if reading_mode == "MAP" else None
+        canvas_layout = layout_canvas_diagram(full_diagram, route_edge_ids=route_edge_ids)
+        diagram = (
+            full_diagram.model_copy(
+                update={"edges": [edge for edge in full_diagram.edges if edge.id in route_edge_ids]}
+            )
+            if route_edge_ids is not None
+            else full_diagram
+        )
+        return {
+            "schema": "archbro.full_canvas.v1",
+            "project_id": project_id,
+            "architecture_version": model.version,
+            "diagram": diagram.model_dump(mode="json"),
+            "positioned_graph": asdict(canvas_layout.graph),
+            "group_frames": [asdict(frame) for frame in canvas_layout.group_frames],
+        }
+
+    def context_manifest_payload(self, project_id: str, request: dict) -> dict:
+        context = self.contexts[project_id]
+        architecture_payload = context["architecture"]
+        component_id = str(request["node_id"]).removeprefix("node:")
+        lineage: list[dict] = []
+
+        def compact(node: dict) -> dict:
+            return {
+                "node_id": f"node:{node['id']}",
+                "component_id": node["id"],
+                "name": node["name"],
+                "type": node["type"],
+                "kind": node.get("kind", "SYSTEM"),
+                "responsibility": node["responsibility"],
+                "status": node.get("status", "ACCEPTED"),
+            }
+
+        def find(nodes: list[dict], trail: list[dict]) -> dict | None:
+            for node in nodes:
+                current = [*trail, node]
+                if node["id"] == component_id:
+                    lineage.extend(compact(item) for item in current)
+                    return node
+                nested = find(node.get("children", []), current)
+                if nested is not None:
+                    return nested
+            return None
+
+        origin = find(architecture_payload.get("components", []), [])
+        if origin is None:
+            raise AssertionError(f"Unknown context manifest node: {component_id}")
+        by_id: dict[str, dict] = {}
+
+        def collect(nodes: list[dict]) -> None:
+            for node in nodes:
+                by_id[node["id"]] = node
+                collect(node.get("children", []))
+
+        collect(architecture_payload.get("components", []))
+        limits = {
+            "ASK_ALL": (1, 8),
+            "ALLOW_NEIGHBORHOOD": (2, 14),
+            "AUTO_BOUNDED": (3, 20),
+        }
+        max_hops, max_results = limits[request["expansion_policy"]]
+        relationships = architecture_payload.get("relationships", [])
+        reached: dict[str, int] = {}
+        queue = [(component_id, 0)]
+        while queue:
+            current, hop = queue.pop(0)
+            if hop >= max_hops:
+                continue
+            for relationship in relationships:
+                peer = None
+                if relationship["source"] == current:
+                    peer = relationship["target"]
+                elif relationship["target"] == current:
+                    peer = relationship["source"]
+                if peer is None or peer == component_id or peer in reached:
+                    continue
+                reached[peer] = hop + 1
+                queue.append((peer, hop + 1))
+        kept = sorted(reached, key=lambda item: (reached[item], item))[:max_results]
+        dependency_nodes = [{**compact(by_id[item]), "hop": reached[item]} for item in kept]
+        allowed = {component_id, *(child["id"] for child in origin.get("children", [])), *kept}
+        dependency_relationships = [
+            {
+                "id": f"relationship:{index}",
+                "source": f"node:{item['source']}",
+                "target": f"node:{item['target']}",
+                "semantic_type": item["relationship_type"],
+                "description": item.get("description", ""),
+            }
+            for index, item in enumerate(relationships)
+            if item["source"] in {component_id, *kept} and item["target"] in {component_id, *kept}
+        ]
+        tasks = [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "description": item.get("description", ""),
+                "status": item["status"],
+                "owner": item.get("owner", "HUMAN"),
+                "source": item.get("source", "ARCHITECTURE"),
+                "related_component": item.get("related_component"),
+                "dependencies": item.get("dependencies", []),
+                "acceptance_criteria": item.get("acceptance_criteria", []),
+            }
+            for item in context.get("tasks", [])
+            if item.get("related_component") in allowed
+        ]
+        manifest = {
+            "schema": "archbro.agent_context_manifest.v1",
+            "project_id": project_id,
+            "architecture_version": architecture_payload["version"],
+            "selection": {
+                **request,
+                "effective_max_hops": max_hops,
+                "effective_max_results": max_results,
+            },
+            "sections": {
+                "project": {
+                    "id": project_id,
+                    "name": context["project"]["name"],
+                    "status": context["project"]["status"],
+                    "goal": context["project"]["goal"],
+                    "architecture_summary": architecture_payload["summary"],
+                },
+                "architecture": {
+                    "origin": compact(origin),
+                    "lineage": lineage,
+                    "children": [compact(child) for child in origin.get("children", [])],
+                    "dependency_context": {
+                        "origin": compact(origin),
+                        "nodes": dependency_nodes,
+                        "relationships": dependency_relationships,
+                        "counts": {
+                            "nodes": len(dependency_nodes),
+                            "relationships": len(dependency_relationships),
+                            "max_hop": max(reached.values(), default=0),
+                        },
+                        "truncated": len(reached) > max_results,
+                        "limit_reason": "MAX_RESULTS" if len(reached) > max_results else None,
+                    },
+                },
+                "tasks": tasks,
+                "pending_proposals": [],
+                "evidence": [],
+                "code_truth": {"status": "NO_SNAPSHOT", "chunks": []},
+                "mcp_refs": [],
+            },
+            "budget": {
+                "max_chars": 24000,
+                "max_estimated_input_tokens": 6000,
+                "max_evidence_records": 12,
+                "max_code_truth_chunks": 12,
+            },
+            "usage": {
+                "selected_node_count": 1,
+                "context_chars": 0,
+                "estimated_input_tokens": 0,
+                "task_count": len(tasks),
+                "evidence_count": 0,
+                "mcp_result_count": 0,
+                "code_truth_chunk_count": 0,
+                "expansion_count": max(0, max(reached.values(), default=0) - 1),
+                "truncated": len(reached) > max_results,
+                "limit_reasons": ["MAX_RESULTS"] if len(reached) > max_results else [],
+            },
+            "manifest_hash": "0" * 64,
+        }
+        manifest["usage"]["context_chars"] = len(json.dumps(manifest, sort_keys=True))
+        manifest["usage"]["estimated_input_tokens"] = (manifest["usage"]["context_chars"] + 3) // 4
+        digest_payload = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+        manifest["manifest_hash"] = hashlib.sha256(
+            json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return manifest
+
     def handle(self, route: Route) -> None:
         request = route.request
         method = request.method
         path = urlsplit(request.url).path
+        self.requests.append({"method": method, "path": path, "url": request.url})
         key = (method, path)
         if self.fail_once.get(key, 0):
             self.fail_once[key] -= 1
@@ -199,8 +491,44 @@ class FakeBackend:
                 return
             self.json(route, self.scoped_diagram_payload(project_id, scope))
             return
+        if parts[2:] == ["architecture", "canvas"] and method == "GET":
+            query = parse_qs(urlsplit(request.url).query)
+            expected = query.get("expected_architecture_version", [None])[0]
+            reading_mode = query.get("reading_mode", ["FULL"])[0]
+            current_version = int(context["architecture"].get("version", 0))
+            if expected is not None and int(expected) != current_version:
+                self.json(route, {"detail": {"code": "stale_architecture_version", "expected_architecture_version": int(expected), "current_architecture_version": current_version}}, 409)
+                return
+            self.json(route, self.full_canvas_payload(project_id, reading_mode))
+            return
+        if parts[2:] == ["architecture", "path"] and method == "GET":
+            query = parse_qs(urlsplit(request.url).query)
+            source_id = query.get("source_id", [""])[0]
+            target_id = query.get("target_id", [""])[0]
+            max_hops = int(query.get("max_hops", ["8"])[0])
+            expected = query.get("expected_architecture_version", [None])[0]
+            current_version = int(context["architecture"].get("version", 0))
+            if expected is not None and int(expected) != current_version:
+                self.json(route, {"detail": {"error": "stale_architecture_version", "expected_architecture_version": int(expected), "current_architecture_version": current_version}}, 409)
+                return
+            payload = find_architecture_path(
+                Architecture.model_validate(context["architecture"]),
+                project_id,
+                source_id,
+                target_id,
+                max_hops=max_hops,
+                expected_architecture_version=current_version,
+            )
+            self.json(route, payload)
+            return
         if parts[2:] == ["architecture", "proposals"] and method == "GET":
             self.json(route, context["proposals"])
+            return
+        if parts[2:] == ["agent-context", "manifest"] and method == "POST":
+            body = request.post_data_json
+            manifest = self.context_manifest_payload(project_id, body)
+            self.context_manifest_requests.append({"request": copy.deepcopy(body), "manifest": copy.deepcopy(manifest)})
+            self.json(route, manifest)
             return
         if parts[2:] == ["code-architecture", "latest"] and method == "GET":
             route.fulfill(status=204, body="")
@@ -210,7 +538,25 @@ class FakeBackend:
             return
         if parts[2:] == ["events"] and method == "POST":
             body = request.post_data_json
-            self.event_requests.append({"path": path, "body": body})
+            context_request = body.get("payload", {}).get("agent_context_request")
+            manifest = None
+            if context_request:
+                manifest_request = {
+                    key: value
+                    for key, value in context_request.items()
+                    if key != "preview_manifest_hash"
+                }
+                manifest = self.context_manifest_payload(project_id, manifest_request)
+                if manifest["manifest_hash"] != context_request["preview_manifest_hash"]:
+                    self.json(route, {
+                        "detail": {
+                            "error": "agent_context_preview_stale",
+                            "expected_manifest_hash": context_request["preview_manifest_hash"],
+                            "current_manifest_hash": manifest["manifest_hash"],
+                        }
+                    }, 409)
+                    return
+            self.event_requests.append({"path": path, "body": copy.deepcopy(body), "server_manifest": copy.deepcopy(manifest)})
             if body.get("payload", {}).get("intent") == "INITIAL_ARCHITECTURE":
                 context["architecture"] = architecture(project_id)
             result = {
@@ -221,6 +567,12 @@ class FakeBackend:
                 "actions": [],
                 "architecture_review_required": False,
                 "error": "Fixture agent error." if self.event_result == "ERROR" else None,
+                "context_telemetry": (
+                    {**manifest["usage"], "manifest_hash": manifest["manifest_hash"], "architecture_version": manifest["architecture_version"], "selection": manifest["selection"]}
+                    if manifest is not None
+                    else None
+                ),
+                "provider_usage": {"input_tokens": 1234, "output_tokens": 56} if manifest is not None else None,
             }
             self.json(route, result)
             return
@@ -761,6 +1113,368 @@ def case_architecture_inspector_disclosure(browser: Browser) -> None:
         assert not errors, errors
 
 
+def case_architecture_canvas_interactions(browser: Browser) -> None:
+    project_id = "canvas-flow"
+    backend = FakeBackend([project(project_id, "Architecture Canvas Flow")])
+    backend.contexts[project_id]["architecture"] = canvas_architecture(project_id)
+    identity = "email:canvas-flow@example.com"
+    context, page, errors = open_page(
+        browser,
+        backend,
+        viewport={"width": 1440, "height": 900},
+        identity=identity,
+        project_id=project_id,
+    )
+    with diagnostic_scope(context.close):
+        api_id = f"{project_id}-api"
+        validator_id = f"{project_id}-validator"
+        core_id = f"{project_id}-core"
+        catalog_id = f"{project_id}-catalog"
+        data_id = f"{project_id}-data"
+        viewer_id = f"{project_id}-viewer"
+        worker_id = f"{project_id}-worker"
+        page.goto(
+            f"{BASE_URL}?canvas=architecture&project={project_id}&node={api_id}&tab=dependencies",
+            wait_until="networkidle",
+        )
+        page.locator("#view-architecture").wait_for(state="visible")
+        page.locator(".living-graph-svg").wait_for(state="visible")
+
+        api_node = page.locator(f'[data-component="{api_id}"]')
+        api_node.wait_for(state="visible")
+        assert "selected" in (api_node.get_attribute("class") or "")
+        assert page.locator('[data-inspector-tab="dependencies"]').get_attribute("aria-pressed") == "true"
+        assert page.locator(".node-card[data-node]").count() == 8
+        centered = page.evaluate(
+            f"""
+            () => {{
+              const node = document.querySelector('[data-component="{api_id}"]')?.getBoundingClientRect();
+              const svgElement = document.querySelector('.living-graph-svg');
+              const svg = svgElement?.getBoundingClientRect();
+              const graphNode = document.querySelector('[data-component="{api_id}"]')?.getBBox();
+              const viewBox = svgElement?.viewBox?.baseVal;
+              if (!node || !svg || !graphNode || !viewBox) return null;
+              return {{dx:Math.abs((node.left+node.width/2)-(svg.left+svg.width/2)),dy:Math.abs((node.top+node.height/2)-(svg.top+svg.height/2)),width:svg.width,height:svg.height,graphDx:Math.abs((graphNode.x+graphNode.width/2)-(viewBox.x+viewBox.width/2)),graphDy:Math.abs((graphNode.y+graphNode.height/2)-(viewBox.y+viewBox.height/2)),viewBox:svgElement.getAttribute('viewBox'),fitViewBox:svgElement.dataset.fitViewBox}};
+            }}
+            """
+        )
+        assert centered and centered["graphDx"] < 1 and centered["graphDy"] < 1, centered
+
+        # Viewport controls are browser behavior, not source assertions. Fit
+        # returns to the backend-authored graph bounds; 100% maps one graph unit
+        # to one CSS pixel; +/- and wheel change disclosure without topology;
+        # background drag pans by moving only the local viewBox.
+        canvas = page.locator("#graphCanvas")
+        viewport_svg = page.locator(".living-graph-svg")
+
+        def current_view_box() -> list[float]:
+            return viewport_svg.evaluate(
+                "svg => { const box=svg.viewBox.baseVal; return [box.x,box.y,box.width,box.height]; }"
+            )
+
+        fit_view_box = [float(value) for value in (viewport_svg.get_attribute("data-fit-view-box") or "").split()]
+        page.locator('[data-graph-viewport="fit"]').click()
+        assert current_view_box() == fit_view_box
+        page.locator('[data-graph-viewport="actual"]').click()
+        page.wait_for_function("() => document.querySelector('[data-graph-zoom]')?.textContent === '100%'")
+        assert canvas.get_attribute("data-zoom-tier") == "detail"
+        # Visibility alone ignores opacity: assert the actual rendered detail
+        # for selected and unselected nodes, not just the zoom-tier attribute.
+        page.wait_for_function(
+            """() => [...document.querySelectorAll('.node-card .graph-detail-read')]
+              .every(node => getComputedStyle(node).opacity === '1') &&
+              [...document.querySelectorAll('.node-card .graph-detail-full')]
+              .every(node => getComputedStyle(node).opacity === '0')""",
+            timeout=2000,
+        )
+        page.locator('[data-graph-viewport="zoom-in"]').click()
+        assert canvas.get_attribute("data-zoom-tier") == "full"
+        page.wait_for_function(
+            """() => [...document.querySelectorAll('.node-card .graph-detail-read, .node-card .graph-detail-full')]
+              .every(node => getComputedStyle(node).opacity === '1')""",
+            timeout=2000,
+        )
+        for _ in range(4):
+            page.locator('[data-graph-viewport="zoom-out"]').click()
+        assert canvas.get_attribute("data-zoom-tier") == "overview"
+        page.wait_for_function(
+            """() => [...document.querySelectorAll('.node-card .graph-detail-read, .node-card .graph-detail-full')]
+              .every(node => getComputedStyle(node).opacity === '0' && getComputedStyle(node).pointerEvents === 'none')""",
+            timeout=2000,
+        )
+
+        page.locator('[data-graph-viewport="actual"]').click()
+        wheel_before = current_view_box()
+        svg_box = viewport_svg.bounding_box()
+        assert svg_box
+        page.mouse.move(svg_box["x"] + svg_box["width"] / 2, svg_box["y"] + svg_box["height"] / 2)
+        page.mouse.wheel(0, -240)
+        wheel_after = current_view_box()
+        assert wheel_after[2] < wheel_before[2], (wheel_before, wheel_after)
+
+        pan_before = current_view_box()
+        page.mouse.move(svg_box["x"] + 8, svg_box["y"] + 8)
+        page.mouse.down()
+        page.mouse.move(svg_box["x"] + 88, svg_box["y"] + 48)
+        page.mouse.up()
+        pan_after = current_view_box()
+        assert pan_after[:2] != pan_before[:2], (pan_before, pan_after)
+        page.locator('[data-graph-viewport="fit"]').click()
+        assert current_view_box() == fit_view_box
+
+        context_tray = page.locator("#agentContextTray")
+        context_tray.wait_for(state="visible")
+        page.wait_for_function(
+            "() => document.querySelector('#agentContextTrayBody')?.textContent.includes('Within budget')"
+        )
+        assert page.locator("#agentContextTrayTitle").inner_text() == "API"
+        tray_text = page.locator("#agentContextTrayBody").inner_text()
+        for expected in [
+            "SELECTION",
+            "API",
+            "PARENT",
+            "Core Platform",
+            "CHILDREN",
+            "Validator",
+            "DEPENDENCY NEIGHBORHOOD",
+            "CODE TRUTH",
+            "NO_SNAPSHOT",
+            "Not included until explicitly gathered",
+            "ASK_ALL",
+        ]:
+            assert expected in tray_text, (expected, tray_text)
+        assert backend.context_manifest_requests[-1]["request"] == {
+            "node_id": f"node:{api_id}",
+            "direction": "both",
+            "expansion_policy": "ASK_ALL",
+            "expected_architecture_version": 7,
+        }
+
+        preview_count = len(backend.context_manifest_requests)
+        page.locator("#agentContextPolicy").select_option("ALLOW_NEIGHBORHOOD")
+        page.wait_for_function(
+            "() => document.querySelector('#agentContextTrayBody')?.textContent.includes('ALLOW_NEIGHBORHOOD')",
+            arg=preview_count,
+        )
+        assert len(backend.context_manifest_requests) > preview_count
+        assert backend.context_manifest_requests[-1]["request"]["expansion_policy"] == "ALLOW_NEIGHBORHOOD"
+        page.locator("#agentContextTelemetryToggle").click()
+        assert page.locator(".agent-context-telemetry").count() == 0
+        page.locator("#agentContextTelemetryToggle").click()
+        assert page.locator(".agent-context-telemetry").count() == 1
+
+        # The UI sends only request + preview hash. A project fact changed after
+        # preview must fail closed before the fake provider is accepted, preserve
+        # the message, and rebuild the preview for a deliberate retry.
+        stale_preview_hash = backend.context_manifest_requests[-1]["manifest"]["manifest_hash"]
+        new_context_task = task(project_id, "task-context-new", "New bounded API fact", "TODO")
+        new_context_task["related_component"] = api_id
+        backend.contexts[project_id]["tasks"].append(new_context_task)
+        bounded_message = "Review the selected API boundary using only the previewed context."
+        page.locator("#instruction").fill(bounded_message)
+        page.locator("#instructionForm button[type='submit']").click()
+        page.wait_for_function(
+            "() => document.querySelector('#toast')?.textContent.includes('agent_context_preview_stale')"
+        )
+        assert page.locator("#instruction").input_value() == bounded_message
+        assert backend.event_requests == []
+        page.wait_for_function(
+            "oldHash => document.querySelector('#agentContextTrayBody code')?.textContent !== oldHash.slice(0, 12)",
+            arg=stale_preview_hash,
+        )
+
+        page.locator("#instructionForm button[type='submit']").click()
+        page.wait_for_function("() => document.querySelector('#instruction')?.value === ''")
+        assert len(backend.event_requests) == 1
+        sent = backend.event_requests[0]
+        sent_payload = sent["body"]["payload"]
+        assert sent_payload["message"] == bounded_message
+        assert "agent_context_manifest" not in sent_payload
+        assert sent_payload["agent_context_request"]["node_id"] == f"node:{api_id}"
+        assert sent_payload["agent_context_request"]["expansion_policy"] == "ALLOW_NEIGHBORHOOD"
+        assert sent_payload["agent_context_request"]["preview_manifest_hash"] == sent["server_manifest"]["manifest_hash"]
+        page.wait_for_function(
+            "() => document.querySelector('#agentContextTrayBody')?.textContent.includes('1,234 tokens')"
+        )
+        assert "New bounded API fact" in page.locator("#agentContextTrayBody").inner_text()
+
+        # Explore from here uses the same exact server-owned manifest contract as
+        # Ask Agent: selected node + architecture version + preview hash only.
+        with page.expect_response(
+            lambda response: response.request.method == "GET"
+            and urlsplit(response.url).path == f"/projects/{project_id}/architecture/canvas"
+        ) as explore_refresh_response:
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and urlsplit(response.url).path == f"/projects/{project_id}/events"
+            ) as explore_response:
+                page.locator('[data-agent-explore]').click()
+        assert explore_response.value.status == 200
+        assert explore_refresh_response.value.status == 200
+        assert len(backend.event_requests) == 2
+        explored = backend.event_requests[-1]
+        explored_payload = explored["body"]["payload"]
+        assert explored_payload["message"] == "Explore from here: API"
+        assert explored_payload["agent_context_request"]["node_id"] == f"node:{api_id}"
+        assert explored_payload["agent_context_request"]["expected_architecture_version"] == 7
+        assert explored_payload["agent_context_request"]["preview_manifest_hash"] == explored["server_manifest"]["manifest_hash"]
+        assert "agent_context_manifest" not in explored_payload
+
+        canvas_reads = lambda: len([item for item in backend.requests if item["method"] == "GET" and item["path"] == f"/projects/{project_id}/architecture/canvas"])
+        reads_before_tabs = canvas_reads()
+        for tab in ("tasks", "evidence", "code", "decisions", "overview", "dependencies"):
+            page.locator(f'[data-inspector-tab="{tab}"]').click()
+            assert page.locator(f'[data-inspector-tab="{tab}"]').get_attribute("aria-pressed") == "true"
+        assert canvas_reads() == reads_before_tabs
+
+        validator_node = page.locator(f'[data-component="{validator_id}"]')
+        validator_node.click(force=True)
+        assert "selected" in (validator_node.get_attribute("class") or "")
+        assert page.locator(".graph-edge.selected").count() == 0
+
+        # Trace Path consumes the backend-authored directed-path endpoint. The
+        # browser only highlights returned node/relationship IDs; it never walks
+        # the graph to invent a route.
+        path_reads_before = len([
+            item for item in backend.requests
+            if item["method"] == "GET" and item["path"] == f"/projects/{project_id}/architecture/path"
+        ])
+        page.locator('[data-trace-target]').select_option(f"node:{catalog_id}")
+        page.locator('[data-trace-path]').click()
+        page.wait_for_function(
+            "() => document.querySelector('[data-trace-status]')?.textContent.includes('FOUND')"
+        )
+        path_reads = [
+            item for item in backend.requests
+            if item["method"] == "GET" and item["path"] == f"/projects/{project_id}/architecture/path"
+        ]
+        assert len(path_reads) == path_reads_before + 1
+        trace_query = parse_qs(urlsplit(path_reads[-1]["url"]).query)
+        assert trace_query == {
+            "source_id": [f"node:{validator_id}"],
+            "target_id": [f"node:{catalog_id}"],
+            "max_hops": ["8"],
+            "expected_architecture_version": ["7"],
+        }
+        assert "1 hop" in page.locator('[data-trace-status]').inner_text()
+        assert "is-dimmed" not in (page.locator(f'[data-component="{validator_id}"]').get_attribute("class") or "")
+        assert "is-dimmed" not in (page.locator(f'[data-component="{catalog_id}"]').get_attribute("class") or "")
+        assert "is-dimmed" in (page.locator(f'[data-component="{viewer_id}"]').get_attribute("class") or "")
+
+        page.locator(f'[data-component="{catalog_id}"]').click(force=True)
+        page.locator('[data-trace-target]').select_option(f"node:{validator_id}")
+        page.locator('[data-trace-path]').click()
+        page.wait_for_function(
+            "() => document.querySelector('[data-trace-status]')?.textContent.includes('No authored directed path')"
+        )
+        page.locator(f'[data-component="{validator_id}"]').click(force=True)
+
+        selected_edge = page.locator(".graph-edge[data-edge]").first
+        selected_edge.click(force=True)
+        assert page.locator(".graph-edge.selected").count() == 1
+        assert page.locator(".node-card.selected").count() == 0
+        assert "SELECTED RELATIONSHIP" in page.locator("#selectedNode").inner_text()
+        page.locator('[data-inspector-tab="dependencies"]').click()
+        page.locator("[data-inspect-component]").first.click()
+        assert page.locator(".node-card.selected").count() == 1
+        assert page.locator(".graph-edge.selected").count() == 0
+
+        api_node = page.locator(f'[data-component="{api_id}"]')
+        api_node.click(force=True)
+        page.locator('[data-graph-focus="hierarchy"]').click()
+        assert page.locator(f'[data-component="{validator_id}"]').is_visible()
+        assert page.locator(f'[data-component="{viewer_id}"]').is_visible()
+        assert "is-dimmed" in (page.locator(f'[data-component="{viewer_id}"]').get_attribute("class") or "")
+
+        page.locator('[data-graph-focus="isolate"]').click()
+        for visible_component in (api_id, validator_id, core_id, catalog_id, data_id):
+            assert page.locator(f'[data-component="{visible_component}"]').is_visible(), visible_component
+        for hidden_component in (viewer_id, worker_id):
+            assert page.locator(f'[data-component="{hidden_component}"]').is_hidden(), hidden_component
+        assert "is-boundary-context" in (page.locator(f'[data-component="{catalog_id}"]').get_attribute("class") or "")
+        assert "is-boundary-context" in (page.locator(f'[data-component="{data_id}"]').get_attribute("class") or "")
+        assert page.locator(".graph-edge[data-edge]:visible").count() == 1
+
+        page.locator('[data-graph-focus="clear"]').click()
+        assert page.locator(".node-card[data-node]:visible").count() == 8
+        assert page.locator(".graph-edge[data-edge]:visible").count() == 2
+        assert canvas_reads() == reads_before_tabs
+
+        validator_geometry = page.locator(f'[data-component="{validator_id}"]').evaluate(
+            "el => { const box=el.getBBox(); return [box.x,box.y,box.width,box.height]; }"
+        )
+        page.locator(f'[data-component="{api_id}"]').click(force=True)
+        page.locator('[data-toggle-collapse]').click()
+        api_node = page.locator(f'[data-component="{api_id}"]')
+        assert api_node.get_attribute("data-collapsed") == "true"
+        assert page.locator(f'[data-component="{validator_id}"]').count() == 0
+        assert page.locator('[data-expand-all]').is_visible()
+        collapsed_sql = page.locator('.graph-edge.relationship-data')
+        assert collapsed_sql.is_visible()
+        assert "projection-collapsed" in (collapsed_sql.get_attribute("class") or "")
+        collapsed_sql.focus()
+        page.keyboard.press("Enter")
+        relationship_heading = page.locator("#selectedNode h3").inner_text()
+        assert "Validator" in relationship_heading and "Catalog" in relationship_heading, relationship_heading
+
+        # Inspecting a hidden canonical endpoint expands only its collapsed
+        # ancestor, then selects the original canonical node.
+        page.locator('[data-inspector-tab="dependencies"]').click()
+        page.locator(f'[data-inspect-component="{validator_id}"]').click()
+        validator_node = page.locator(f'[data-component="{validator_id}"]')
+        assert validator_node.is_visible()
+        assert "selected" in (validator_node.get_attribute("class") or "")
+        assert page.locator(f'[data-component="{api_id}"]').get_attribute("data-collapsed") == "false"
+        assert validator_node.evaluate(
+            "el => { const box=el.getBBox(); return [box.x,box.y,box.width,box.height]; }"
+        ) == validator_geometry
+
+        # Expand all is the explicit reset and restores exact backend geometry.
+        page.locator(f'[data-component="{api_id}"]').click(force=True)
+        page.locator('[data-toggle-collapse]').click()
+        assert page.locator('[data-expand-all]').is_visible()
+        page.locator('[data-expand-all]').click()
+        assert page.locator('[data-expand-all]').count() == 0
+        assert page.locator(f'[data-component="{validator_id}"]').evaluate(
+            "el => { const box=el.getBBox(); return [box.x,box.y,box.width,box.height]; }"
+        ) == validator_geometry
+
+        # Collapse composes after canonical projection and before Isolate:
+        # the hidden descendant stays hidden while its crossing dependency and
+        # external boundary context remain inspectable.
+        page.locator(f'[data-component="{api_id}"]').click(force=True)
+        page.locator('[data-toggle-collapse]').click()
+        page.locator('[data-graph-focus="isolate"]').click()
+        for visible_component in (api_id, core_id, catalog_id, data_id):
+            assert page.locator(f'[data-component="{visible_component}"]').is_visible(), visible_component
+        for hidden_component in (validator_id, viewer_id, worker_id):
+            assert page.locator(f'[data-component="{hidden_component}"]').count() == 0 or page.locator(f'[data-component="{hidden_component}"]').is_hidden(), hidden_component
+        assert page.locator('.graph-edge.relationship-data:visible').count() == 1
+        page.locator('[data-graph-focus="clear"]').click()
+        assert page.locator(".node-card[data-node]:visible").count() == 7
+        page.locator('[data-expand-all]').click()
+        assert page.locator(".node-card[data-node]:visible").count() == 8
+        assert canvas_reads() == reads_before_tabs
+
+        page.goto(
+            f"{BASE_URL}?canvas=architecture&project={project_id}&node=missing-node&tab=code",
+            wait_until="networkidle",
+        )
+        page.locator("#view-architecture").wait_for(state="visible")
+        assert page.locator(".node-card.selected").count() == 0
+        assert page.locator(".node-card[data-node]:visible").count() == 8
+        assert page.locator('[data-collapsed="true"]').count() == 0
+        assert "CURRENT SCOPE" in page.locator("#selectedNode").inner_text()
+        assert len(backend.event_requests) == 2
+        architecture_mutations = [
+            item
+            for item in backend.requests
+            if "/architecture" in item["path"] and item["method"] != "GET"
+        ]
+        assert architecture_mutations == []
+        assert not errors, errors
+
+
 def case_instruction_failure(browser: Browser) -> None:
     backend = FakeBackend([project("alpha", "Instruction Project")])
     backend.contexts["alpha"]["tasks"] = [task("alpha", "task-a", "Preserve this context", "TODO")]
@@ -1262,6 +1976,7 @@ CASES = [
     ("keyboard_and_mobile_layers", case_keyboard_and_mobile_layers),
     ("task_architecture_navigation", case_task_architecture_navigation),
     ("architecture_inspector_disclosure", case_architecture_inspector_disclosure),
+    ("architecture_canvas_interactions", case_architecture_canvas_interactions),
     ("instruction_failure", case_instruction_failure),
     ("inline_rename_and_account", case_inline_rename_and_account),
     ("project_row_action_menu", case_project_row_action_menu),
@@ -1269,37 +1984,79 @@ CASES = [
 
 
 report = {"result": "RUNNING", "base_url": BASE_URL, "cases": [], "failures": []}
-requested = {name for name in os.getenv("ARCHBRO_FINAL_FIX_CASES", "").split(",") if name}
 
-with sync_playwright() as playwright:
-    browser = playwright.chromium.launch(headless=True)
+
+def run_cases(requested: set[str] | None = None) -> dict:
+    global report
+    requested = requested or set()
+    report = {"result": "RUNNING", "base_url": BASE_URL, "cases": [], "failures": []}
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            for name, case in CASES:
+                if requested and name not in requested:
+                    continue
+                print("CASE", name, flush=True)
+                try:
+                    case(browser)
+                    report["cases"].append({"name": name, "result": "PASS"})
+                    print("CASE_PASS", name, flush=True)
+                except Exception as exc:
+                    details = getattr(exc, "archbro_failure_details", None) or failure_details(exc)
+                    failure = f"{details['type']}: {details['message']}"
+                    entry = {"name": name, "result": "FAIL", "failure": failure, **details}
+                    report["cases"].append(entry)
+                    report["failures"].append(entry.copy())
+                    print("CASE_FAIL", name, failure, flush=True)
+                    print(
+                        "CASE_DIAGNOSTIC",
+                        json.dumps({key: details[key] for key in ["file", "line", "assertion", "values"]}),
+                        flush=True,
+                    )
+                    print(details["traceback"], flush=True)
+        finally:
+            browser.close()
+    report["result"] = "PASS" if not report["failures"] else "FAIL"
+    REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def test_s2_04_architecture_canvas_interactions_browser() -> None:
+    global BASE_URL
+    original_base_url = BASE_URL
+    web_root = Path(__file__).resolve().parents[1] / "frontend" / "web"
+    class LaneStaticHandler(SimpleHTTPRequestHandler):
+        def translate_path(self, path: str) -> str:
+            if path.startswith("/static/"):
+                path = path[len("/static/"):]
+            return super().translate_path(path)
+
+    handler = partial(LaneStaticHandler, directory=str(web_root))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    BASE_URL = f"http://127.0.0.1:{server.server_port}/"
     try:
-        for name, case in CASES:
-            if requested and name not in requested:
-                continue
-            print("CASE", name, flush=True)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
             try:
-                case(browser)
-                report["cases"].append({"name": name, "result": "PASS"})
-                print("CASE_PASS", name, flush=True)
-            except Exception as exc:
-                details = getattr(exc, "archbro_failure_details", None) or failure_details(exc)
-                failure = f"{details['type']}: {details['message']}"
-                entry = {"name": name, "result": "FAIL", "failure": failure, **details}
-                report["cases"].append(entry)
-                report["failures"].append(entry.copy())
-                print("CASE_FAIL", name, failure, flush=True)
-                print(
-                    "CASE_DIAGNOSTIC",
-                    json.dumps({key: details[key] for key in ["file", "line", "assertion", "values"]}),
-                    flush=True,
-                )
-                print(details["traceback"], flush=True)
+                case_architecture_canvas_interactions(browser)
+            finally:
+                browser.close()
     finally:
-        browser.close()
+        BASE_URL = original_base_url
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
-report["result"] = "PASS" if not report["failures"] else "FAIL"
-REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
-if report["failures"]:
-    raise AssertionError(f"{len(report['failures'])} final-fix browser case(s) failed")
-print("FINAL_FIX_PLAYWRIGHT_PASS", json.dumps({"cases": len(report["cases"])}), flush=True)
+
+def main() -> None:
+    requested = {name for name in os.getenv("ARCHBRO_FINAL_FIX_CASES", "").split(",") if name}
+    final_report = run_cases(requested)
+    if final_report["failures"]:
+        raise AssertionError(f"{len(final_report['failures'])} final-fix browser case(s) failed")
+    print("FINAL_FIX_PLAYWRIGHT_PASS", json.dumps({"cases": len(final_report["cases"])}), flush=True)
+
+
+if __name__ == "__main__":
+    main()
