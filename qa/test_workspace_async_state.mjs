@@ -176,7 +176,7 @@ test('workspace recovery and optional-resource retry controls are wired into the
   assert.match(app, /data-retry-workspace-resource="canvas"/);
   assert.match(app, /data-retry-workspace-resource="codeArchitecture"/);
   assert.match(app, /resource\.refreshing \? ' · refreshing' : ''/);
-  const controls = app.slice(app.indexOf('function graphViewportControlsMarkup()'), app.indexOf('function graphViewportWithAspect('));
+  const controls = app.slice(app.indexOf('function graphViewportControlsMarkup('), app.indexOf('function graphViewportWithAspect('));
   assert.match(controls, /resource\?\.status === 'error'/);
   assert.match(controls, /graph-resource-tools/);
   assert.match(controls, /data-retry-workspace-resource/);

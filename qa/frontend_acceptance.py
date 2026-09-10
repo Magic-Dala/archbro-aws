@@ -354,6 +354,7 @@ def run(open_report: bool = False, stage3: bool = False) -> int:
     port = free_port()
     base_url = f"http://127.0.0.1:{port}/"
     env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
     source_root = str(ROOT / "src")
     env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["ARCHBRO_PROVIDER"] = "fake"
@@ -394,6 +395,8 @@ def run(open_report: bool = False, stage3: bool = False) -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     test_exit_code = 1
@@ -404,13 +407,15 @@ def run(open_report: bool = False, stage3: bool = False) -> int:
         wait_for_health(server, base_url)
         test_env = env.copy()
         test_env["ARCHBRO_BASE_URL"] = base_url
-        test_env["ARCHBRO_FINAL_FIX_CASES"] = "autonomous_surface_sweep,architecture_canvas_interactions"
+        test_env["ARCHBRO_FINAL_FIX_CASES"] = "autonomous_surface_sweep,architecture_inspector_disclosure,architecture_canvas_interactions"
         completed = subprocess.run(
             [sys.executable, str(ROOT / "qa" / "playwright_final_fix.py")],
             cwd=ROOT,
             env=test_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         test_exit_code = completed.returncode
@@ -425,6 +430,8 @@ def run(open_report: bool = False, stage3: bool = False) -> int:
             env=drill_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
         test_stdout += f"\n\nHIERARCHY_DRILL_STDOUT\n{drill.stdout}"

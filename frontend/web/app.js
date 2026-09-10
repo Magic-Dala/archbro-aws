@@ -210,6 +210,7 @@ const state = {
     workingRequestId: null,
     lastError: null,
   },
+  graphTransitionGeneration: 0,
   navigation: {
     generation: 0,
     initialized: false,
@@ -284,6 +285,7 @@ function readNavigationRoute(locationLike = window.location, {useStorageFallback
 
 function beginNavigationTransition(projectId = state.projectId) {
   state.navigation.generation += 1;
+  state.graphTransitionGeneration += 1;
   // Advancing navigation immediately hides work owned by the previous project.
   // The request itself keeps its token and will retire only that token when it
   // eventually settles, so it cannot clear a newer project's indicator.
@@ -375,34 +377,126 @@ function isSupersededNavigationError(error) {
   return error?.code === 'ARCHBRO_NAVIGATION_SUPERSEDED';
 }
 
-const architectureViewCache = {
-  projectId: null,
-  architectureVersion: null,
-  canvas: null,
-  project: null,
-};
+const architectureViewCache = new Map();
+
+function normalizedArchitectureReadingMode(readingMode) {
+  return ['MAP','READ','FULL'].includes(readingMode) ? readingMode : 'MAP';
+}
+
+function architectureViewCacheKey(surface, projectId, architectureVersion, scopeComponentId = null, readingMode = 'MAP') {
+  const normalizedSurface = surface === 'canvas' ? 'canvas' : 'project';
+  const scope = normalizedSurface === 'canvas' ? 'ROOT' : (scopeComponentId || 'ROOT');
+  return `${projectId || ''}|${Number(architectureVersion) || 0}|${normalizedSurface}|${scope}|${normalizedArchitectureReadingMode(readingMode)}`;
+}
 
 function resetArchitectureViewCache(projectId, architectureVersion) {
   const version = Number(architectureVersion) || 0;
-  if (architectureViewCache.projectId !== projectId || architectureViewCache.architectureVersion !== version) {
-    architectureViewCache.projectId = projectId;
-    architectureViewCache.architectureVersion = version;
-    architectureViewCache.canvas = null;
-    architectureViewCache.project = null;
+  for (const [key, entry] of architectureViewCache.entries()) {
+    if (entry.projectId === projectId && entry.architectureVersion !== version) architectureViewCache.delete(key);
   }
   return architectureViewCache;
 }
 
-function cacheArchitectureView(kind, projectId, architectureVersion, diagram) {
-  if (!['canvas','project'].includes(kind) || !diagram) return diagram;
-  resetArchitectureViewCache(projectId, architectureVersion)[kind] = diagram;
+function invalidateArchitectureViewCache(projectId) {
+  for (const [key, entry] of architectureViewCache.entries()) {
+    if (entry.projectId === projectId) architectureViewCache.delete(key);
+  }
+  return architectureViewCache;
+}
+
+function cacheArchitectureView(surface, projectId, architectureVersion, scopeComponentId = null, readingMode = 'MAP', diagram = null) {
+  // Compatibility with the pre-Task-4 four-argument form while callers migrate
+  // to exact projection identity.
+  if (diagram == null && scopeComponentId && typeof scopeComponentId === 'object') {
+    diagram = scopeComponentId;
+    scopeComponentId = null;
+    readingMode = 'MAP';
+  }
+  if (!diagram || !['canvas','project'].includes(surface)) return diagram;
+  const version = Number(architectureVersion) || 0;
+  resetArchitectureViewCache(projectId, version);
+  architectureViewCache.set(
+    architectureViewCacheKey(surface, projectId, version, scopeComponentId, readingMode),
+    {projectId, architectureVersion:version, surface, scopeComponentId:scopeComponentId || null, readingMode:normalizedArchitectureReadingMode(readingMode), diagram},
+  );
   return diagram;
 }
 
-function cachedArchitectureView(kind, projectId, architectureVersion) {
-  const version = Number(architectureVersion) || 0;
-  if (architectureViewCache.projectId !== projectId || architectureViewCache.architectureVersion !== version) return null;
-  return architectureViewCache[kind] || null;
+function cachedArchitectureView(surface, projectId, architectureVersion, scopeComponentId = null, readingMode = 'MAP') {
+  return architectureViewCache.get(architectureViewCacheKey(surface, projectId, architectureVersion, scopeComponentId, readingMode))?.diagram || null;
+}
+
+function beginGraphTransition({projectId = state.projectId, architectureVersion = state.architecture?.version, surface = ARCHITECTURE_CANVAS_MODE ? 'canvas' : 'project', scopeComponentId = state.scopeComponentId, readingMode = state.readingMode} = {}) {
+  return {
+    generation: ++state.graphTransitionGeneration,
+    projectId: projectId || null,
+    architectureVersion: Number(architectureVersion) || 0,
+    surface,
+    scopeComponentId: scopeComponentId || null,
+    readingMode: normalizedArchitectureReadingMode(readingMode),
+  };
+}
+
+function graphTransitionIsCurrent(transition) {
+  return Boolean(transition)
+    && transition.generation === state.graphTransitionGeneration
+    && (transition.projectId || null) === (state.projectId || null)
+    && Number(transition.architectureVersion || 0) === Number(state.architecture?.version || 0);
+}
+
+function captureGraphProjectionGuard({projectId = state.projectId, architectureVersion = state.architecture?.version, surface = ARCHITECTURE_CANVAS_MODE ? 'canvas' : 'project', scopeComponentId = state.scopeComponentId, readingMode = state.readingMode} = {}) {
+  return {
+    generation: state.graphTransitionGeneration,
+    projectId: projectId || null,
+    architectureVersion: Number(architectureVersion) || 0,
+    surface,
+    scopeComponentId: surface === 'canvas' ? null : (scopeComponentId || null),
+    readingMode: normalizedArchitectureReadingMode(readingMode),
+  };
+}
+
+function graphProjectionMatchesCommittedState(guard) {
+  if (!graphTransitionIsCurrent(guard)) return false;
+  const surface = ARCHITECTURE_CANVAS_MODE ? 'canvas' : 'project';
+  return guard.surface === surface
+    && (guard.scopeComponentId || null) === (surface === 'canvas' ? null : (state.scopeComponentId || null))
+    && guard.readingMode === normalizedArchitectureReadingMode(state.readingMode);
+}
+
+function captureGraphInteractionState() {
+  return {
+    selectedComponentId: state.selectedComponentId,
+    selectedEdgeId: state.selectedEdgeId,
+    inspectorTab: state.inspectorTab,
+    graphFocusMode: state.graphFocusMode,
+    tracePathRequest: state.tracePathRequest,
+    tracePathResult: state.tracePathResult,
+    tracePathLoading: state.tracePathLoading,
+    tracePathError: state.tracePathError,
+  };
+}
+
+function reconcileGraphInteractionState(diagram, previous = captureGraphInteractionState()) {
+  const selectedComponentId = previous.selectedComponentId && (diagram?.nodes || []).some((node) => node.component_id === previous.selectedComponentId)
+    ? previous.selectedComponentId
+    : null;
+  const selectedEdgeId = !selectedComponentId && previous.selectedEdgeId && (diagram?.edges || []).some((edge) => edge.id === previous.selectedEdgeId)
+    ? previous.selectedEdgeId
+    : null;
+  state.selectedComponentId = selectedComponentId;
+  state.selectedEdgeId = selectedEdgeId;
+  state.inspectorTab = selectedComponentId || selectedEdgeId ? previous.inspectorTab : 'overview';
+  state.graphFocusMode = selectedComponentId ? previous.graphFocusMode : 'all';
+  const nodeIds = new Set((diagram?.nodes || []).map((node) => node.id));
+  const trace = previous.tracePathRequest;
+  const traceValid = Boolean(
+    trace
+    && Number(trace.expected_architecture_version) === Number(diagram?.architectureVersion || 0)
+    && nodeIds.has(trace.source_id)
+    && nodeIds.has(trace.target_id)
+  );
+  if (!traceValid) clearArchitectureTracePath({render:false});
+  return {selectedComponentId, selectedEdgeId, traceValid};
 }
 
 function showExperience(phase) {
@@ -1399,34 +1493,55 @@ function deferredBootstrapResourceHref(resource, expectedPrefix, architectureVer
 // WORKSPACE_CORE_LOADER_END
 
 async function refreshCanvasResource(contextTicket, architecture, {scopeComponentId = null, retainData = false, deferredResources = null} = {}) {
+  const surface = ARCHITECTURE_CANVAS_MODE ? 'canvas' : 'project';
+  const projectionScope = surface === 'canvas' ? null : (scopeComponentId || null);
+  const readingMode = normalizedArchitectureReadingMode(state.readingMode);
+  const cacheReadingMode = surface === 'canvas' ? 'FULL' : readingMode;
+  const projectionGuard = captureGraphProjectionGuard({
+    projectId:contextTicket.projectId,
+    architectureVersion:architecture?.version,
+    surface,
+    scopeComponentId:projectionScope,
+    readingMode,
+  });
   const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:retainData && Boolean(state.diagram)});
   if (!request) return false;
   try {
     let diagram;
-    if (ARCHITECTURE_CANVAS_MODE && !scopeComponentId && deferredResources?.canvas) {
+    if (surface === 'canvas' && deferredResources?.canvas) {
       const href = deferredBootstrapResourceHref(deferredResources.canvas, `/projects/${contextTicket.projectId}/architecture/canvas?`, architecture.version);
       diagram = normalizeFullCanvasResponse(await api(href));
-    } else if (!ARCHITECTURE_CANVAS_MODE && !scopeComponentId && state.readingMode === 'MAP' && deferredResources?.project_diagram) {
+    } else if (surface === 'project' && !projectionScope && readingMode === 'MAP' && deferredResources?.project_diagram) {
       const href = deferredBootstrapResourceHref(deferredResources.project_diagram, `/projects/${contextTicket.projectId}/architecture/diagram?`, architecture.version);
       diagram = normalizeScopedDiagramResponse(await api(href), null);
     } else {
-      diagram = ARCHITECTURE_CANVAS_MODE
+      diagram = surface === 'canvas'
         ? await loadArchitectureCanvasDiagram(contextTicket.projectId, architecture, 'FULL')
-        : await loadArchitectureDiagram(contextTicket.projectId, architecture, scopeComponentId, state.readingMode);
+        : await loadArchitectureDiagram(contextTicket.projectId, architecture, projectionScope, readingMode);
     }
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphProjectionMatchesCommittedState(projectionGuard)) return false;
+    const currentInteraction = captureGraphInteractionState();
     state.diagram = diagram;
     state.diagramError = null;
     settleWorkspaceResource(state.workspaceAsync, request, diagram ? 'ready' : 'empty');
     resetArchitectureViewCache(contextTicket.projectId, architecture.version);
-    if (diagram) {
-      if (ARCHITECTURE_CANVAS_MODE) cacheArchitectureView('canvas', contextTicket.projectId, architecture.version, diagram);
-      else if (!scopeComponentId) cacheArchitectureView('project', contextTicket.projectId, architecture.version, diagram);
+    if (diagram) cacheArchitectureView(surface, contextTicket.projectId, architecture.version, projectionScope, cacheReadingMode, diagram);
+    reconcileGraphInteractionState(diagram, currentInteraction);
+    const committedNodeId = surface === 'canvas' ? (state.navigation?.committed?.nodeId || null) : null;
+    if (committedNodeId && !diagramNodeByComponentId(committedNodeId, diagram)) {
+      state.canvasInspectorOpen = false;
+      state.canvasDeepLinkFocusPending = false;
+      const navigationGuard = captureNavigationGuard(contextTicket.projectId);
+      if (committedProjectGuardIsCurrent(navigationGuard)) {
+        const committed = state.navigation.committed || navigationSnapshotFromState();
+        if (!commitNavigation({...committed, nodeId:null, inspectorTab:'overview'}, {historyMode:'replace', guard:navigationGuard})) return false;
+      }
     }
     render();
     return true;
   } catch (error) {
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphProjectionMatchesCommittedState(projectionGuard)) return false;
+    architectureViewCache.delete(architectureViewCacheKey(surface, contextTicket.projectId, architecture.version, projectionScope, cacheReadingMode));
     state.diagramError = error?.message || String(error);
     if (!retainData) state.diagram = null;
     settleWorkspaceResource(state.workspaceAsync, request, 'error', error);
@@ -1461,18 +1576,24 @@ async function refreshCodeArchitectureResource(contextTicket, {retainData = fals
 
 async function refreshProjectDiagramResource(contextTicket, architecture, {deferredResources = null} = {}) {
   if (!ARCHITECTURE_CANVAS_MODE || !deferredResources?.project_diagram) return false;
-  const request = beginWorkspaceResource(state.workspaceAsync, 'projectDiagram', contextTicket, {retainData:Boolean(cachedArchitectureView('project', contextTicket.projectId, architecture.version))});
+  const request = beginWorkspaceResource(
+    state.workspaceAsync,
+    'projectDiagram',
+    contextTicket,
+    {retainData:Boolean(cachedArchitectureView('project', contextTicket.projectId, architecture.version, null, 'MAP'))},
+  );
   if (!request) return false;
   try {
     const href = deferredBootstrapResourceHref(deferredResources.project_diagram, `/projects/${contextTicket.projectId}/architecture/diagram?`, architecture.version);
     const diagram = normalizeScopedDiagramResponse(await api(href), null);
     if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
     resetArchitectureViewCache(contextTicket.projectId, architecture.version);
-    if (diagram) cacheArchitectureView('project', contextTicket.projectId, architecture.version, diagram);
+    if (diagram) cacheArchitectureView('project', contextTicket.projectId, architecture.version, null, 'MAP', diagram);
     settleWorkspaceResource(state.workspaceAsync, request, diagram ? 'ready' : 'empty');
     return true;
   } catch (error) {
     if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    architectureViewCache.delete(architectureViewCacheKey('project', contextTicket.projectId, architecture.version, null, 'MAP'));
     settleWorkspaceResource(state.workspaceAsync, request, 'error', error);
     return false;
   }
@@ -1656,7 +1777,7 @@ async function refresh({projectId = state.projectId, guard = captureNavigationGu
   if ((projectId || null) !== (state.projectId || null)) return false;
   const requestSerial = ++state.projectContextRequestSerial;
   const contextRequest = beginWorkspaceContextRequest(projectId);
-  const scopeComponentId = state.scopeComponentId;
+  const rememberedProjectScope = state.scopeComponentId;
   const previousArchitectureVersion = Number(state.architecture?.version || 0);
   const ticket = beginWorkspaceContext(state.workspaceAsync, projectId);
   try {
@@ -1668,12 +1789,18 @@ async function refresh({projectId = state.projectId, guard = captureNavigationGu
     const retainOptional = previousArchitectureVersion === Number(context.architecture?.version || 0);
     Object.assign(state, context);
     if (!bindWorkspaceContextArchitecture(state.workspaceAsync, ticket, context.architecture?.version)) return false;
-    if (!navigationGenerationIsCurrent(guard) || requestSerial !== state.projectContextRequestSerial) return false;
+    if (!navigationGenerationIsCurrent(guard)
+      || requestSerial !== state.projectContextRequestSerial
+      || !isWorkspaceContextRequestCurrent(contextRequest, {requireSelectedProject: true})) return false;
+    // Projection facts contain task/proposal/health state that can change without
+    // an architecture-version bump. Only the newest successful core refresh is
+    // allowed to invalidate them; failed or superseded refreshes preserve cache.
+    invalidateArchitectureViewCache(projectId);
     if (!retainOptional) clearWorkspaceOptionalData();
     clearAgentContextPreview();
     render();
     void refreshWorkspaceOptionalResources(ticket, context.architecture, {
-      scopeComponentId,
+      scopeComponentId:rememberedProjectScope,
       retainData:retainOptional,
       deferredResources:context.deferredArchitectureResources,
     });
@@ -2646,8 +2773,8 @@ function architectureHealth(node) {
   return {key: 'healthy', label: 'Healthy', detail: 'Aligned · no action needed', needsAttention: false, tasks, blockedTasks, activeTasks, pendingReviews};
 }
 
-function diagramNodeByComponentId(componentId) {
-  return (state.diagram?.nodes || []).find((node) => node.component_id === componentId) || null;
+function diagramNodeByComponentId(componentId, diagram = state.diagram) {
+  return (diagram?.nodes || []).find((node) => node.component_id === componentId) || null;
 }
 
 function diagramNodeById(nodeId) {
@@ -2849,28 +2976,42 @@ function expandAllGraphNodes() {
 
 async function navigateGraphScope(scopeComponentId, {focusComponentId = state.scopeComponentId, loader = loadArchitectureDiagram, render = renderGraph, notify = toast} = {}) {
   if (!state.projectId || !state.architecture) return false;
+  if (ARCHITECTURE_CANVAS_MODE) {
+    return focusComponentId ? revealArchitectureComponent(focusComponentId, {surface:'canvas', render, notify}) : false;
+  }
+  const projectId = state.projectId;
+  const architecture = state.architecture;
   const targetScope = scopeComponentId || null;
+  const nextMode = nextReadingModeForScope(state.readingMode, targetScope);
   const contextTicket = currentWorkspaceContextTicket(state.workspaceAsync);
   const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:Boolean(state.diagram)});
   if (!request) return false;
-  const architecture = state.architecture;
+  const transition = beginGraphTransition({projectId, architectureVersion:architecture.version, surface:'project', scopeComponentId:targetScope, readingMode:nextMode});
   try {
-    const nextMode = nextReadingModeForScope(state.readingMode, targetScope);
-    const nextDiagram = await loader(contextTicket.projectId, architecture, targetScope, nextMode);
+    const nextDiagram = cachedArchitectureView('project', projectId, architecture.version, targetScope, nextMode)
+      || await loader(projectId, architecture, targetScope, nextMode);
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphTransitionIsCurrent(transition)) return false;
     if (!nextDiagram) throw new Error('Scoped diagram is unavailable.');
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    const currentInteraction = captureGraphInteractionState();
+    cacheArchitectureView('project', projectId, architecture.version, targetScope, nextMode, nextDiagram);
+    state.diagram = nextDiagram;
     state.scopeComponentId = targetScope;
     state.readingMode = nextMode;
-    state.selectedComponentId = null;
-    state.graphFocusMode = 'all';
-    state.diagram = nextDiagram;
     state.diagramError = null;
+    const reconciled = reconcileGraphInteractionState(nextDiagram, currentInteraction);
+    if (!reconciled.selectedComponentId && focusComponentId && diagramNodeByComponentId(focusComponentId, nextDiagram)) {
+      state.selectedComponentId = focusComponentId;
+      state.selectedEdgeId = null;
+      state.graphFocusMode = 'connected';
+      state.inspectorTab = currentInteraction.inspectorTab;
+    }
     settleWorkspaceResource(state.workspaceAsync, request, 'ready');
     render();
     if (focusComponentId && typeof document !== 'undefined') setTimeout(() => document.querySelector(`[data-component="${CSS.escape(focusComponentId)}"]`)?.focus(), 0);
     return true;
   } catch (err) {
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphTransitionIsCurrent(transition)) return false;
+    architectureViewCache.delete(architectureViewCacheKey('project', projectId, architecture.version, targetScope, nextMode));
     state.diagramError = err?.message || String(err);
     settleWorkspaceResource(state.workspaceAsync, request, 'error', err);
     notify(`Could not open that architecture scope. ${state.diagramError}`, true);
@@ -2880,32 +3021,39 @@ async function navigateGraphScope(scopeComponentId, {focusComponentId = state.sc
 
 async function setGraphReadingMode(mode, {loader = loadArchitectureDiagram, render = renderGraph, notify = toast} = {}) {
   if (!['MAP','READ','FULL'].includes(mode)) return false;
-  if (mode === state.readingMode) return true;
   if (!state.projectId || !state.architecture) return false;
+  const projectId = state.projectId;
+  const architecture = state.architecture;
+  const surface = ARCHITECTURE_CANVAS_MODE ? 'canvas' : 'project';
+  const scopeComponentId = surface === 'canvas' ? null : state.scopeComponentId;
+  const transition = beginGraphTransition({projectId, architectureVersion:architecture.version, surface, scopeComponentId, readingMode:mode});
+  if (mode === state.readingMode) return true;
   const contextTicket = currentWorkspaceContextTicket(state.workspaceAsync);
   const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:Boolean(state.diagram)});
   if (!request) return false;
-  const architecture = state.architecture;
-  const scopeComponentId = state.scopeComponentId;
   try {
-    const nextDiagram = ARCHITECTURE_CANVAS_MODE
-      ? await loadArchitectureCanvasDiagram(contextTicket.projectId, architecture, mode)
-      : await loader(contextTicket.projectId, architecture, scopeComponentId, mode);
+    const cached = cachedArchitectureView(surface, projectId, architecture.version, scopeComponentId, mode);
+    const nextDiagram = cached || (surface === 'canvas'
+      ? await loadArchitectureCanvasDiagram(projectId, architecture, mode)
+      : await loader(projectId, architecture, scopeComponentId, mode));
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphTransitionIsCurrent(transition)) return false;
     if (!nextDiagram) throw new Error('Diagram is unavailable for this reading mode.');
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    const currentInteraction = captureGraphInteractionState();
+    cacheArchitectureView(surface, projectId, architecture.version, scopeComponentId, mode, nextDiagram);
     state.diagram = nextDiagram;
     state.readingMode = mode;
-    state.selectedComponentId = null;
-    state.graphFocusMode = 'all';
     state.diagramError = null;
+    reconcileGraphInteractionState(nextDiagram, currentInteraction);
     settleWorkspaceResource(state.workspaceAsync, request, 'ready');
     render();
+    if (ARCHITECTURE_CANVAS_MODE) syncArchitectureCanvasSelectionUrl();
     return true;
   } catch (err) {
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphTransitionIsCurrent(transition)) return false;
+    architectureViewCache.delete(architectureViewCacheKey(surface, projectId, architecture.version, scopeComponentId, mode));
     state.diagramError = err?.message || String(err);
     settleWorkspaceResource(state.workspaceAsync, request, 'error', err);
-    notify(err?.message || String(err), true);
+    notify(state.diagramError, true);
     return false;
   }
 }
@@ -2916,6 +3064,7 @@ async function activateGraphNode(node, {navigate = navigateGraphScope, render = 
   if (ARCHITECTURE_CANVAS_MODE) {
     (node.hierarchyPath || []).slice(0,-1).forEach((nodeId) => state.collapsedNodeIds.delete(nodeId));
   }
+  clearArchitectureTracePath({render:false});
   state.selectedComponentId = node.component_id;
   state.selectedEdgeId = null;
   state.inspectorTab = 'overview';
@@ -2928,6 +3077,7 @@ async function activateGraphNode(node, {navigate = navigateGraphScope, render = 
 async function drillGraphNode(node, {navigate = navigateGraphScope} = {}) {
   if (!node || graphNodeAction(node) !== 'drill') return false;
   if (ARCHITECTURE_CANVAS_MODE) {
+    clearArchitectureTracePath({render:false});
     state.selectedComponentId = node.component_id;
     state.selectedEdgeId = null;
     state.graphFocusMode = 'hierarchy';
@@ -2936,6 +3086,59 @@ async function drillGraphNode(node, {navigate = navigateGraphScope} = {}) {
     return true;
   }
   return navigate(node.component_id, {focusComponentId:node.component_id});
+}
+
+async function revealArchitectureComponent(componentId, {surface = ARCHITECTURE_CANVAS_MODE ? 'canvas' : 'project', inspectorTab = 'overview', render = renderGraph, notify = toast} = {}) {
+  const target = findArchitectureNode(componentId);
+  if (!target) {
+    notify(`Architecture component not found: ${componentId}`, true);
+    return false;
+  }
+  const desiredSurface = surface === 'canvas' ? 'canvas' : 'project';
+  if (desiredSurface === 'canvas' && !ARCHITECTURE_CANVAS_MODE) {
+    const opened = await setArchitectureCanvasMode(true);
+    if (!opened) return false;
+  } else if (desiredSurface === 'project' && ARCHITECTURE_CANVAS_MODE) {
+    const opened = await setArchitectureCanvasMode(false);
+    if (!opened) return false;
+  }
+  if (state.currentView !== 'architecture') switchView('architecture');
+
+  if (ARCHITECTURE_CANVAS_MODE) {
+    const projected = diagramNodeByComponentId(target.id);
+    if (!projected) {
+      notify(`Component ${target.name || target.id} is not present in the full-system Canvas.`, true);
+      return false;
+    }
+    (projected.hierarchyPath || []).slice(0, -1).forEach((nodeId) => state.collapsedNodeIds.delete(nodeId));
+    clearArchitectureTracePath({render:false});
+    state.canvasInspectorOpen = true;
+    state.selectedComponentId = target.id;
+    state.selectedEdgeId = null;
+    state.inspectorTab = inspectorTab;
+    state.graphFocusMode = 'connected';
+    syncArchitectureCanvasSelectionUrl();
+    render();
+    requestAnimationFrame(() => {
+      const svg = document.querySelector('#graphCanvas .living-graph-svg');
+      const projectedNode = diagramNodeByComponentId(target.id);
+      if (svg && projectedNode) focusGraphNodeInViewport(svg, projectedNode);
+      document.querySelector(`[data-component="${CSS.escape(target.id)}"]`)?.focus();
+    });
+    return true;
+  }
+
+  const parentScopeComponentId = findArchitectureParentId(target.id);
+  const opened = await navigateGraphScope(parentScopeComponentId ?? null, {focusComponentId:target.id, render, notify});
+  if (!opened || !diagramNodeByComponentId(target.id)) return false;
+  clearArchitectureTracePath({render:false});
+  state.selectedComponentId = target.id;
+  state.selectedEdgeId = null;
+  state.inspectorTab = inspectorTab;
+  state.graphFocusMode = 'connected';
+  render();
+  setTimeout(() => document.querySelector(`[data-component="${CSS.escape(target.id)}"]`)?.focus(), 0);
+  return true;
 }
 
 function graphBreadcrumbMarkup(diagram) {
@@ -2993,7 +3196,7 @@ function resolvedGraphViewport(fitViewBox, key) {
   return formatGraphViewBox(graphViewport.viewBox);
 }
 
-function graphViewportControlsMarkup() {
+function graphViewportControlsMarkup(diagram = state.diagram) {
   const resourceName = state.architectureGraphKind === 'code' ? 'codeArchitecture' : 'canvas';
   const resource = state.workspaceAsync.resources[resourceName];
   const retry = resource?.status === 'error'
@@ -3003,7 +3206,10 @@ function graphViewportControlsMarkup() {
   const expandAll = state.architectureGraphKind === 'living' && state.collapsedNodeIds.size
     ? '<button type="button" data-expand-all>Expand all</button>'
     : '';
-  return `<div class="graph-viewport-tools" role="toolbar" aria-label="Canvas navigation"><button type="button" data-canvas-inspector aria-pressed="${state.canvasInspectorOpen}">Details & Agent</button><button type="button" data-graph-viewport="zoom-out" aria-label="Zoom out">−</button><span data-graph-zoom aria-live="polite">100%</span><button type="button" data-graph-viewport="zoom-in" aria-label="Zoom in">＋</button><button type="button" data-graph-viewport="fit">Fit</button><button type="button" data-graph-viewport="actual">100%</button>${retry}${expandAll}</div>`;
+  const picker = state.architectureGraphKind === 'living' && diagram?.fullCanvas
+    ? `<label class="graph-component-picker"><span>Find component</span><input type="search" data-component-picker list="architecture-component-options" placeholder="Component ID" autocomplete="off"/><datalist id="architecture-component-options">${(diagram.nodes || []).map((node)=>`<option value="${escapeHtml(node.component_id)}">${escapeHtml((node.hierarchyPath || []).map((id)=>diagramNodeById(id,diagram)?.label || String(id).replace(/^node:/,'')).join(' / ') || node.label)}</option>`).join('')}</datalist></label>`
+    : '';
+  return `<div class="graph-viewport-tools" role="toolbar" aria-label="Canvas navigation">${picker}<span class="graph-pan-hint" data-graph-pan-hint>Hold Space + drag to pan</span><button type="button" data-canvas-inspector aria-pressed="${state.canvasInspectorOpen}">Details & Agent</button><button type="button" data-graph-viewport="zoom-out" aria-label="Zoom out">−</button><span data-graph-zoom aria-live="polite">100%</span><button type="button" data-graph-viewport="zoom-in" aria-label="Zoom in">＋</button><button type="button" data-graph-viewport="fit">Fit</button><button type="button" data-graph-viewport="actual">100%</button>${retry}${expandAll}</div>`;
 }
 
 function graphViewportWithAspect(svg, box) {
@@ -3100,8 +3306,11 @@ function zoomGraphViewport(svg, factor, clientX = null, clientY = null) {
 }
 
 let graphViewportResizeObserver = null;
+let graphViewportInteractionCleanup = null;
 
 function wireGraphViewport(svg) {
+  graphViewportInteractionCleanup?.();
+  graphViewportInteractionCleanup = null;
   if (!ARCHITECTURE_CANVAS_MODE || !svg) return;
   const canvas = svg.closest('#graphCanvas');
   const fit = parseGraphViewBox(svg.dataset.fitViewBox);
@@ -3129,6 +3338,18 @@ function wireGraphViewport(svg) {
   }));
   canvas.querySelector('[data-expand-all]')?.addEventListener('click', expandAllGraphNodes);
   canvas.querySelector('[data-canvas-inspector]')?.addEventListener('click',()=>{state.canvasInspectorOpen=!state.canvasInspectorOpen;renderGraph();});
+  const componentPicker = canvas.querySelector('[data-component-picker]');
+  const revealPickedComponent = () => {
+    const componentId = String(componentPicker?.value || '').trim();
+    if (componentId && findArchitectureNode(componentId)) void revealArchitectureComponent(componentId, {surface:'canvas'});
+  };
+  componentPicker?.addEventListener('change', revealPickedComponent);
+  componentPicker?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      revealPickedComponent();
+    }
+  });
 
   svg.addEventListener('wheel', (event) => {
     event.preventDefault();
@@ -3136,30 +3357,80 @@ function wireGraphViewport(svg) {
   }, {passive:false});
 
   let drag = null;
+  let spacePressed = false;
+  let suppressNextClick = false;
+  const editableTarget = (target) => Boolean(target?.closest?.('input,textarea,select,button,[contenteditable="true"]'));
+  const syncPanHint = () => {
+    canvas.classList.toggle('is-space-pan-ready', spacePressed);
+    const hint = canvas.querySelector('[data-graph-pan-hint]');
+    if (hint) hint.textContent = spacePressed ? 'Drag anywhere to pan' : 'Hold Space + drag to pan';
+  };
+  const onKeyDown = (event) => {
+    if (event.code !== 'Space' || editableTarget(event.target)) return;
+    spacePressed = true;
+    syncPanHint();
+    event.preventDefault();
+  };
+  const onKeyUp = (event) => {
+    if (event.code !== 'Space') return;
+    spacePressed = false;
+    syncPanHint();
+  };
+  const finishPan = (event = null, force = false) => {
+    if (!drag || (!force && event?.pointerId !== drag.pointerId)) return;
+    const completed = drag;
+    drag = null;
+    svg.classList.remove('is-panning');
+    if (completed.moved) suppressNextClick = true;
+    if (svg.hasPointerCapture?.(completed.pointerId)) svg.releasePointerCapture?.(completed.pointerId);
+  };
+  const onWindowBlur = () => {
+    spacePressed = false;
+    syncPanHint();
+    finishPan(null, true);
+  };
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  window.addEventListener('blur', onWindowBlur);
+
+  svg.addEventListener('click', (event) => {
+    if (!suppressNextClick) return;
+    suppressNextClick = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
   svg.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0 || event.target.closest?.('[data-node],[data-code-node],[data-edge],[data-fold-group]')) return;
+    const interactive = Boolean(event.target.closest?.('[data-node],[data-code-node],[data-edge],[data-fold-group]'));
+    if (event.button !== 0 || (interactive && !spacePressed)) return;
     const box = parseGraphViewBox(svg.getAttribute('viewBox'));
     if (!box) return;
-    drag = {pointerId:event.pointerId, clientX:event.clientX, clientY:event.clientY, box:graphViewportWithAspect(svg, box)};
+    drag = {pointerId:event.pointerId, clientX:event.clientX, clientY:event.clientY, box:graphViewportWithAspect(svg, box), moved:false};
     svg.setPointerCapture?.(event.pointerId);
-    svg.classList.add('is-panning');
     event.preventDefault();
   });
   svg.addEventListener('pointermove', (event) => {
     if (!drag || event.pointerId !== drag.pointerId) return;
     const rect = svg.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
-    const dx = (event.clientX - drag.clientX) * drag.box.width / rect.width;
-    const dy = (event.clientY - drag.clientY) * drag.box.height / rect.height;
+    const clientDx = event.clientX - drag.clientX;
+    const clientDy = event.clientY - drag.clientY;
+    if (!drag.moved && Math.hypot(clientDx, clientDy) < 4) return;
+    drag.moved = true;
+    svg.classList.add('is-panning');
+    const dx = clientDx * drag.box.width / rect.width;
+    const dy = clientDy * drag.box.height / rect.height;
     scheduleGraphPan(svg, {...drag.box, x:drag.box.x-dx, y:drag.box.y-dy});
+    event.preventDefault();
   });
-  const finishPan = (event) => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    drag = null;
-    svg.classList.remove('is-panning');
-  };
   svg.addEventListener('pointerup', finishPan);
   svg.addEventListener('pointercancel', finishPan);
+  svg.addEventListener('lostpointercapture', finishPan);
+  graphViewportInteractionCleanup = () => {
+    window.removeEventListener('keydown', onKeyDown);
+    window.removeEventListener('keyup', onKeyUp);
+    window.removeEventListener('blur', onWindowBlur);
+    canvas.classList.remove('is-space-pan-ready');
+  };
 }
 
 function syncArchitectureCanvasDomMode() {
@@ -3226,12 +3497,24 @@ async function setArchitectureCanvasMode(enabled, {
 } = {}) {
   const guard = navigationGuard || beginNavigationTransition(state.projectId);
   if (!navigationGenerationIsCurrent(guard)) return false;
-  // Even a no-op navigation supersedes an older pending opposite request.
   const requestId = ++architectureCanvasModeRequest;
-  const projectId = state.projectId, architecture = state.architecture;
-  const architectureVersion = architecture?.version, readingMode = state.readingMode;
+  const projectId = state.projectId;
+  const architecture = state.architecture;
+  const architectureVersion = architecture?.version;
   const resolvedHistoryMode = historyMode || (pushHistory ? 'push' : 'none');
   const previousCommitted = state.navigation.committed ? {...state.navigation.committed} : navigationSnapshotFromState();
+  const desiredReadingMode = normalizedArchitectureReadingMode(state.readingMode);
+  const transitionInteraction = captureGraphInteractionState();
+  const requestedNodeId = String(route?.nodeId || '').trim() || null;
+  const requestedInspectorTab = route?.inspectorTab || null;
+  let targetScopeComponentId = enabled ? null : state.scopeComponentId;
+  if (!enabled && transitionInteraction.selectedComponentId) {
+    const parentId = findArchitectureParentId(transitionInteraction.selectedComponentId);
+    if (parentId !== undefined) targetScopeComponentId = parentId || null;
+  }
+  const targetSurface = enabled ? 'canvas' : 'project';
+  const targetReadingMode = enabled ? 'FULL' : desiredReadingMode;
+  const graphTransition = beginGraphTransition({projectId, architectureVersion, surface:targetSurface, scopeComponentId:targetScopeComponentId, readingMode:targetReadingMode});
   const beginModeResource = () => {
     if (!projectId || !architecture?.components?.length) return null;
     const contextTicket = currentWorkspaceContextTicket(state.workspaceAsync);
@@ -3239,82 +3522,121 @@ async function setArchitectureCanvasMode(enabled, {
   };
   const isCurrent = () => navigationGenerationIsCurrent(guard)
     && requestId === architectureCanvasModeRequest
-    && state.projectId === projectId && state.architecture === architecture
-    && state.architecture?.version === architectureVersion && state.readingMode === readingMode;
+    && state.projectId === projectId
+    && state.architecture === architecture
+    && state.architecture?.version === architectureVersion
+    && graphTransitionIsCurrent(graphTransition);
 
   if (ARCHITECTURE_CANVAS_MODE === enabled && state.diagram) {
     const noOpResource = beginModeResource();
     if (noOpResource) settleWorkspaceResource(state.workspaceAsync, noOpResource, 'ready');
     state.currentView = ROUTED_VIEWS.has(route?.view) ? route.view : 'architecture';
-    if (enabled && route?.nodeId) {
-      state.selectedComponentId = route.nodeId;
-      state.inspectorTab = route.inspectorTab || 'overview';
+    const requestedNode = enabled && requestedNodeId ? diagramNodeByComponentId(requestedNodeId) : null;
+    const invalidRequestedNode = Boolean(enabled && requestedNodeId && !requestedNode);
+    if (requestedNode) {
+      (requestedNode?.hierarchyPath || []).slice(0, -1).forEach((id) => state.collapsedNodeIds.delete(id));
+      clearArchitectureTracePath({render:false});
+      state.selectedComponentId = requestedNodeId;
+      state.selectedEdgeId = null;
+      state.inspectorTab = requestedInspectorTab || 'overview';
       state.canvasInspectorOpen = true;
-      state.canvasDeepLinkApplied = true;
-      state.canvasDeepLinkFocusPending = true;
+      state.graphFocusMode = 'connected';
+    } else if (invalidRequestedNode) {
+      state.selectedComponentId = null;
+      state.selectedEdgeId = null;
+      state.inspectorTab = 'overview';
+      state.canvasInspectorOpen = false;
+      state.graphFocusMode = 'all';
+      state.canvasDeepLinkApplied = false;
+      state.canvasDeepLinkFocusPending = false;
+      clearArchitectureTracePath({render:false});
     }
+    const routeHistoryMode = route
+      ? (invalidRequestedNode && resolvedHistoryMode === 'none' ? 'replace' : resolvedHistoryMode)
+      : 'none';
     if (!commitNavigation({
       projectId,
       view:state.currentView,
       canvas:enabled,
-      nodeId:enabled ? (route?.nodeId ?? state.selectedComponentId) : null,
-      inspectorTab:enabled ? (route?.inspectorTab ?? state.inspectorTab) : 'overview',
-    }, {historyMode:route ? resolvedHistoryMode : 'none', guard})) return false;
+      nodeId:enabled ? state.selectedComponentId : null,
+      inspectorTab:enabled ? state.inspectorTab : 'overview',
+    }, {historyMode:routeHistoryMode, guard})) return false;
     render();
     return true;
   }
 
-  const previous = ARCHITECTURE_CANVAS_MODE;
+  const previousMode = ARCHITECTURE_CANVAS_MODE;
   let previousState = null;
   let resourceRequest = null;
   try {
-    let nextDiagram = state.diagram, cacheKind = null;
+    let nextDiagram = state.diagram;
     if (projectId && architecture?.components?.length) {
       resourceRequest = beginModeResource();
       if (!resourceRequest) return false;
-      cacheKind = enabled ? 'canvas' : 'project';
-      const cached = cachedArchitectureView(cacheKind, projectId, architectureVersion);
+      const cached = cachedArchitectureView(targetSurface, projectId, architectureVersion, targetScopeComponentId, targetReadingMode);
       nextDiagram = cached || (enabled
-        ? await loadArchitectureCanvasDiagram(projectId, architecture, 'FULL')
-        : await loadArchitectureDiagram(projectId, architecture, null, readingMode));
+        ? await loadArchitectureCanvasDiagram(projectId, architecture, targetReadingMode)
+        : await loadArchitectureDiagram(projectId, architecture, targetScopeComponentId, targetReadingMode));
     }
     if (!isCurrent() || (resourceRequest && !workspaceResourceIsCurrent(state.workspaceAsync, resourceRequest))) return false;
+    if (!nextDiagram && projectId && architecture?.components?.length) throw new Error('Architecture diagram is unavailable.');
 
-    // Fetch/normalize first, then commit synchronously. Capture at commit time
-    // so interactions made while waiting also survive a failed commit.
     previousState = snapshotArchitectureInteractionState(state);
+    const currentInteraction = captureGraphInteractionState();
+    if (nextDiagram) cacheArchitectureView(targetSurface, projectId, architectureVersion, targetScopeComponentId, targetReadingMode, nextDiagram);
     ARCHITECTURE_CANVAS_MODE = enabled;
-    syncArchitectureCanvasDomMode();
+    state.diagram = nextDiagram;
+    state.diagramError = null;
+    if (!enabled) state.scopeComponentId = targetScopeComponentId;
+    state.readingMode = desiredReadingMode;
     state.currentView = ROUTED_VIEWS.has(route?.view) ? route.view : 'architecture';
-    state.scopeComponentId = null;
-    state.selectedComponentId = enabled && route?.nodeId ? route.nodeId : null;
-    state.selectedEdgeId = null;
-    state.inspectorTab = enabled && route?.nodeId ? (route.inspectorTab || 'overview') : 'overview';
-    state.canvasInspectorOpen = Boolean(enabled && route?.nodeId);
-    state.canvasDeepLinkApplied = Boolean(enabled && route?.nodeId);
-    state.canvasDeepLinkFocusPending = Boolean(enabled && route?.nodeId);
-    state.graphFocusMode = enabled && route?.nodeId ? 'connected' : 'all';
-    clearArchitectureTracePath({render:false});
-    if (cacheKind) {
-      state.diagram = nextDiagram;
-      cacheArchitectureView(cacheKind, projectId, architectureVersion, nextDiagram);
-      state.diagramError = null;
+    state.canvasDeepLinkApplied = false;
+    reconcileGraphInteractionState(nextDiagram, currentInteraction);
+
+    const selectionId = requestedNodeId || state.selectedComponentId;
+    const invalidRequestedNode = Boolean(enabled && requestedNodeId && !diagramNodeByComponentId(requestedNodeId, nextDiagram));
+    if (selectionId && diagramNodeByComponentId(selectionId, nextDiagram)) {
+      state.selectedComponentId = selectionId;
+      state.selectedEdgeId = null;
+      state.inspectorTab = requestedInspectorTab || currentInteraction.inspectorTab || 'overview';
+      state.graphFocusMode = currentInteraction.selectedComponentId === selectionId ? currentInteraction.graphFocusMode : 'connected';
+      if (enabled) {
+        const target = diagramNodeByComponentId(selectionId, nextDiagram);
+        (target?.hierarchyPath || []).slice(0, -1).forEach((id) => state.collapsedNodeIds.delete(id));
+      }
+    } else if (requestedNodeId) {
+      state.selectedComponentId = null;
+      state.selectedEdgeId = null;
+      state.inspectorTab = 'overview';
+      state.graphFocusMode = 'all';
+      clearArchitectureTracePath({render:false});
     }
+    state.canvasInspectorOpen = Boolean(enabled && state.selectedComponentId);
+    state.canvasDeepLinkApplied = Boolean(enabled && requestedNodeId && !invalidRequestedNode);
+    state.canvasDeepLinkFocusPending = Boolean(enabled && requestedNodeId && !invalidRequestedNode);
+    syncArchitectureCanvasDomMode();
     if (resourceRequest) settleWorkspaceResource(state.workspaceAsync, resourceRequest, nextDiagram ? 'ready' : 'empty');
+    const commitHistoryMode = invalidRequestedNode && resolvedHistoryMode === 'none' ? 'replace' : resolvedHistoryMode;
     if (!commitNavigation({
       projectId,
       view:state.currentView,
       canvas:enabled,
-      nodeId:state.selectedComponentId,
-      inspectorTab:state.inspectorTab,
-    }, {historyMode:resolvedHistoryMode, guard})) return false;
+      nodeId:enabled ? state.selectedComponentId : null,
+      inspectorTab:enabled ? state.inspectorTab : 'overview',
+    }, {historyMode:commitHistoryMode, guard})) return false;
     render();
+    if (enabled && state.selectedComponentId && typeof requestAnimationFrame === 'function') requestAnimationFrame(() => {
+      const svg = document.querySelector('#graphCanvas .living-graph-svg');
+      const projectedNode = diagramNodeByComponentId(state.selectedComponentId);
+      if (svg && projectedNode) focusGraphNodeInViewport(svg, projectedNode);
+    });
     return true;
   } catch (error) {
     if (!isCurrent() || (resourceRequest && !workspaceResourceIsCurrent(state.workspaceAsync, resourceRequest))) return false;
+    architectureViewCache.delete(architectureViewCacheKey(targetSurface, projectId, architectureVersion, targetScopeComponentId, targetReadingMode));
     if (previousState) {
       restoreArchitectureInteractionState(state, previousState);
-      ARCHITECTURE_CANVAS_MODE = previous;
+      ARCHITECTURE_CANVAS_MODE = previousMode;
     }
     if (resourceRequest) settleWorkspaceResource(state.workspaceAsync, resourceRequest, state.diagram ? 'ready' : 'empty');
     try {
@@ -4415,6 +4737,34 @@ function renderGraph() {
   renderSelectedNode(); renderLists(); updateInstructionContext();
 }
 
+function canonicalBoundaryRelationshipsForComponent(componentId, diagram = state.diagram) {
+  const canonical = findArchitectureNode(componentId);
+  if (!canonical || !diagram || diagram.fullCanvas) return [];
+  const subtree = new Set(descendantArchitectureIds(canonical));
+  const projectedRelationshipIds = new Set(
+    (diagram.edges || []).flatMap((edge) => (edge.provenance || []).map((item) => item.relationship_id).filter(Boolean)),
+  );
+  const seen = new Set();
+  return (diagram.scope?.directRelationships || []).filter((relationship) => {
+    const id = relationship?.relationship_id;
+    if (!id || seen.has(id) || projectedRelationshipIds.has(id)) return false;
+    const sourceInside = subtree.has(relationship.source_component_id);
+    const targetInside = subtree.has(relationship.target_component_id);
+    if (sourceInside === targetInside) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+function canonicalBoundaryRelationshipMarkup(relationship, componentId) {
+  const canonical = findArchitectureNode(componentId);
+  const subtree = new Set(descendantArchitectureIds(canonical));
+  const inbound = subtree.has(relationship.target_component_id);
+  const peerId = inbound ? relationship.source_component_id : relationship.target_component_id;
+  const peer = findArchitectureNode(peerId);
+  return `<li class="canonical-boundary-relationship"><button type="button" data-reveal-component="${escapeHtml(peerId)}"><strong>${inbound ? '← From' : '→ To'} ${escapeHtml(peer?.name || peerId)}</strong><span>${escapeHtml(relationship.semantic_type || 'relationship')} · canonical cross-boundary</span></button></li>`;
+}
+
 function renderSelectedNode() {
   for (const panel of [$('selectedNode'),$('nodeEvidence')]) {
     if (panel) {
@@ -4472,6 +4822,7 @@ function renderSelectedNode() {
     return;
   }
   const health=diagramNodeHealth(c), incoming=diagram.edges.filter((edge)=>edge.target===c.id), outgoing=diagram.edges.filter((edge)=>edge.source===c.id), linkedTasks=state.tasks.filter((task)=>task.related_component===c.component_id);
+  const boundaryRelationships=canonicalBoundaryRelationshipsForComponent(c.component_id,diagram);
   const connectionLine=(edge,direction)=>{
     const peerId=direction==='in'?edge.source:edge.target, peer=diagramNodeById(peerId);
     const domain=diagram.fullCanvas ? canvasDomainForNode(peer,diagram) : null;
@@ -4499,7 +4850,9 @@ function renderSelectedNode() {
   const inspectorTaskMarkup=inspectorTasks.length
     ? `<div class="inspector-task-list">${inspectorTasks.map((task)=>`<div class="inspector-task-row"><i class="status-dot ${statusClass(task.status)}" aria-hidden="true"></i><span>${escapeHtml(task.title)}</span></div>`).join('')}</div>`
     : `<p class="inspector-status-detail">${escapeHtml(c.status?.canonical_status || 'No linked execution task.')}</p>`;
-  const dependencyContent=incoming.length||outgoing.length ? `<div class="component-connections"><ul>${incoming.map((edge)=>connectionLine(edge,'in')).join('')}${outgoing.map((edge)=>connectionLine(edge,'out')).join('')}</ul></div>` : '<p class="muted">No direct canonical dependencies are attached to this component.</p>';
+  const projectedDependencyMarkup=incoming.length||outgoing.length ? `<section class="component-connections"><h4>Shown in this projection</h4><ul>${incoming.map((edge)=>connectionLine(edge,'in')).join('')}${outgoing.map((edge)=>connectionLine(edge,'out')).join('')}</ul></section>` : '<section><h4>Shown in this projection</h4><p class="muted">No relationships are shown for this component at the current scope/detail.</p></section>';
+  const canonicalBoundaryMarkup=boundaryRelationships.length ? `<section class="component-connections canonical-boundary-connections"><h4>Canonical cross-boundary</h4><ul>${boundaryRelationships.map((relationship)=>canonicalBoundaryRelationshipMarkup(relationship,c.component_id)).join('')}</ul></section>` : '<section><h4>Canonical cross-boundary</h4><p class="muted">No additional cross-boundary relationships are declared for this component subtree by the current scope contract.</p></section>';
+  const dependencyContent=`${projectedDependencyMarkup}${canonicalBoundaryMarkup}`;
   const tasksContent=linkedTasks.length ? `<div class="inspector-task-list">${[...linkedTasks].sort((a,b)=>({BLOCKED:0,IN_PROGRESS:1,TODO:2,DONE:3}[a.status]??4)-({BLOCKED:0,IN_PROGRESS:1,TODO:2,DONE:3}[b.status]??4)).map((task)=>`<div class="inspector-task-row"><i class="status-dot ${statusClass(task.status)}" aria-hidden="true"></i><span>${escapeHtml(task.title)} · ${escapeHtml(task.status.replace('_',' '))}</span></div>`).join('')}</div>` : '<p class="muted">No execution task is linked to this component.</p>';
   const evidenceContent=`${nodeEvidence.length ? `<div class="inspector-evidence-list">${nodeEvidence.map((text)=>`<p>${escapeHtml(text)}</p>`).join('')}</div>` : '<p class="muted">No node-linked observation or external evidence is present in this Diagram projection.</p>'}${provenanceMarkup}`;
   const matchingCodeNodes=(state.codeDiagram?.nodes || []).filter((node)=>node.component_id===c.component_id);
@@ -4520,6 +4873,7 @@ function renderSelectedNode() {
   $('nodeEvidence').innerHTML=`${architectureInspectorTabsMarkup()}<div class="architecture-inspector-content">${tabContent}</div>`;
   wireArchitectureInspectorTabs();
   $('nodeEvidence').querySelectorAll('[data-open-code-node]').forEach((button)=>button.addEventListener('click',()=>{state.architectureGraphKind='code';state.selectedCodeNodeId=button.dataset.openCodeNode;render();}));
+  $('nodeEvidence').querySelectorAll('[data-reveal-component]').forEach((button)=>button.addEventListener('click',()=>{ void revealArchitectureComponent(button.dataset.revealComponent,{inspectorTab:'dependencies'}); }));
   $('selectedNode').querySelectorAll('[data-graph-focus]').forEach((button)=>button.addEventListener('click',()=>{ const mode=button.dataset.graphFocus; if(mode==='clear'){clearArchitectureTracePath({render:false});state.selectedComponentId=null;state.selectedEdgeId=null;state.graphFocusMode='all';state.inspectorTab='overview';syncArchitectureCanvasSelectionUrl();} else {clearArchitectureTracePath({render:false});state.graphFocusMode=mode;} renderGraph(); }));
   $('selectedNode').querySelector('[data-toggle-collapse]')?.addEventListener('click',()=>toggleGraphNodeCollapse(c.id));
   $('selectedNode').querySelector('[data-open-selected-scope]')?.addEventListener('click',()=>drillGraphNode(c));

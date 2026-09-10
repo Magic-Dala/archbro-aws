@@ -21,7 +21,7 @@ test('captured obstructed geometry renders four sources as one trunk with Postgr
   const payload = {
     schema:'archbro.full_canvas.v1',
     diagram:{...fixture.diagram, diagram_version:'archbro.diagram.v1', architecture_version:fixture.graph.architecture_version},
-    positioned_graph:{...fixture.graph, layout_version:'archbro.canvas-layout.v9',
+    positioned_graph:{...fixture.graph, layout_version:'archbro.canvas-layout.v10',
       width:Math.max(...fixture.graph.nodes.map(node=>node.x+node.width))+48,
       height:Math.max(...fixture.graph.nodes.map(node=>node.y+node.height))+48},
     connection_summaries:JSON.parse(probe.stdout),
@@ -312,7 +312,7 @@ test('canvas mode switches in-page and never uses popup or location navigation',
   assert.doesNotMatch(section,/window\.location\.assign/);
   assert.match(app,/addEventListener\('popstate'/);
   assert.match(app,/const architectureViewCache/);
-  assert.match(app,/cachedArchitectureView\(cacheKind/);
+  assert.match(app,/cachedArchitectureView\(targetSurface, projectId, architectureVersion, targetScopeComponentId, targetReadingMode\)/);
   const core=app.slice(app.indexOf('// WORKSPACE_CORE_LOADER_START'),app.indexOf('// WORKSPACE_CORE_LOADER_END'));
   assert.match(core,/loadProjectCoreContext/);
   assert.match(core,/workspace-bootstrap\?reading_mode=FULL/);
@@ -323,13 +323,15 @@ test('canvas mode switches in-page and never uses popup or location navigation',
   assert.match(optional,/refreshCodeArchitectureResource/);
   assert.match(optional,/refreshProjectDiagramResource/);
   assert.match(optional,/refreshWorkspaceOptionalResources/);
-  assert.match(optional,/beginWorkspaceResource\(state\.workspaceAsync, 'projectDiagram'/);
+  assert.ok(optional.includes("beginWorkspaceResource(")); assert.ok(optional.includes("'projectDiagram'"));
   assert.doesNotMatch(app,/bootstrapArchitectureViewsRequest|diagramLoading/);
 });
 
 async function canvasSwitchHarness(options = {}) {
   const app = await readFile(new URL('app.js', webRoot), 'utf8');
   const navigation = app.slice(app.indexOf('const ROUTED_VIEWS'), app.indexOf('const architectureViewCache'));
+  const normalizedMode = app.slice(app.indexOf('function normalizedArchitectureReadingMode('), app.indexOf('function architectureViewCacheKey('));
+  const graphHelpers = app.slice(app.indexOf('function beginGraphTransition('), app.indexOf('function showExperience('));
   const asyncState = app.slice(
     app.indexOf('// WORKSPACE_ASYNC_STATE_START'),
     app.indexOf('// WORKSPACE_ASYNC_STATE_END') + '// WORKSPACE_ASYNC_STATE_END'.length,
@@ -342,6 +344,7 @@ async function canvasSwitchHarness(options = {}) {
     selectedEdgeId:'edge-1', inspectorTab:'tasks', graphFocusMode:'connected', collapsedNodeIds:new Set(['group']),
     canvasDeepLinkApplied:true, canvasDeepLinkFocusPending:false, canvasInspectorOpen:true,
     tracePathRequest:{source_id:'node:api'}, tracePathResult:{status:'FOUND'}, tracePathLoading:false, tracePathError:null, diagramError:null,
+    graphTransitionGeneration:0,
     navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:Boolean(options.initialMode),nodeId:options.initialMode?'api':null,inspectorTab:options.initialMode?'tasks':'overview'}},
   };
   const calls = {push:0,replace:0,clear:0,render:0,load:0,cache:[],toasts:[]};
@@ -355,14 +358,17 @@ async function canvasSwitchHarness(options = {}) {
       replaceState(_state,_title,url){calls.replace += 1; context.window.location.href = url;},
     },
     cachedArchitectureView:kind => options.cached?.[kind] || null,
-    loadArchitectureCanvasDiagram:async(...args) => {calls.load += 1; return options.load ? options.load(...args) : {kind:'canvas'};},
-    loadArchitectureDiagram:async(...args) => {calls.load += 1; return options.load ? options.load(...args) : {kind:'project'};},
-    cacheArchitectureView:(...args) => calls.cache.push(args), syncArchitectureCanvasDomMode:() => {},
-    clearArchitectureTracePath:() => {calls.clear += 1; state.tracePathRequest = state.tracePathResult = null;},
+    loadArchitectureCanvasDiagram:async(...args) => {calls.load += 1; return options.load ? options.load(...args) : {kind:'canvas',architectureVersion:7,nodes:[{id:'node:api',component_id:'api',hierarchyPath:[]}]};},
+    loadArchitectureDiagram:async(...args) => {calls.load += 1; return options.load ? options.load(...args) : {kind:'project',architectureVersion:7,nodes:[{id:'node:api',component_id:'api',hierarchyPath:[]}]};},
+    cacheArchitectureView:(...args) => calls.cache.push(args),
+    architectureViewCache:{delete(){}}, architectureViewCacheKey:()=>'',
+    diagramNodeByComponentId:(id,diagram=state.diagram)=>(diagram?.nodes||[]).find(node=>node.component_id===id)||null,
+    findArchitectureParentId:()=>null, syncArchitectureCanvasDomMode:() => {},
+    clearArchitectureTracePath:() => {calls.clear += 1; state.tracePathRequest = state.tracePathResult = null; state.tracePathLoading=false; state.tracePathError=null;},
     render:() => {calls.render += 1; if(options.renderFailure && calls.render === 1) throw new Error('render failed');},
     toast:message => calls.toasts.push(message), console,
   };
-  runInNewContext(`${navigation}\n${asyncState}\n${helpers}\n${section}\n
+  runInNewContext(`${navigation}\n${normalizedMode}\n${graphHelpers}\n${asyncState}\n${helpers}\n${section}\n
     state.workspaceAsync=makeWorkspaceAsyncState(state.projectId);
     const contextTicket=beginWorkspaceContext(state.workspaceAsync,state.projectId);
     bindWorkspaceContextArchitecture(state.workspaceAsync,contextTicket,state.architecture?.version);
@@ -376,6 +382,7 @@ function comparableCanvasSwitchState(value) {
   const copy = {...value, collapsedNodeIds:[...(value.collapsedNodeIds || [])]};
   delete copy.workspaceAsync;
   if (copy.navigation) copy.navigation = {...copy.navigation, generation:0};
+  if ('graphTransitionGeneration' in copy) copy.graphTransitionGeneration = 0;
   return JSON.parse(JSON.stringify(copy));
 }
 
@@ -479,6 +486,8 @@ test('canvas switch uses the current cached diagram without a reload', async () 
 test('canvas switch fences an older pending Project Diagram resource load', async () => {
   const app = await readFile(new URL('app.js', webRoot), 'utf8');
   const navigation = app.slice(app.indexOf('const ROUTED_VIEWS'), app.indexOf('const architectureViewCache'));
+  const normalizedMode = app.slice(app.indexOf('function normalizedArchitectureReadingMode('), app.indexOf('function architectureViewCacheKey('));
+  const graphHelpers = app.slice(app.indexOf('function beginGraphTransition('), app.indexOf('function showExperience('));
   const asyncState = app.slice(
     app.indexOf('// WORKSPACE_ASYNC_STATE_START'),
     app.indexOf('// WORKSPACE_ASYNC_STATE_END') + '// WORKSPACE_ASYNC_STATE_END'.length,
@@ -503,6 +512,7 @@ test('canvas switch fences an older pending Project Diagram resource load', asyn
     selectedEdgeId:null, inspectorTab:'overview', graphFocusMode:'all', collapsedNodeIds:new Set(),
     canvasDeepLinkApplied:false, canvasDeepLinkFocusPending:false, canvasInspectorOpen:false,
     tracePathRequest:null, tracePathResult:null, tracePathLoading:false, tracePathError:null,
+    graphTransitionGeneration:0,
     navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:false,nodeId:null,inspectorTab:'overview'}},
   };
   const context = {
@@ -514,10 +524,13 @@ test('canvas switch fences an older pending Project Diagram resource load', asyn
     loadArchitectureDiagram:async() => new Promise(resolve => {resolveProjectDiagram=resolve;}),
     loadArchitectureCanvasDiagram:async() => ({kind:'canvas'}),
     cachedArchitectureView:() => null,
-    cacheArchitectureView:() => {}, resetArchitectureViewCache:() => {}, syncArchitectureCanvasDomMode:() => {},
-    clearArchitectureTracePath:() => {}, render:() => {}, toast:() => {}, console,
+    cacheArchitectureView:() => {}, resetArchitectureViewCache:() => {},
+    architectureViewCache:{delete(){}}, architectureViewCacheKey:()=>'',
+    diagramNodeByComponentId:(id,diagram=state.diagram)=>(diagram?.nodes||[]).find(node=>node.component_id===id)||null,
+    findArchitectureParentId:()=>null, syncArchitectureCanvasDomMode:() => {},
+    clearArchitectureTracePath:() => {state.tracePathRequest=state.tracePathResult=null;state.tracePathLoading=false;state.tracePathError=null;}, render:() => {}, toast:() => {}, console,
   };
-  runInNewContext(`${navigation}\n${asyncState}\n${refresh}\n${helpers}\n${mode}\n
+  runInNewContext(`${navigation}\n${normalizedMode}\n${graphHelpers}\n${asyncState}\n${refresh}\n${helpers}\n${mode}\n
     state.workspaceAsync=makeWorkspaceAsyncState('project-1');
     const ticket=beginWorkspaceContext(state.workspaceAsync,'project-1');
     bindWorkspaceContextArchitecture(state.workspaceAsync,ticket,7);
@@ -575,12 +588,14 @@ test('workspace restore never presents the signed-out landing screen as loading 
 test('deferred bootstrap projections use canonical resource generations and isolate failures', async () => {
   const app=await readFile(new URL('app.js',webRoot),'utf8');
   const asyncBlock=app.slice(app.indexOf('// WORKSPACE_ASYNC_STATE_START')+'// WORKSPACE_ASYNC_STATE_START'.length,app.indexOf('// WORKSPACE_ASYNC_STATE_END'));
+  const normalizedMode=app.slice(app.indexOf('function normalizedArchitectureReadingMode('),app.indexOf('function architectureViewCacheKey('));
+  const graphHelpers=app.slice(app.indexOf('function beginGraphTransition('),app.indexOf('function showExperience('));
   const optionalBlock=app.slice(app.indexOf('function deferredBootstrapResourceHref('),app.indexOf('function clearWorkspaceOptionalData('));
   let resolveCanvas, rejectProject;
   const canvasPromise=new Promise(resolve=>{resolveCanvas=resolve;});
   const projectPromise=new Promise((_resolve,reject)=>{rejectProject=reject;});
   const cached=[], renders=[];
-  const state={projectId:'project-1',architecture:{version:4},diagram:null,diagramError:null,readingMode:'MAP',currentView:'architecture',codeDiagram:null};
+  const state={projectId:'project-1',architecture:{version:4},diagram:null,diagramError:null,readingMode:'MAP',currentView:'architecture',scopeComponentId:null,selectedComponentId:null,selectedEdgeId:null,inspectorTab:'overview',graphFocusMode:'all',tracePathRequest:null,tracePathResult:null,tracePathLoading:false,tracePathError:null,graphTransitionGeneration:0,codeDiagram:null};
   const context={
     state,
     ARCHITECTURE_CANVAS_MODE:true,
@@ -594,10 +609,12 @@ test('deferred bootstrap projections use canonical resource generations and isol
     cachedArchitectureView:()=>null,
     resetArchitectureViewCache:()=>{},
     cacheArchitectureView:(...args)=>cached.push(args),
+    architectureViewCache:{delete(){}}, architectureViewCacheKey:()=>'',
+    clearArchitectureTracePath:()=>{state.tracePathRequest=state.tracePathResult=null;state.tracePathLoading=false;state.tracePathError=null;},
     render:()=>renders.push('render'),
     renderGraph:()=>{},
   };
-  runInNewContext(asyncBlock+optionalBlock+';globalThis.makeAsync=makeWorkspaceAsyncState;globalThis.beginContext=beginWorkspaceContext;globalThis.bindContext=bindWorkspaceContextArchitecture;globalThis.refreshCanvas=refreshCanvasResource;globalThis.refreshProject=refreshProjectDiagramResource;',context);
+  runInNewContext(asyncBlock+normalizedMode+graphHelpers+optionalBlock+';globalThis.makeAsync=makeWorkspaceAsyncState;globalThis.beginContext=beginWorkspaceContext;globalThis.bindContext=bindWorkspaceContextArchitecture;globalThis.refreshCanvas=refreshCanvasResource;globalThis.refreshProject=refreshProjectDiagramResource;',context);
   state.workspaceAsync=context.makeAsync('project-1');
   const ticket=context.beginContext(state.workspaceAsync,'project-1');
   context.bindContext(state.workspaceAsync,ticket,4);

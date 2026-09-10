@@ -1116,6 +1116,10 @@ def case_architecture_inspector_disclosure(browser: Browser) -> None:
         ]
         for mode in ["MAP", "READ", "FULL"]:
             page.locator(f'button[data-reading-mode="{mode}"]').click()
+            page.wait_for_function(
+                "expected => document.querySelector('.graph-side')?.dataset.readingMode === expected",
+                arg=mode,
+            )
             assert page.locator(".graph-side").get_attribute("data-reading-mode") == mode
             if mode == "MAP":
                 assert page.locator("#graphDecisionPanel").is_hidden()
@@ -1167,6 +1171,17 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
         assert "selected" in (api_node.get_attribute("class") or "")
         assert page.locator('[data-inspector-tab="dependencies"]').get_attribute("aria-pressed") == "true"
         assert page.locator(".node-card[data-node]").count() == 8
+
+        # Leave full-system Canvas through the selected child, then reopen it.
+        # Project may remember a scoped view, but Canvas must always restore the
+        # full-system projection and the same canonical selection.
+        page.locator("#architectureCanvasBtn").click()
+        page.wait_for_function("() => document.body.dataset.architectureCanvasMode === 'false'")
+        assert page.locator(".node-card[data-node]").count() < 8
+        page.locator("#architectureCanvasBtn").click()
+        page.wait_for_function("() => document.body.dataset.architectureCanvasMode === 'true'")
+        assert page.locator(".node-card[data-node]").count() == 8
+        assert "selected" in (page.locator(f'[data-component="{api_id}"]').get_attribute("class") or "")
         centered = page.evaluate(
             f"""
             () => {{
@@ -1250,6 +1265,27 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
         page.mouse.up()
         pan_after = current_view_box()
         assert pan_after[:2] != pan_before[:2], (pan_before, pan_after)
+        page.locator('[data-graph-viewport="fit"]').click()
+        assert_fit_view_box()
+
+        # Holding Space explicitly enables panning even when drag begins over
+        # an interactive node; the synthetic click after movement is suppressed.
+        api_node = page.locator(f'[data-component="{api_id}"]')
+        api_node.focus()
+        node_box = api_node.bounding_box()
+        assert node_box
+        node_pan_before = current_view_box()
+        page.keyboard.down("Space")
+        assert "Drag anywhere to pan" in page.locator('[data-graph-pan-hint]').inner_text()
+        page.mouse.move(node_box["x"] + node_box["width"] / 2, node_box["y"] + node_box["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(node_box["x"] + node_box["width"] / 2 + 72, node_box["y"] + node_box["height"] / 2 + 36)
+        page.mouse.up()
+        page.keyboard.up("Space")
+        assert "Hold Space + drag to pan" in page.locator('[data-graph-pan-hint]').inner_text()
+        node_pan_after = current_view_box()
+        assert node_pan_after[:2] != node_pan_before[:2], (node_pan_before, node_pan_after)
+        assert "selected" in (page.locator(f'[data-component="{api_id}"]').get_attribute("class") or "")
         page.locator('[data-graph-viewport="fit"]').click()
         assert_fit_view_box()
 
@@ -1440,6 +1476,22 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
         assert api_node.get_attribute("data-collapsed") == "true"
         assert page.locator(f'[data-component="{validator_id}"]').count() == 0
         assert page.locator('[data-expand-all]').is_visible()
+
+        # Stable-ID picker uses the same local Canvas reveal path: expand only
+        # the target ancestors and never refetch a scoped Project diagram.
+        picker_reads_before = canvas_reads()
+        picker = page.locator('[data-component-picker]')
+        picker.fill(validator_id)
+        picker.press("Enter")
+        validator_node = page.locator(f'[data-component="{validator_id}"]')
+        validator_node.wait_for(state="visible")
+        assert "selected" in (validator_node.get_attribute("class") or "")
+        assert page.locator(f'[data-component="{api_id}"]').get_attribute("data-collapsed") == "false"
+        assert canvas_reads() == picker_reads_before
+
+        page.locator(f'[data-component="{api_id}"]').dispatch_event("click")
+        page.locator('[data-toggle-collapse]').click()
+        assert page.locator(f'[data-component="{validator_id}"]').count() == 0
         collapsed_sql = page.locator('.graph-edge.relationship-data')
         assert collapsed_sql.is_visible()
         assert "projection-collapsed" in (collapsed_sql.get_attribute("class") or "")
@@ -1496,6 +1548,8 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
         assert page.locator(".node-card[data-node]:visible").count() == 8
         assert page.locator('[data-collapsed="true"]').count() == 0
         assert "SYSTEM ARCHITECTURE" in page.locator("#selectedNode").inner_text()
+        normalized_query = parse_qs(urlsplit(page.url).query)
+        assert "node" not in normalized_query and "tab" not in normalized_query
         assert len(backend.event_requests) == 2
         architecture_mutations = [
             item
@@ -1958,6 +2012,8 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
 
         backend.projects = []
         page.evaluate("() => localStorage.removeItem('archbro-project-id')")
+        # Home is a navigation intent: clearing the startup fallback alone must
+        # not override the explicit project still present in the current URL.
         page.goto(BASE_URL, wait_until="networkidle")
         page.locator("#workspaceHome").wait_for(state="visible")
         assert "project" not in parse_qs(urlsplit(page.url).query)
@@ -2054,7 +2110,7 @@ def run_cases(requested: set[str] | None = None) -> dict:
     return report
 
 
-def test_s2_04_architecture_canvas_interactions_browser() -> None:
+def run_case_with_static_server(case) -> None:
     global BASE_URL
     original_base_url = BASE_URL
     web_root = Path(__file__).resolve().parents[1] / "frontend" / "web"
@@ -2073,7 +2129,7 @@ def test_s2_04_architecture_canvas_interactions_browser() -> None:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             try:
-                case_architecture_canvas_interactions(browser)
+                case(browser)
             finally:
                 browser.close()
     finally:
@@ -2082,6 +2138,13 @@ def test_s2_04_architecture_canvas_interactions_browser() -> None:
         server.server_close()
         thread.join(timeout=2)
 
+
+def test_s2_04_architecture_canvas_interactions_browser() -> None:
+    run_case_with_static_server(case_architecture_canvas_interactions)
+
+
+def test_s2_05_architecture_inspector_disclosure_browser() -> None:
+    run_case_with_static_server(case_architecture_inspector_disclosure)
 
 def main() -> None:
     requested = {name for name in os.getenv("ARCHBRO_FINAL_FIX_CASES", "").split(",") if name}
