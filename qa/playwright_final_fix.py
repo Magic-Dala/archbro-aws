@@ -469,6 +469,28 @@ class FakeBackend:
         if len(parts) == 2 and method == "GET":
             self.json(route, context["project"])
             return
+        if parts[2:] == ["workspace-bootstrap"] and method == "GET":
+            architecture_version = int(context["architecture"].get("version", 0))
+            self.json(route, {
+                "schema": "archbro.workspace-bootstrap.v2",
+                "project": copy.deepcopy(context["project"]),
+                "tasks": copy.deepcopy(context["tasks"]),
+                "architecture": copy.deepcopy(context["architecture"]),
+                "proposals": copy.deepcopy(context["proposals"]),
+                "activity": copy.deepcopy(context.get("activity", [])),
+                "resources": {
+                    "canvas": {
+                        "status": "DEFERRED",
+                        "href": f"/projects/{project_id}/architecture/canvas?expected_architecture_version={architecture_version}&reading_mode=FULL",
+                    },
+                    "project_diagram": {
+                        "status": "DEFERRED",
+                        "href": f"/projects/{project_id}/architecture/diagram?expected_architecture_version={architecture_version}&reading_mode=MAP",
+                    },
+                },
+                "built_in_model_called": False,
+            })
+            return
         if len(parts) == 2 and method == "PATCH":
             body = request.post_data_json
             context["project"].update(body)
@@ -1173,8 +1195,17 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
             )
 
         fit_view_box = [float(value) for value in (viewport_svg.get_attribute("data-fit-view-box") or "").split()]
+        def assert_fit_view_box() -> None:
+            rendered = current_view_box()
+            svg_rect = viewport_svg.bounding_box()
+            assert svg_rect and svg_rect["width"] > 0 and svg_rect["height"] > 0
+            assert rendered[0] <= fit_view_box[0] + 0.01
+            assert rendered[1] <= fit_view_box[1] + 0.01
+            assert rendered[0] + rendered[2] >= fit_view_box[0] + fit_view_box[2] - 0.01
+            assert rendered[1] + rendered[3] >= fit_view_box[1] + fit_view_box[3] - 0.01
+            assert abs((rendered[2] / rendered[3]) - (svg_rect["width"] / svg_rect["height"])) < 0.001
         page.locator('[data-graph-viewport="fit"]').click()
-        assert current_view_box() == fit_view_box
+        assert_fit_view_box()
         page.locator('[data-graph-viewport="actual"]').click()
         page.wait_for_function("() => document.querySelector('[data-graph-zoom]')?.textContent === '100%'")
         assert canvas.get_attribute("data-zoom-tier") == "detail"
@@ -1220,7 +1251,7 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
         pan_after = current_view_box()
         assert pan_after[:2] != pan_before[:2], (pan_before, pan_after)
         page.locator('[data-graph-viewport="fit"]').click()
-        assert current_view_box() == fit_view_box
+        assert_fit_view_box()
 
         context_tray = page.locator("#agentContextTray")
         context_tray.wait_for(state="visible")
@@ -1369,8 +1400,8 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
         )
         page.locator(f'[data-component="{validator_id}"]').click(force=True)
 
-        selected_edge = page.locator(".graph-edge[data-edge]").first
-        selected_edge.click(force=True)
+        selected_edge = page.locator('.graph-edge[data-edge][data-summary-id=""]').first
+        selected_edge.dispatch_event("click")
         assert page.locator(".graph-edge.selected").count() == 1
         assert page.locator(".node-card.selected").count() == 0
         assert "SELECTED RELATIONSHIP" in page.locator("#selectedNode").inner_text()
@@ -1464,7 +1495,7 @@ def case_architecture_canvas_interactions(browser: Browser) -> None:
         assert page.locator(".node-card.selected").count() == 0
         assert page.locator(".node-card[data-node]:visible").count() == 8
         assert page.locator('[data-collapsed="true"]').count() == 0
-        assert "CURRENT SCOPE" in page.locator("#selectedNode").inner_text()
+        assert "SYSTEM ARCHITECTURE" in page.locator("#selectedNode").inner_text()
         assert len(backend.event_requests) == 2
         architecture_mutations = [
             item
@@ -1927,8 +1958,10 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
 
         backend.projects = []
         page.evaluate("() => localStorage.removeItem('archbro-project-id')")
-        page.reload(wait_until="networkidle")
+        page.goto(BASE_URL, wait_until="networkidle")
         page.locator("#workspaceHome").wait_for(state="visible")
+        assert "project" not in parse_qs(urlsplit(page.url).query)
+        assert page.evaluate("() => window.ArchBroWebBridge.getCommittedNavigation().project_id") is None
         page.locator("#workspaceHomeEmpty").wait_for(state="visible")
         capture_surface("desktop_1440_empty_workspace")
 

@@ -185,7 +185,12 @@ const state = {
   selectedTaskId: null,
   selectedProposalId: null,
   currentView: 'overview',
+  projectContextRequestSerial: 0,
   taskUpdating: new Set(),
+  workingRequests: new Map(),
+  workingRequestSerial: 0,
+  workingUiRequestId: null,
+  architectureProgressRequestId: null,
   expandedProjectIds: loadExpandedProjectIds(),
   projectSnapshots: new Map(),
   workspaceAsync: makeWorkspaceAsyncState(initialProjectId),
@@ -202,7 +207,14 @@ const state = {
     working: false,
     workingStartedAt: null,
     workingTimer: null,
+    workingRequestId: null,
     lastError: null,
+  },
+  navigation: {
+    generation: 0,
+    initialized: false,
+    committed: null,
+    onboardingReturn: null,
   },
 };
 
@@ -251,6 +263,117 @@ const views = {
   tasks: {title: 'Tasks', subtitle: 'Concrete, actionable work shared by humans and the agent.'},
   architecture: {title: 'Architecture', subtitle: 'Compare accepted design intent with revision-pinned implementation evidence.'},
 };
+
+const ROUTED_VIEWS = new Set(Object.keys(views));
+
+function readNavigationRoute(locationLike = window.location, {useStorageFallback = false} = {}) {
+  const params = new URLSearchParams(locationLike?.search || '');
+  const explicitProject = params.has('project');
+  let projectId = String(params.get('project') || '').trim() || null;
+  if (!explicitProject && useStorageFallback) {
+    projectId = String(localStorage.getItem('archbro-project-id') || '').trim() || null;
+  }
+  const canvas = params.get('canvas') === 'architecture';
+  const requestedView = String(params.get('view') || '').trim().toLowerCase();
+  const view = ROUTED_VIEWS.has(requestedView) ? requestedView : (canvas ? 'architecture' : 'overview');
+  const nodeId = projectId && canvas ? (String(params.get('node') || '').trim() || null) : null;
+  const requestedTab = String(params.get('tab') || '').trim().toLowerCase();
+  const inspectorTab = nodeId && INSPECTOR_TABS.has(requestedTab) ? requestedTab : 'overview';
+  return {projectId, explicitProject, view, canvas, nodeId, inspectorTab};
+}
+
+function beginNavigationTransition(projectId = state.projectId) {
+  state.navigation.generation += 1;
+  // Advancing navigation immediately hides work owned by the previous project.
+  // The request itself keeps its token and will retire only that token when it
+  // eventually settles, so it cannot clear a newer project's indicator.
+  if (typeof syncWorkingRequestUI === 'function') syncWorkingRequestUI();
+  return {projectId: projectId || null, generation: state.navigation.generation};
+}
+
+function captureNavigationGuard(projectId = state.projectId) {
+  return {projectId: projectId || null, generation: state.navigation.generation};
+}
+
+function navigationGenerationIsCurrent(guard) {
+  return Boolean(guard) && guard.generation === state.navigation.generation;
+}
+
+function committedProjectGuardIsCurrent(guard) {
+  return navigationGenerationIsCurrent(guard) && (guard.projectId || null) === (state.projectId || null);
+}
+
+function navigationSnapshotFromState(overrides = {}) {
+  const projectId = Object.prototype.hasOwnProperty.call(overrides, 'projectId') ? overrides.projectId : state.projectId;
+  const view = ROUTED_VIEWS.has(overrides.view) ? overrides.view : state.currentView;
+  const canvas = Object.prototype.hasOwnProperty.call(overrides, 'canvas') ? Boolean(overrides.canvas) : ARCHITECTURE_CANVAS_MODE;
+  const nodeId = Object.prototype.hasOwnProperty.call(overrides, 'nodeId') ? overrides.nodeId : state.selectedComponentId;
+  const inspectorTab = Object.prototype.hasOwnProperty.call(overrides, 'inspectorTab') ? overrides.inspectorTab : state.inspectorTab;
+  return {
+    projectId: projectId || null,
+    view: ROUTED_VIEWS.has(view) ? view : 'overview',
+    canvas,
+    nodeId: projectId && canvas ? (nodeId || null) : null,
+    inspectorTab: projectId && canvas && nodeId && INSPECTOR_TABS.has(inspectorTab) ? inspectorTab : 'overview',
+  };
+}
+
+function committedNavigationSnapshot() {
+  const committed = state.navigation.committed;
+  return {
+    initialized: state.navigation.initialized,
+    generation: state.navigation.generation,
+    project_id: committed?.projectId || null,
+    view: committed?.view || 'overview',
+    canvas: Boolean(committed?.canvas),
+    node_id: committed?.nodeId || null,
+    inspector_tab: committed?.inspectorTab || 'overview',
+  };
+}
+
+function writeNavigationUrl(snapshot, historyMode = 'replace') {
+  if (typeof history === 'undefined' || historyMode === 'none') return;
+  const url = new URL(window.location.href);
+  if (snapshot.projectId) url.searchParams.set('project', snapshot.projectId);
+  else url.searchParams.delete('project');
+  if (snapshot.projectId && snapshot.view !== 'overview') url.searchParams.set('view', snapshot.view);
+  else url.searchParams.delete('view');
+  if (snapshot.canvas) url.searchParams.set('canvas', 'architecture');
+  else url.searchParams.delete('canvas');
+  if (snapshot.projectId && snapshot.canvas && snapshot.nodeId) url.searchParams.set('node', snapshot.nodeId);
+  else url.searchParams.delete('node');
+  if (snapshot.projectId && snapshot.canvas && snapshot.nodeId && snapshot.inspectorTab !== 'overview') url.searchParams.set('tab', snapshot.inspectorTab);
+  else url.searchParams.delete('tab');
+  const method = historyMode === 'push' ? 'pushState' : 'replaceState';
+  history[method]({archbroNavigation: snapshot}, '', url.toString());
+}
+
+function commitNavigation(snapshot, {historyMode = 'replace', guard = null} = {}) {
+  if (guard && !navigationGenerationIsCurrent(guard)) return false;
+  const normalized = navigationSnapshotFromState(snapshot);
+  state.navigation.committed = normalized;
+  state.navigation.initialized = true;
+  if (normalized.projectId) localStorage.setItem('archbro-project-id', normalized.projectId);
+  else localStorage.removeItem('archbro-project-id');
+  writeNavigationUrl(normalized, historyMode);
+  return true;
+}
+
+function recommitCurrentNavigationAfterFailedTransition(guard, {historyMode = 'replace'} = {}) {
+  if (!navigationGenerationIsCurrent(guard)) return false;
+  const committed = state.navigation.committed || navigationSnapshotFromState();
+  return commitNavigation(committed, {historyMode, guard});
+}
+
+function supersededNavigationError() {
+  const error = new Error('Navigation changed before this request completed.');
+  error.code = 'ARCHBRO_NAVIGATION_SUPERSEDED';
+  return error;
+}
+
+function isSupersededNavigationError(error) {
+  return error?.code === 'ARCHBRO_NAVIGATION_SUPERSEDED';
+}
 
 const architectureViewCache = {
   projectId: null,
@@ -574,9 +697,66 @@ function toast(message, error = false) {
 
 function setWorking(working, detail = '') {
   const el = $('agentStatus');
+  if (!el) return;
   el.classList.toggle('working', working);
   el.innerHTML = `<span class="pulse"></span>${working ? (detail || 'Agent working…') : 'Agent ready'}`;
 }
+
+// WORKING_REQUEST_LOGIC_START
+function workingRequestsForCurrentNavigation() {
+  return [...state.workingRequests.values()]
+    .filter((request) => (
+      request.generation === state.navigation.generation
+      && (request.projectId || null) === (state.projectId || null)
+    ))
+    .sort((left, right) => left.serial - right.serial);
+}
+
+function syncWorkingRequestUI() {
+  const visible = workingRequestsForCurrentNavigation();
+  const current = visible.at(-1) || null;
+  state.workingUiRequestId = current?.id || null;
+  setWorking(Boolean(current), current?.detail || '');
+
+  const architectureRequest = [...visible].reverse().find((request) => request.architectureStartedAt) || null;
+  const architectureRequestId = architectureRequest?.id || null;
+  if (state.architectureProgressRequestId !== architectureRequestId) {
+    state.architectureProgressRequestId = architectureRequestId;
+    setArchitectureProgress(Boolean(architectureRequest), architectureRequest?.architectureStartedAt || 0);
+  }
+  return current;
+}
+
+function beginWorkingRequest(detail = '', {projectId = state.projectId, architectureStartedAt = null} = {}) {
+  const serial = ++state.workingRequestSerial;
+  const id = `working-request-${serial}`;
+  state.workingRequests.set(id, {
+    id,
+    serial,
+    detail,
+    projectId: projectId || null,
+    generation: state.navigation.generation,
+    architectureStartedAt: Number(architectureStartedAt) || null,
+  });
+  syncWorkingRequestUI();
+  return id;
+}
+
+function updateWorkingRequest(id, detail) {
+  const request = state.workingRequests.get(id);
+  if (!request) return false;
+  state.workingRequests.set(id, {...request, detail});
+  syncWorkingRequestUI();
+  return true;
+}
+
+function finishWorkingRequest(id) {
+  if (!id) return false;
+  const removed = state.workingRequests.delete(id);
+  syncWorkingRequestUI();
+  return removed;
+}
+// WORKING_REQUEST_LOGIC_END
 
 function escapeHtml(value = '') {
   return String(value).replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
@@ -586,13 +766,15 @@ function statusClass(status) {
   return status === 'IN_PROGRESS' ? 'progress' : status.toLowerCase();
 }
 
-async function loadProjects() {
-  state.projects = await api('/projects');
+async function loadProjects({guard = null} = {}) {
+  const projects = await api('/projects');
+  if (guard && !navigationGenerationIsCurrent(guard)) return null;
+  state.projects = projects;
   renderProjectTree();
   return state.projects;
 }
 
-async function loadProjectSnapshots() {
+async function loadProjectSnapshots({guard = null} = {}) {
   const snapshots = new Map();
   await Promise.all(state.projects.map(async (project) => {
     try {
@@ -604,6 +786,7 @@ async function loadProjectSnapshots() {
       snapshots.set(project.id, {architecture, rootDiagram});
     } catch { snapshots.set(project.id, null); }
   }));
+  if (guard && !navigationGenerationIsCurrent(guard)) return null;
   state.projectSnapshots = snapshots;
   return snapshots;
 }
@@ -694,7 +877,9 @@ function renderWorkspaceHome() {
   renderAccountIdentity();
 }
 
-async function openPersonalWorkspace() {
+async function openPersonalWorkspace({historyMode = 'push', navigationGuard = null} = {}) {
+  const guard = navigationGuard || beginNavigationTransition(null);
+  if (!navigationGenerationIsCurrent(guard)) return false;
   supersedeWorkspaceContextRequests();
   beginWorkspaceContext(state.workspaceAsync, null);
   state.workspaceAsync.phase = 'ready';
@@ -726,10 +911,14 @@ async function openPersonalWorkspace() {
   state.currentView = 'overview';
   state.openProjectMenuId = null;
   state.renamingProjectId = null;
-  clearActiveProjectSelection();
-  await loadProjectSnapshots();
+  ARCHITECTURE_CANVAS_MODE = false;
+  syncArchitectureCanvasDomMode();
+  if (!commitNavigation({projectId:null, view:'overview', canvas:false, nodeId:null, inspectorTab:'overview'}, {historyMode, guard})) return false;
+  await loadProjectSnapshots({guard});
+  if (!navigationGenerationIsCurrent(guard)) return false;
   renderWorkspaceHome();
   closeMobileSidebar();
+  return true;
 }
 
 function renderProjectTree() {
@@ -970,7 +1159,7 @@ function normalizeDiagramGraph(payload) {
   const layout = payload?.positioned_graph || payload?.positionedGraph || payload?.layout;
   if (!diagram || !layout) throw new Error('Positioned diagram response must include DiagramView and PositionedGraph.');
   if (diagram.diagram_version !== 'archbro.diagram.v1') throw new Error(`Unsupported diagram contract: ${diagram.diagram_version || 'missing'}`);
-  if (!['archbro.layout.v1','archbro.canvas-layout.v2','archbro.canvas-layout.v3','archbro.canvas-layout.v4','archbro.canvas-layout.v5','archbro.canvas-layout.v6','archbro.canvas-layout.v7','archbro.canvas-layout.v8','archbro.canvas-layout.v9'].includes(layout.layout_version)) throw new Error(`Unsupported layout contract: ${layout.layout_version || 'missing'}`);
+  if (!['archbro.layout.v1','archbro.canvas-layout.v2','archbro.canvas-layout.v3','archbro.canvas-layout.v4','archbro.canvas-layout.v5','archbro.canvas-layout.v6','archbro.canvas-layout.v7','archbro.canvas-layout.v8','archbro.canvas-layout.v9','archbro.canvas-layout.v10'].includes(layout.layout_version)) throw new Error(`Unsupported layout contract: ${layout.layout_version || 'missing'}`);
   if (Number(diagram.architecture_version) !== Number(layout.architecture_version)) throw new Error('Diagram and layout architecture versions do not match.');
   const positionedById = new Map((layout.nodes || []).map((node) => [node.node_id, node]));
   const nodes = (diagram.nodes || []).map((node) => {
@@ -1339,46 +1528,61 @@ function restoreDisplayedWorkspaceAsync(error = null) {
   state.workspaceAsync.error = error ? (error?.message || String(error)) : null;
 }
 
-function persistActiveProjectSelection(projectId) {
-  localStorage.setItem('archbro-project-id', projectId);
-  const activeUrl = new URL(window.location.href);
-  if (activeUrl.searchParams.get('project') !== projectId) {
-    activeUrl.searchParams.set('project', projectId);
-    window.history.replaceState(window.history.state, '', activeUrl);
-  }
-}
-
-function clearActiveProjectSelection() {
-  localStorage.removeItem('archbro-project-id');
-  const activeUrl = new URL(window.location.href);
-  if (activeUrl.searchParams.has('project')) {
-    activeUrl.searchParams.delete('project');
-    window.history.replaceState(window.history.state, '', activeUrl);
-  }
-}
-
-async function selectProject(projectId) {
+async function selectProject(projectId, {
+  view = 'overview',
+  canvas = ARCHITECTURE_CANVAS_MODE,
+  historyMode = 'push',
+  navigationGuard = null,
+  route = null,
+} = {}) {
   if (!projectId) return false;
+  const guard = navigationGuard || beginNavigationTransition(projectId);
+  if (!navigationGenerationIsCurrent(guard)) return false;
   state.openProjectMenuId = null;
-  if (projectId === state.projectId && state.project) {
-    persistActiveProjectSelection(projectId);
+
+  if (projectId === state.projectId && state.project && canvas === ARCHITECTURE_CANVAS_MODE) {
     state.onboarding.active = false;
-    state.currentView = 'overview';
+    state.currentView = ROUTED_VIEWS.has(view) ? view : 'overview';
+    if (route?.canvas && route?.nodeId) {
+      state.selectedComponentId = route.nodeId;
+      state.inspectorTab = route.inspectorTab || 'overview';
+      state.canvasInspectorOpen = true;
+      state.canvasDeepLinkApplied = true;
+      state.canvasDeepLinkFocusPending = true;
+    } else if (!canvas) {
+      state.selectedComponentId = null;
+      state.selectedEdgeId = null;
+      state.inspectorTab = 'overview';
+    }
+    if (!commitNavigation({
+      projectId,
+      view:state.currentView,
+      canvas,
+      nodeId:route?.nodeId ?? state.selectedComponentId,
+      inspectorTab:route?.inspectorTab ?? state.inspectorTab,
+    }, {historyMode, guard})) return false;
     render();
     return true;
   }
+
   const previousProjectId = state.projectId;
   const previousArchitectureVersion = Number(state.architecture?.version || 0);
   const ticket = beginWorkspaceContext(state.workspaceAsync, projectId);
-  $('projectTree').setAttribute('aria-busy', 'true');
+  $('projectTree')?.setAttribute('aria-busy', 'true');
   const contextRequest = beginWorkspaceContextRequest(projectId);
   try {
     const context = await loadProjectCoreContext(projectId);
-    if (!workspaceContextIsCurrent(state.workspaceAsync, ticket)
+    if (!navigationGenerationIsCurrent(guard)
+      || !workspaceContextIsCurrent(state.workspaceAsync, ticket)
       || !isWorkspaceContextRequestCurrent(contextRequest)) return false;
     const retainOptional = previousProjectId === projectId
-      && previousArchitectureVersion === Number(context.architecture?.version || 0);
+      && previousArchitectureVersion === Number(context.architecture?.version || 0)
+      && canvas === ARCHITECTURE_CANVAS_MODE;
     if (!bindWorkspaceContextArchitecture(state.workspaceAsync, ticket, context.architecture?.version)) return false;
+    if (!navigationGenerationIsCurrent(guard) || !isWorkspaceContextRequestCurrent(contextRequest)) return false;
+
+    ARCHITECTURE_CANVAS_MODE = Boolean(canvas);
+    syncArchitectureCanvasDomMode();
     Object.assign(state, context, {
       projectId,
       lastRun: null,
@@ -1392,82 +1596,95 @@ async function selectProject(projectId) {
       agentContextTelemetryVisible: true,
       scopeComponentId: null,
       readingMode: 'MAP',
-      selectedComponentId: null,
+      selectedComponentId: canvas && route?.nodeId ? route.nodeId : null,
       selectedCodeNodeId: null,
       architectureGraphKind: 'living',
-      graphFocusMode: 'all',
+      graphFocusMode: canvas && route?.nodeId ? 'connected' : 'all',
       collapsedNodeIds: new Set(),
       selectedTaskId: null,
       selectedProposalId: null,
-      currentView: 'overview',
+      currentView: ROUTED_VIEWS.has(view) ? view : (canvas ? 'architecture' : 'overview'),
+      inspectorTab: canvas && route?.nodeId ? (route.inspectorTab || 'overview') : 'overview',
+      canvasInspectorOpen: Boolean(canvas && route?.nodeId),
+      canvasDeepLinkApplied: Boolean(canvas && route?.nodeId),
+      canvasDeepLinkFocusPending: Boolean(canvas && route?.nodeId),
     });
     if (!retainOptional) clearWorkspaceOptionalData();
     state.onboarding.active = false;
     state.expandedProjectIds.add(projectId);
     persistExpandedProjectIds();
-    persistActiveProjectSelection(projectId);
+    if (!commitNavigation({
+      projectId,
+      view:state.currentView,
+      canvas:ARCHITECTURE_CANVAS_MODE,
+      nodeId:state.selectedComponentId,
+      inspectorTab:state.inspectorTab,
+    }, {historyMode, guard})) return false;
     render();
-    void refreshWorkspaceOptionalResources(ticket, context.architecture, {retainData:retainOptional,deferredResources:context.deferredArchitectureResources});
+    void refreshWorkspaceOptionalResources(ticket, context.architecture, {
+      retainData:retainOptional,
+      deferredResources:context.deferredArchitectureResources,
+    });
     return true;
   } catch (err) {
-    if (workspaceContextIsCurrent(state.workspaceAsync, ticket)) {
-      if (state.project) restoreDisplayedWorkspaceAsync(err);
-      else failWorkspaceContext(state.workspaceAsync, ticket, err);
-    }
+    if (!navigationGenerationIsCurrent(guard)
+      || !workspaceContextIsCurrent(state.workspaceAsync, ticket)
+      || !isWorkspaceContextRequestCurrent(contextRequest)) return false;
+    if (state.project) restoreDisplayedWorkspaceAsync(err);
+    else failWorkspaceContext(state.workspaceAsync, ticket, err);
+    recommitCurrentNavigationAfterFailedTransition(guard, {historyMode:'replace'});
     toast(`Could not open that project. ${err.message}`, true);
     return false;
   } finally {
-    $('projectTree').removeAttribute('aria-busy');
+    $('projectTree')?.removeAttribute('aria-busy');
   }
 }
 
-async function refresh() {
+async function refresh({projectId = state.projectId, guard = captureNavigationGuard(projectId)} = {}) {
+  if (!navigationGenerationIsCurrent(guard)) return false;
   if (state.onboarding.active) {
     renderOnboarding();
     return true;
   }
   if (!state.projectId) {
-    await loadProjectSnapshots();
+    if (projectId) return false;
+    await loadProjectSnapshots({guard});
+    if (!navigationGenerationIsCurrent(guard)) return false;
     renderWorkspaceHome();
     return true;
   }
-  const projectId = state.projectId;
+  if ((projectId || null) !== (state.projectId || null)) return false;
+  const requestSerial = ++state.projectContextRequestSerial;
   const contextRequest = beginWorkspaceContextRequest(projectId);
   const scopeComponentId = state.scopeComponentId;
   const previousArchitectureVersion = Number(state.architecture?.version || 0);
   const ticket = beginWorkspaceContext(state.workspaceAsync, projectId);
   try {
     const context = await loadProjectCoreContext(projectId);
-    if (!workspaceContextIsCurrent(state.workspaceAsync, ticket)
+    if (!navigationGenerationIsCurrent(guard)
+      || requestSerial !== state.projectContextRequestSerial
+      || !workspaceContextIsCurrent(state.workspaceAsync, ticket)
       || !isWorkspaceContextRequestCurrent(contextRequest, {requireSelectedProject: true})) return false;
     const retainOptional = previousArchitectureVersion === Number(context.architecture?.version || 0);
     Object.assign(state, context);
     if (!bindWorkspaceContextArchitecture(state.workspaceAsync, ticket, context.architecture?.version)) return false;
+    if (!navigationGenerationIsCurrent(guard) || requestSerial !== state.projectContextRequestSerial) return false;
     if (!retainOptional) clearWorkspaceOptionalData();
     clearAgentContextPreview();
     render();
-    void refreshWorkspaceOptionalResources(ticket, context.architecture, {scopeComponentId,retainData:retainOptional,deferredResources:context.deferredArchitectureResources});
+    void refreshWorkspaceOptionalResources(ticket, context.architecture, {
+      scopeComponentId,
+      retainData:retainOptional,
+      deferredResources:context.deferredArchitectureResources,
+    });
     return true;
   } catch (err) {
-    if (!workspaceContextIsCurrent(state.workspaceAsync, ticket)) return false;
+    if (!navigationGenerationIsCurrent(guard)
+      || requestSerial !== state.projectContextRequestSerial
+      || !workspaceContextIsCurrent(state.workspaceAsync, ticket)) return false;
     if (String(err.message).startsWith('404:')) {
-      supersedeWorkspaceContextRequests();
-      beginWorkspaceContext(state.workspaceAsync, null);
-      clearActiveProjectSelection();
-      state.projectId = null;
-      state.project = null;
-      clearWorkspaceOptionalData();
-      await loadProjects();
-      if (state.projects.length) {
-        state.expandedProjectIds.add(state.projects[0].id);
-        persistExpandedProjectIds();
-        await selectProject(state.projects[0].id);
-      } else {
-        state.workspaceAsync.phase = 'ready';
-        state.workspaceAsync.architectureVersion = 0;
-        await loadProjectSnapshots();
-        renderWorkspaceHome();
-      }
+      await openPersonalWorkspace({historyMode:'replace'});
+      toast('This project is no longer available. Returned to your workspace without opening another project.', true);
       return true;
     }
     if (state.project) restoreDisplayedWorkspaceAsync(err);
@@ -1479,6 +1696,9 @@ async function refresh() {
 
 function startOnboarding() {
   if (state.onboarding.workingTimer) clearInterval(state.onboarding.workingTimer);
+  const returnNavigation = state.navigation.committed ? {...state.navigation.committed} : navigationSnapshotFromState();
+  const guard = beginNavigationTransition(null);
+  state.navigation.onboardingReturn = returnNavigation?.projectId ? returnNavigation : null;
   state.currentView = 'overview';
   state.onboarding = {
     active: true,
@@ -1490,6 +1710,7 @@ function startOnboarding() {
     working: false,
     workingStartedAt: null,
     workingTimer: null,
+    workingRequestId: null,
     lastError: null,
   };
   state.selectedTaskId = null;
@@ -1499,6 +1720,7 @@ function startOnboarding() {
   state.architectureGraphKind = 'living';
   state.scopeComponentId = null;
   state.readingMode = 'MAP';
+  commitNavigation({projectId:null, view:'overview', canvas:false, nodeId:null, inspectorTab:'overview'}, {historyMode:'push', guard});
   renderOnboarding();
   openNewProjectNameDialog();
 }
@@ -1621,7 +1843,9 @@ function updateOnboardingProgressUI() {
   const progress = onboardingProgressText();
   const bubble = $('onboardingWorkingText');
   if (bubble) bubble.textContent = progress.text;
-  setWorking(true, `Updating Goal · ${progress.elapsed}s`);
+  if (state.onboarding.workingRequestId) {
+    updateWorkingRequest(state.onboarding.workingRequestId, `Updating Goal · ${progress.elapsed}s`);
+  }
 }
 
 function startOnboardingProgress() {
@@ -1629,6 +1853,8 @@ function startOnboardingProgress() {
   state.onboarding.working = true;
   state.onboarding.workingStartedAt = Date.now();
   state.onboarding.lastError = null;
+  const workingRequestId = beginWorkingRequest('Updating Goal · 0s', {projectId:state.projectId});
+  state.onboarding.workingRequestId = workingRequestId;
   const sendButton = document.querySelector('#onboardingForm button[type="submit"]');
   if (sendButton) {
     sendButton.disabled = true;
@@ -1637,19 +1863,23 @@ function startOnboardingProgress() {
   renderOnboardingConversation();
   updateOnboardingProgressUI();
   state.onboarding.workingTimer = setInterval(updateOnboardingProgressUI, 1000);
+  return workingRequestId;
 }
 
-function stopOnboardingProgress() {
+function stopOnboardingProgress(workingRequestId = state.onboarding.workingRequestId) {
+  const ownsOnboarding = Boolean(workingRequestId) && state.onboarding.workingRequestId === workingRequestId;
+  finishWorkingRequest(workingRequestId);
+  if (!ownsOnboarding) return;
   if (state.onboarding.workingTimer) clearInterval(state.onboarding.workingTimer);
   state.onboarding.workingTimer = null;
   state.onboarding.working = false;
   state.onboarding.workingStartedAt = null;
+  state.onboarding.workingRequestId = null;
   const sendButton = document.querySelector('#onboardingForm button[type="submit"]');
   if (sendButton) {
     sendButton.disabled = false;
     sendButton.textContent = 'Send';
   }
-  setWorking(false);
 }
 
 function renderOnboardingConversation() {
@@ -1734,8 +1964,9 @@ function updateGoalConfirmState() {
 }
 
 async function requestOnboardingGoalDraft() {
-  if (state.onboarding.working) return;
-  startOnboardingProgress();
+  if (state.onboarding.working) return null;
+  const guard = captureNavigationGuard(state.projectId);
+  const workingRequestId = startOnboardingProgress();
   updateGoalConfirmState();
   try {
     const draft = await api('/onboarding/goal', {
@@ -1746,16 +1977,22 @@ async function requestOnboardingGoalDraft() {
       }),
       timeoutMs: 30000,
     });
+    if (!navigationGenerationIsCurrent(guard)) return null;
     state.onboarding.draft = draft;
     state.onboarding.lastError = null;
     state.onboarding.messages.push({role: 'assistant', content: draft.assistant_message});
+    return draft;
   } catch (err) {
+    if (!navigationGenerationIsCurrent(guard)) return null;
     state.onboarding.lastError = err.message || String(err);
     toast('Goal update stopped. Your Goal and Ask are preserved; retry when ready.', true);
+    return null;
   } finally {
-    stopOnboardingProgress();
-    renderOnboardingConversation();
-    renderGoalDraft();
+    stopOnboardingProgress(workingRequestId);
+    if (navigationGenerationIsCurrent(guard)) {
+      renderOnboardingConversation();
+      renderGoalDraft();
+    }
   }
 }
 
@@ -1791,35 +2028,41 @@ async function confirmGoalAndGenerate() {
   const name = state.onboarding.projectName.trim();
   const goal = $('goalDraftText').value.trim();
   if (!name || !goal || state.onboarding.working) return;
+  const callerGuard = captureNavigationGuard(state.projectId);
+  const workingRequestId = beginWorkingRequest('Creating project…', {projectId:state.projectId});
   try {
-    setWorking(true, 'Creating project…');
     const project = await api('/projects', {
       method: 'POST',
       body: JSON.stringify({name, goal, description: 'Goal drafted through Goal + Ask onboarding.'}),
     });
+    if (!navigationGenerationIsCurrent(callerGuard)) return;
     $('goalDraftText').value = '';
     $('onboardingAsk').value = '';
-    state.projectId = project.id;
-    state.expandedProjectIds.add(project.id);
-    persistActiveProjectSelection(project.id);
-    state.project = project;
-    state.lastRun = null;
-    state.onboarding.active = false;
-    await loadProjects();
-    await refresh();
+    if (!(await selectProject(project.id, {historyMode:'push'}))) return;
+    const projectGuard = captureNavigationGuard(project.id);
+    await loadProjects({guard:projectGuard});
+    if (!committedProjectGuardIsCurrent(projectGuard)) return;
     toast('Goal confirmed. Generating Architecture v1…');
     await generateInitialArchitecture();
   } catch (err) {
-    toast(err.message, true);
+    if (navigationGenerationIsCurrent(callerGuard)) toast(err.message, true);
   } finally {
-    setWorking(false);
+    finishWorkingRequest(workingRequestId);
   }
 }
 
-function backToCurrentProject() {
-  if (!state.projectId) return;
+async function backToCurrentProject() {
+  const target = state.navigation.onboardingReturn;
+  if (!target?.projectId || target.projectId !== state.projectId || !state.project) return false;
+  const guard = beginNavigationTransition(target.projectId);
   state.onboarding.active = false;
-  refresh();
+  state.navigation.onboardingReturn = null;
+  state.currentView = target.view;
+  ARCHITECTURE_CANVAS_MODE = Boolean(target.canvas);
+  syncArchitectureCanvasDomMode();
+  if (!commitNavigation(target, {historyMode:'replace', guard})) return false;
+  render();
+  return refresh({projectId:target.projectId, guard});
 }
 
 function openEditProject(trigger = document.activeElement) {
@@ -1866,52 +2109,31 @@ function openDeleteProject(trigger = document.activeElement) {
 }
 
 async function deleteCurrentProject() {
-  if (!state.projectId) return;
   const deletedId = state.projectId;
+  if (!deletedId) return;
+  const guard = captureNavigationGuard(deletedId);
   const deletedName = state.project?.name || 'Project';
-  const deleteRequest = beginWorkspaceContextRequest(deletedId);
   try {
     await api(`/projects/${deletedId}`, {method: 'DELETE'});
+    if (!committedProjectGuardIsCurrent(guard)) {
+      const currentGuard = captureNavigationGuard(state.projectId);
+      await loadProjects({guard:currentGuard});
+      return;
+    }
     $('deleteProjectDialog').close();
     state.projectSnapshots.delete(deletedId);
     state.expandedProjectIds.delete(deletedId);
     persistExpandedProjectIds();
-    if (!isWorkspaceContextRequestCurrent(deleteRequest, {requireSelectedProject: true})) {
-      await loadProjects();
-      toast(`${deletedName} deleted.`);
-      return;
-    }
-    supersedeWorkspaceContextRequests();
-    beginWorkspaceContext(state.workspaceAsync, null);
-    state.projectId = null;
-    state.project = null;
-    state.tasks = [];
-    state.architecture = null;
-    state.diagram = null;
-    state.diagramError = null;
-    state.codeArchitecture = null;
-    state.codeDiagram = null;
-    state.architectureGraphKind = 'living';
-    state.selectedCodeNodeId = null;
-    state.graphFocusMode = 'all';
-    state.collapsedNodeIds.clear();
-    state.proposals = [];
-    state.lastRun = null;
-    clearAgentContextPreview();
-    state.selectedComponentId = null;
-    state.scopeComponentId = null;
-    state.readingMode = 'MAP';
-    clearActiveProjectSelection();
-    await loadProjects();
+    await loadProjects({guard});
+    if (!committedProjectGuardIsCurrent(guard)) return;
     if (state.projects.length) {
-      await selectProject(state.projects[0].id);
+      await selectProject(state.projects[0].id, {historyMode:'replace'});
     } else {
-      await loadProjectSnapshots();
-      renderWorkspaceHome();
+      await openPersonalWorkspace({historyMode:'replace'});
     }
     toast(`${deletedName} deleted.`);
   } catch (err) {
-    toast(err.message, true);
+    if (committedProjectGuardIsCurrent(guard)) toast(err.message, true);
   }
 }
 
@@ -2343,16 +2565,21 @@ function renderProposals() {
 }
 
 async function decideProposal(id, decision) {
+  const projectId = state.projectId;
+  const guard = captureNavigationGuard(projectId);
+  if (!projectId || !committedProjectGuardIsCurrent(guard)) return;
+  const workingRequestId = beginWorkingRequest('', {projectId});
   try {
-    setWorking(true);
-    await api(`/projects/${state.projectId}/architecture/proposals/${id}/${decision}`, {method: 'POST'});
+    await api(`/projects/${projectId}/architecture/proposals/${id}/${decision}`, {method: 'POST'});
+    if (!committedProjectGuardIsCurrent(guard)) return;
     toast(decision === 'accept' ? 'Architecture change accepted.' : 'Proposal rejected; current architecture preserved.');
-    await refresh();
+    await refresh({projectId, guard});
+    if (!committedProjectGuardIsCurrent(guard)) return;
     if ($('proposalReviewDialog').open) $('proposalReviewDialog').close();
   } catch (err) {
-    toast(err.message, true);
+    if (committedProjectGuardIsCurrent(guard)) toast(err.message, true);
   } finally {
-    setWorking(false);
+    finishWorkingRequest(workingRequestId);
   }
 }
 
@@ -2991,26 +3218,53 @@ function applyArchitectureNavigationToUrl(url, {enabled, projectId, selectedComp
 
 let architectureCanvasModeRequest = 0;
 
-async function setArchitectureCanvasMode(enabled, {pushHistory = true} = {}) {
+async function setArchitectureCanvasMode(enabled, {
+  pushHistory = true,
+  historyMode = null,
+  navigationGuard = null,
+  route = null,
+} = {}) {
+  const guard = navigationGuard || beginNavigationTransition(state.projectId);
+  if (!navigationGenerationIsCurrent(guard)) return false;
   // Even a no-op navigation supersedes an older pending opposite request.
   const requestId = ++architectureCanvasModeRequest;
   const projectId = state.projectId, architecture = state.architecture;
   const architectureVersion = architecture?.version, readingMode = state.readingMode;
+  const resolvedHistoryMode = historyMode || (pushHistory ? 'push' : 'none');
+  const previousCommitted = state.navigation.committed ? {...state.navigation.committed} : navigationSnapshotFromState();
   const beginModeResource = () => {
     if (!projectId || !architecture?.components?.length) return null;
     const contextTicket = currentWorkspaceContextTicket(state.workspaceAsync);
     return beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:Boolean(state.diagram)});
   };
+  const isCurrent = () => navigationGenerationIsCurrent(guard)
+    && requestId === architectureCanvasModeRequest
+    && state.projectId === projectId && state.architecture === architecture
+    && state.architecture?.version === architectureVersion && state.readingMode === readingMode;
+
   if (ARCHITECTURE_CANVAS_MODE === enabled && state.diagram) {
     const noOpResource = beginModeResource();
     if (noOpResource) settleWorkspaceResource(state.workspaceAsync, noOpResource, 'ready');
+    state.currentView = ROUTED_VIEWS.has(route?.view) ? route.view : 'architecture';
+    if (enabled && route?.nodeId) {
+      state.selectedComponentId = route.nodeId;
+      state.inspectorTab = route.inspectorTab || 'overview';
+      state.canvasInspectorOpen = true;
+      state.canvasDeepLinkApplied = true;
+      state.canvasDeepLinkFocusPending = true;
+    }
+    if (!commitNavigation({
+      projectId,
+      view:state.currentView,
+      canvas:enabled,
+      nodeId:enabled ? (route?.nodeId ?? state.selectedComponentId) : null,
+      inspectorTab:enabled ? (route?.inspectorTab ?? state.inspectorTab) : 'overview',
+    }, {historyMode:route ? resolvedHistoryMode : 'none', guard})) return false;
+    render();
     return true;
   }
+
   const previous = ARCHITECTURE_CANVAS_MODE;
-  const previousUrl = window.location.href;
-  const isCurrent = () => requestId === architectureCanvasModeRequest
-    && state.projectId === projectId && state.architecture === architecture
-    && state.architecture?.version === architectureVersion && state.readingMode === readingMode;
   let previousState = null;
   let resourceRequest = null;
   try {
@@ -3029,20 +3283,17 @@ async function setArchitectureCanvasMode(enabled, {pushHistory = true} = {}) {
     // Fetch/normalize first, then commit synchronously. Capture at commit time
     // so interactions made while waiting also survive a failed commit.
     previousState = snapshotArchitectureInteractionState(state);
-    const url = applyArchitectureNavigationToUrl(new URL(window.location.href), {
-      enabled,
-      projectId,
-      selectedComponentId:null,
-      inspectorTab:'overview',
-    });
-    if (pushHistory && typeof history !== 'undefined') history.pushState({}, '', url.toString());
     ARCHITECTURE_CANVAS_MODE = enabled;
     syncArchitectureCanvasDomMode();
-    state.currentView = 'architecture';
+    state.currentView = ROUTED_VIEWS.has(route?.view) ? route.view : 'architecture';
     state.scopeComponentId = null;
-    state.selectedComponentId = null;
+    state.selectedComponentId = enabled && route?.nodeId ? route.nodeId : null;
     state.selectedEdgeId = null;
-    state.graphFocusMode = 'all';
+    state.inspectorTab = enabled && route?.nodeId ? (route.inspectorTab || 'overview') : 'overview';
+    state.canvasInspectorOpen = Boolean(enabled && route?.nodeId);
+    state.canvasDeepLinkApplied = Boolean(enabled && route?.nodeId);
+    state.canvasDeepLinkFocusPending = Boolean(enabled && route?.nodeId);
+    state.graphFocusMode = enabled && route?.nodeId ? 'connected' : 'all';
     clearArchitectureTracePath({render:false});
     if (cacheKind) {
       state.diagram = nextDiagram;
@@ -3050,6 +3301,13 @@ async function setArchitectureCanvasMode(enabled, {pushHistory = true} = {}) {
       state.diagramError = null;
     }
     if (resourceRequest) settleWorkspaceResource(state.workspaceAsync, resourceRequest, nextDiagram ? 'ready' : 'empty');
+    if (!commitNavigation({
+      projectId,
+      view:state.currentView,
+      canvas:enabled,
+      nodeId:state.selectedComponentId,
+      inspectorTab:state.inspectorTab,
+    }, {historyMode:resolvedHistoryMode, guard})) return false;
     render();
     return true;
   } catch (error) {
@@ -3060,17 +3318,8 @@ async function setArchitectureCanvasMode(enabled, {pushHistory = true} = {}) {
     }
     if (resourceRequest) settleWorkspaceResource(state.workspaceAsync, resourceRequest, state.diagram ? 'ready' : 'empty');
     try {
-      // popstate changed the URL before this request; restore the mode that is
-      // actually displayed even when no product state was committed.
-      if ((previousState || !pushHistory) && typeof history !== 'undefined') {
-        const restoredUrl = applyArchitectureNavigationToUrl(new URL(previousUrl), {
-          enabled:previous,
-          projectId,
-          selectedComponentId:previousState?.selectedComponentId || null,
-          inspectorTab:previousState?.inspectorTab || 'overview',
-        });
-        history.replaceState({}, '', restoredUrl.toString());
-      }
+      if (previousCommitted) commitNavigation(previousCommitted, {historyMode:'replace', guard});
+      else recommitCurrentNavigationAfterFailedTransition(guard, {historyMode:'replace'});
       if (previousState) { syncArchitectureCanvasDomMode(); render(); }
     } catch (rollbackError) {
       console.error('Architecture view rollback failed.', rollbackError);
@@ -3430,14 +3679,16 @@ function graphSegmentHitsRect(start, end, rect, padding = 0) {
 }
 
 function syncArchitectureCanvasSelectionUrl() {
-  if (!ARCHITECTURE_CANVAS_MODE || typeof history === 'undefined') return;
-  const url = applyArchitectureNavigationToUrl(new URL(window.location.href), {
-    enabled:true,
+  if (!ARCHITECTURE_CANVAS_MODE || typeof history === 'undefined') return false;
+  const guard = captureNavigationGuard(state.projectId);
+  if (!committedProjectGuardIsCurrent(guard)) return false;
+  return commitNavigation({
     projectId:state.projectId,
-    selectedComponentId:state.selectedComponentId,
+    view:'architecture',
+    canvas:true,
+    nodeId:state.selectedComponentId,
     inspectorTab:state.inspectorTab,
-  });
-  history.replaceState(null, '', url.toString());
+  }, {historyMode:'replace', guard});
 }
 
 function setArchitectureInspectorTab(tab) {
@@ -4615,18 +4866,23 @@ function updateInstructionContext() {
 }
 
 async function sendEvent(type, payload, workingDetail = '') {
-  if (!state.projectId) return null;
+  const projectId = state.projectId;
+  if (!projectId) return null;
+  const guard = captureNavigationGuard(projectId);
+  if (!committedProjectGuardIsCurrent(guard)) return null;
   const boundedContextRequested = Boolean(payload?.agent_context_request);
+  const workingRequestId = beginWorkingRequest(workingDetail, {projectId});
   try {
-    setWorking(true, workingDetail);
-    const result = await api(`/projects/${state.projectId}/events`, {method: 'POST', body: JSON.stringify({type, source: 'FRONTEND', payload})});
+    const result = await api(`/projects/${projectId}/events`, {method: 'POST', body: JSON.stringify({type, source: 'FRONTEND', payload})});
+    if (!committedProjectGuardIsCurrent(guard)) return result;
     state.lastRun = result;
     if (boundedContextRequested) clearAgentContextPreview();
     if (result.result === 'ERROR') toast(result.error || 'Agent run failed before state mutation.', true);
     else toast(result.architecture_review_required ? 'Agent created an architecture proposal for review.' : 'Project state updated.');
-    await refresh();
+    await refresh({projectId, guard});
     return result;
   } catch (err) {
+    if (!committedProjectGuardIsCurrent(guard)) return null;
     if (boundedContextRequested && /agent_context_preview_stale|stale_architecture_version/.test(String(err?.message || err))) {
       clearAgentContextPreview();
       syncAgentContextPreview();
@@ -4634,7 +4890,7 @@ async function sendEvent(type, payload, workingDetail = '') {
     toast(err.message, true);
     return null;
   } finally {
-    setWorking(false);
+    finishWorkingRequest(workingRequestId);
   }
 }
 
@@ -4674,43 +4930,49 @@ async function generateInitialArchitecture() {
     toast('Built-in architecture generation is disabled in WebMCP Agent Mode.', true);
     return null;
   }
-  if (!state.projectId || state.architecture?.version > 0) return;
+  const projectId = state.projectId;
+  if (!projectId || state.architecture?.version > 0) return null;
+  const guard = captureNavigationGuard(projectId);
+  if (!committedProjectGuardIsCurrent(guard)) return null;
   const startedAt = Date.now();
-  setArchitectureProgress(true, startedAt);
-  setWorking(true);
+  const workingRequestId = beginWorkingRequest('', {projectId, architectureStartedAt:startedAt});
   const controller = new AbortController();
   const clientTimeout = setTimeout(() => controller.abort(), 42000);
   try {
-    const result = await api(`/projects/${state.projectId}/events`, {
+    const result = await api(`/projects/${projectId}/events`, {
       method: 'POST',
       signal: controller.signal,
       body: JSON.stringify({type: 'USER_MESSAGE', source: 'FRONTEND', payload: {intent: 'INITIAL_ARCHITECTURE'}}),
     });
+    if (!committedProjectGuardIsCurrent(guard)) return result;
     state.lastRun = result;
     if (result.result === 'SUCCESS') {
       toast('Architecture v1 and initial tasks created from the confirmed Goal.');
     } else {
       toast(result.error || 'Architecture generation stopped safely. Retry when ready.', true);
     }
-    await refresh();
+    await refresh({projectId, guard});
     return result;
   } catch (err) {
     const message = err?.name === 'AbortError'
       ? 'Architecture generation reached the client deadline. The saved Goal is safe; retry once the backend is available.'
       : err.message;
-    toast(message, true);
-    await refresh();
+    if (committedProjectGuardIsCurrent(guard)) {
+      toast(message, true);
+      await refresh({projectId, guard});
+    }
     return null;
   } finally {
     clearTimeout(clientTimeout);
-    setArchitectureProgress(false);
-    setWorking(false);
+    finishWorkingRequest(workingRequestId);
   }
 }
 
-function switchView(name) {
-  if (state.onboarding.active) return;
-  if (!views[name]) return;
+function switchView(name, {historyMode = 'push', navigationGuard = null} = {}) {
+  if (state.onboarding.active) return false;
+  if (!views[name]) return false;
+  const guard = navigationGuard || beginNavigationTransition(state.projectId);
+  if (!navigationGenerationIsCurrent(guard)) return false;
   if (name === 'tasks') {
     state.selectedProposalId = null;
     state.selectedComponentId = null;
@@ -4719,6 +4981,13 @@ function switchView(name) {
     state.selectedTaskId = null;
   }
   state.currentView = name;
+  if (!commitNavigation({
+    projectId:state.projectId,
+    view:name,
+    canvas:ARCHITECTURE_CANVAS_MODE,
+    nodeId:name === 'architecture' ? state.selectedComponentId : null,
+    inspectorTab:name === 'architecture' ? state.inspectorTab : 'overview',
+  }, {historyMode, guard})) return false;
   document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
   $(`view-${name}`).classList.add('active');
   $('pageTitle').textContent = views[name].title;
@@ -4729,6 +4998,7 @@ function switchView(name) {
   const workspaceMain = $('workspaceMain');
   if (workspaceMain) workspaceMain.scrollTop = 0;
   window.scrollTo(0, 0);
+  return true;
 }
 
 function wireGoButtons() {
@@ -5255,17 +5525,32 @@ async function addMcpConnection() {
   setMcpPickerTab('connected');
 }
 
+function committedWebMcpProjectId() {
+  const committedProjectId = state.navigation.initialized
+    ? (state.navigation.committed?.projectId || null)
+    : null;
+  if (
+    state.onboarding.active
+    || !committedProjectId
+    || committedProjectId !== state.projectId
+    || !state.project
+    || !state.architecture
+  ) return null;
+  return committedProjectId;
+}
+
 function webMcpRequireProject() {
-  if (!state.projectId || !state.project || !state.architecture) {
-    throw new Error('No active ArchBro project is loaded.');
-  }
+  const projectId = committedWebMcpProjectId();
+  if (!projectId) throw new Error('No active ArchBro project is loaded.');
+  return projectId;
 }
 
 function webMcpContext() {
-  if (!state.projectId || !state.project || !state.architecture) {
+  const projectId = committedWebMcpProjectId();
+  if (!projectId) {
     return {
       project: null,
-      view: 'onboarding',
+      view: state.onboarding.active ? 'onboarding' : 'workspace',
       project_count: state.projects.length,
       can_create_project: true,
     };
@@ -5276,7 +5561,7 @@ function webMcpContext() {
   const selectedProposal = state.proposals.find((proposal) => proposal.id === state.selectedProposalId) || pending[0] || null;
   return {
     project: state.project,
-    view: state.currentView,
+    view: state.navigation.committed?.view || state.currentView,
     architecture_version: state.architecture.version,
     selected_task: selectedTask,
     selected_architecture_node: selectedNode,
@@ -5419,19 +5704,24 @@ function normalizeInitialPlanningTrace(rawTrace, normalizedComponents) {
 }
 
 window.ArchBroWebBridge = {
+  getCommittedNavigation() {
+    return committedNavigationSnapshot();
+  },
+
   getActiveProjectId() {
-    return state.projectId || null;
+    return committedWebMcpProjectId();
   },
 
   getActiveProjectBinding() {
     return {
-      projectId: state.projectId || null,
+      projectId: committedWebMcpProjectId(),
       generation: workspaceContextGeneration,
     };
   },
 
   async bootstrapProject({name, goal, architectureSummary, components = [], relationships = [], tasks = [], planningTrace, reasoning} = {}) {
     await ensureAppInitialized();
+    allowActionDispatch('project-create', {authority:'webmcp', feedback:false});
     const projectName = String(name || '').trim();
     const projectGoal = String(goal || '').trim();
     const summary = String(architectureSummary || '').trim();
@@ -5469,20 +5759,15 @@ window.ArchBroWebBridge = {
     }));
     if (normalizedTasks.some((task) => !task.title)) throw new Error('Every initial task requires a title.');
 
-    const previousProjectId = state.projectId;
+    const callerGuard = captureNavigationGuard(state.projectId);
     const project = await api('/projects', {
       method: 'POST',
       body: JSON.stringify({name: projectName, goal: projectGoal, description: ''}),
     });
-
+    let result = null;
+    let initializationReconciled = false;
     try {
-      state.projectId = project.id;
-      persistActiveProjectSelection(project.id);
-      state.project = project;
-      state.lastRun = null;
-      state.onboarding.active = false;
-      const bootstrapRequest = beginWorkspaceContextRequest(project.id);
-      const result = await api(`/projects/${project.id}/interactive-initial-architecture`, {
+      result = await api(`/projects/${project.id}/interactive-initial-architecture`, {
         method: 'POST',
         body: JSON.stringify({
           architecture,
@@ -5491,48 +5776,70 @@ window.ArchBroWebBridge = {
           planning_trace: normalizedPlanningTrace,
         }),
       });
-      await loadProjects();
-      const bootstrapStillSelected = isWorkspaceContextRequestCurrent(
-        bootstrapRequest,
-        {requireSelectedProject: true},
-      );
-      if (bootstrapStillSelected) await refresh();
-      return {
-        project,
-        ...result,
-        built_in_model_called: false,
-        context: bootstrapStillSelected ? webMcpContext() : {
-          project,
-          view: 'overview',
-          architecture_version: result?.architecture?.version ?? 1,
-          selected_task: null,
-          selected_architecture_node: null,
-          selected_proposal: null,
-          pending_proposal_count: 0,
-        },
-      };
-    } catch (error) {
-      try {
-        await api(`/projects/${project.id}`, {method: 'DELETE'});
-      } catch (_cleanupError) {
-        // Preserve the original bootstrap failure; cleanup is best-effort.
+    } catch (initializationError) {
+      const reconciliation = await reconcileBootstrapInitialization(project.id);
+      if (reconciliation.status === 'INITIALIZED') {
+        initializationReconciled = true;
+        result = {
+          architecture: reconciliation.architecture,
+          reconciled_after_initialization_error: true,
+        };
+      } else if (reconciliation.status === 'NOT_INITIALIZED' || reconciliation.status === 'NOT_FOUND') {
+        if (reconciliation.status === 'NOT_INITIALIZED') {
+          try {
+            await api(`/projects/${project.id}`, {method:'DELETE'});
+          } catch (_cleanupError) {
+            // The initialization is confirmed absent; cleanup remains best-effort.
+          }
+        }
+        throw initializationError;
+      } else {
+        const ambiguous = new Error(`${initializationError.message} Initialization outcome is ambiguous; the created project was retained for reconciliation.`);
+        ambiguous.cause = initializationError;
+        throw ambiguous;
       }
-      await loadProjects();
-      if (state.projectId === project.id) {
-        supersedeWorkspaceContextRequests();
-        state.projectId = previousProjectId || null;
-        if (previousProjectId) persistActiveProjectSelection(previousProjectId);
-        else clearActiveProjectSelection();
-        await refresh();
-      }
-      throw error;
     }
+
+    let uiRefresh = {status:'SKIPPED_SUPERSEDED'};
+    if (navigationGenerationIsCurrent(callerGuard)) {
+      const activationGuard = beginNavigationTransition(project.id);
+      const opened = await selectProject(project.id, {
+        view:'overview',
+        canvas:false,
+        historyMode:'push',
+        navigationGuard:activationGuard,
+      });
+      if (opened) {
+        const committedGuard = captureNavigationGuard(project.id);
+        try {
+          await loadProjects({guard:committedGuard});
+          uiRefresh = webMcpProjectStillCurrent({projectId:project.id, guard:committedGuard})
+            ? {status:'PASS'}
+            : {status:'SKIPPED_SUPERSEDED'};
+        } catch (refreshError) {
+          uiRefresh = {status:'PARTIAL', error:refreshError.message};
+        }
+      } else {
+        uiRefresh = {status:'FAILED', error:'Project initialized, but the UI could not activate it.'};
+      }
+    }
+    const capture = {projectId:project.id, guard:captureNavigationGuard(project.id)};
+    return {
+      project,
+      ...result,
+      mutation_outcome: 'INITIALIZED',
+      initialization_reconciled: initializationReconciled,
+      ui_refresh: uiRefresh,
+      built_in_model_called: false,
+      context: webMcpMutationContext(capture),
+    };
   },
 
   async expandArchitectureScope({scopeComponentId, children = [], reasoning, evidence = [], impact = '', expectedArchitectureVersion} = {}) {
     await ensureAppInitialized();
-    webMcpRequireProject();
-    await refresh();
+    const capture = captureWebMcpProject();
+    await refreshWebMcpProject(capture);
+    if (!webMcpProjectStillCurrent(capture)) throw supersededNavigationError();
     const scopeId = String(scopeComponentId || '').trim();
     if (!scopeId) throw new Error('scope_component_id is required.');
     if (!findArchitectureNode(scopeId)) throw new Error(`Architecture component not found: ${scopeId}`);
@@ -5569,26 +5876,39 @@ window.ArchBroWebBridge = {
   },
 
   async createProject({name, goal, description = ''} = {}) {
+    await ensureAppInitialized();
+    allowActionDispatch('project-create', {authority:'webmcp', feedback:false});
     const projectName = String(name || '').trim();
     const projectGoal = String(goal || '').trim();
     const projectDescription = String(description || '').trim();
     if (!projectName) throw new Error('Project name is required.');
     if (!projectGoal) throw new Error('Project goal is required.');
 
+    const callerGuard = captureNavigationGuard(state.projectId);
     const project = await api('/projects', {
       method: 'POST',
       body: JSON.stringify({name: projectName, goal: projectGoal, description: projectDescription}),
     });
-    supersedeWorkspaceContextRequests();
-    state.projectId = project.id;
-    persistActiveProjectSelection(project.id);
-    state.project = project;
-    state.lastRun = null;
-    state.onboarding.active = false;
-    await loadProjects();
-    await refresh();
+    let uiRefresh = {status:'SKIPPED_SUPERSEDED'};
+    if (navigationGenerationIsCurrent(callerGuard)) {
+      const activationGuard = beginNavigationTransition(project.id);
+      const opened = await selectProject(project.id, {historyMode:'push', navigationGuard:activationGuard});
+      if (opened) {
+        const committedGuard = captureNavigationGuard(project.id);
+        try {
+          await loadProjects({guard:committedGuard});
+          uiRefresh = webMcpProjectStillCurrent({projectId:project.id, guard:committedGuard}) ? {status:'PASS'} : {status:'SKIPPED_SUPERSEDED'};
+        } catch (error) {
+          uiRefresh = {status:'PARTIAL', error:error.message};
+        }
+      } else {
+        uiRefresh = {status:'FAILED', error:'Project created, but the UI could not activate it.'};
+      }
+    }
     return {
-      project: state.project,
+      project,
+      mutation_outcome: 'CREATED',
+      ui_refresh: uiRefresh,
       bootstrap_required: true,
       bootstrap_provider: 'webmcp-agent',
       built_in_model_called: false,
@@ -5607,31 +5927,57 @@ window.ArchBroWebBridge = {
   },
 
   async submitInitialArchitecture({architecture, tasks = [], planningTrace, reasoning} = {}) {
-    webMcpRequireProject();
+    await ensureAppInitialized();
+    const capture = captureWebMcpProject();
     if (!architecture || typeof architecture !== 'object') throw new Error('Architecture v1 is required.');
     if (!Array.isArray(tasks) || !tasks.length) throw new Error('At least one initial task is required.');
     const {components: normalizedComponents} = normalizeWebMcpArchitectureComponents(architecture.components || [], {requireIds: true});
     const normalizedPlanningTrace = normalizeInitialPlanningTrace(planningTrace, normalizedComponents);
-    const result = await api(`/projects/${state.projectId}/interactive-initial-architecture`, {
+    const result = await api(`/projects/${capture.projectId}/interactive-initial-architecture`, {
       method: 'POST',
       body: JSON.stringify({architecture: {...architecture, components: normalizedComponents}, tasks, planning_trace: normalizedPlanningTrace, reasoning: String(reasoning || '').trim()}),
     });
-    await refresh();
+    await refreshWebMcpProject(capture);
     return {
       ...result,
       built_in_model_called: false,
-      context: webMcpContext(),
+      context: webMcpMutationContext(capture),
     };
   },
 
   async getContext() {
+    await ensureAppInitialized();
     return webMcpContext();
+  },
+
+  async publishCodeArchitectureSnapshot({repository, revision, summary, components, relationships = [], sourceEvidence = []} = {}) {
+    await ensureAppInitialized();
+    const capture = captureWebMcpProject();
+    const result = await api(`/projects/${capture.projectId}/code-architecture/snapshots`, {
+      method:'POST',
+      body:JSON.stringify({
+        repository,
+        revision,
+        summary,
+        components,
+        relationships,
+        source_evidence:sourceEvidence,
+      }),
+    });
+    if (webMcpProjectStillCurrent(capture)) {
+      state.codeArchitectureRequestSerial += 1;
+      state.codeArchitecture = result;
+      state.codeDiagram = normalizeCodeArchitectureSnapshot(result);
+      if (state.currentView === 'architecture' && state.architectureGraphKind === 'code') render();
+    }
+    return result;
   },
 
   async getProjectBrief() {
     await ensureAppInitialized();
-    webMcpRequireProject();
-    await refresh();
+    const capture = captureWebMcpProject();
+    await refreshWebMcpProject(capture);
+    if (!webMcpProjectStillCurrent(capture)) throw supersededNavigationError();
     const summarizeTask = (task) => ({
       id: task.id,
       title: task.title,
@@ -5747,10 +6093,10 @@ window.ArchBroWebBridge = {
     expectedArchitectureVersion,
   } = {}) {
     await ensureAppInitialized();
-    webMcpRequireProject();
+    const capture = captureWebMcpProject();
     const expected = Number(expectedArchitectureVersion);
     if (!Number.isInteger(expected) || expected < 0) throw new Error('expected_architecture_version must be a non-negative integer.');
-    const result = await api(`/projects/${state.projectId}/agent-recommendations`, {
+    const result = await api(`/projects/${capture.projectId}/agent-recommendations`, {
       method: 'POST',
       body: JSON.stringify({
         recommendation,
@@ -5763,13 +6109,13 @@ window.ArchBroWebBridge = {
         expected_architecture_version: expected,
       }),
     });
-    await refresh();
-    if (result?.proposal?.id) {
+    await refreshWebMcpProject(capture);
+    if (webMcpProjectStillCurrent(capture) && result?.proposal?.id) {
       state.selectedProposalId = result.proposal.id;
     }
     return {
       ...result,
-      context: webMcpContext(),
+      context: webMcpMutationContext(capture),
     };
   },
 
@@ -5792,12 +6138,15 @@ window.ArchBroWebBridge = {
   },
 
   async getRecentActivity({limit = 10} = {}) {
-    webMcpRequireProject();
+    await ensureAppInitialized();
+    const capture = captureWebMcpProject();
     const boundedLimit = Math.min(50, Math.max(1, Number(limit) || 10));
-    const events = await api(`/projects/${state.projectId}/events?limit=${boundedLimit}`);
-    state.activity = events;
-    renderRecentActivity();
-    return {project_id: state.projectId, events, latest_agent_result: state.lastRun};
+    const events = await api(`/projects/${capture.projectId}/events?limit=${boundedLimit}`);
+    if (webMcpProjectStillCurrent(capture)) {
+      state.activity = events;
+      renderRecentActivity();
+    }
+    return {project_id: capture.projectId, events, latest_agent_result: webMcpProjectStillCurrent(capture) ? state.lastRun : null};
   },
 
   async focusPendingReview() {
@@ -5892,6 +6241,7 @@ window.ArchBroWebBridge = {
       'USER_MESSAGE',
       {message, evidence: normalizedEvidence, ui_context: uiContext},
       'Evaluating WebMCP project change…',
+      {authority:'webmcp'},
     );
   },
 
@@ -5905,8 +6255,8 @@ window.ArchBroWebBridge = {
     acceptanceCriteria = [],
   } = {}) {
     await ensureAppInitialized();
-    webMcpRequireProject();
-    const result = await api(`/projects/${state.projectId}/tasks`, {
+    const capture = captureWebMcpProject();
+    const result = await api(`/projects/${capture.projectId}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
         request_id: requestId,
@@ -5918,8 +6268,8 @@ window.ArchBroWebBridge = {
         acceptance_criteria: acceptanceCriteria,
       }),
     });
-    await refresh();
-    return {...result, context: webMcpContext()};
+    await refreshWebMcpProject(capture);
+    return {...result, context: webMcpMutationContext(capture)};
   },
 
   async recordProjectObservation({
@@ -5929,8 +6279,8 @@ window.ArchBroWebBridge = {
     relatedTaskId = null,
   } = {}) {
     await ensureAppInitialized();
-    webMcpRequireProject();
-    const result = await api(`/projects/${state.projectId}/observations`, {
+    const capture = captureWebMcpProject();
+    const result = await api(`/projects/${capture.projectId}/observations`, {
       method: 'POST',
       body: JSON.stringify({
         summary,
@@ -5939,13 +6289,13 @@ window.ArchBroWebBridge = {
         related_task_id: relatedTaskId,
       }),
     });
-    await refresh();
-    return {...result, context: webMcpContext()};
+    await refreshWebMcpProject(capture);
+    return {...result, context: webMcpMutationContext(capture)};
   },
 
   async updateTaskStatus({taskId, status} = {}) {
     await ensureAppInitialized();
-    webMcpRequireProject();
+    const capture = captureWebMcpProject();
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
     if (status === 'IN_PROGRESS' && task.status !== 'TODO') {
@@ -5955,12 +6305,12 @@ window.ArchBroWebBridge = {
       throw new Error(`Task ${taskId} must be IN_PROGRESS before completion.`);
     }
     if (!['IN_PROGRESS', 'DONE'].includes(status)) throw new Error(`Unsupported task status: ${status}`);
-    const result = await api(`/projects/${state.projectId}/tasks/${encodeURIComponent(taskId)}/status`, {
+    const result = await api(`/projects/${capture.projectId}/tasks/${encodeURIComponent(taskId)}/status`, {
       method: 'PATCH',
       body: JSON.stringify({status}),
     });
-    await refresh();
-    return {...result, context: webMcpContext()};
+    await refreshWebMcpProject(capture);
+    return {...result, context: webMcpMutationContext(capture)};
   },
 
   async decideProposal({proposalId, decision} = {}) {
@@ -6243,15 +6593,60 @@ $('bootstrapLogoutBtn')?.addEventListener('click', logout);
 wireGoButtons();
 document.querySelectorAll('[data-architecture-graph-kind]').forEach((button) => button.addEventListener('click', () => setArchitectureGraphKind(button.dataset.architectureGraphKind)));
 $('architectureCanvasBtn')?.addEventListener('click', toggleArchitectureCanvas);
-window.addEventListener('popstate', () => {
-  const enabled = new URLSearchParams(window.location.search).get('canvas') === 'architecture';
-  void setArchitectureCanvasMode(enabled, {pushHistory:false});
-});
+async function restoreNavigationFromLocation() {
+  const route = readNavigationRoute(window.location, {useStorageFallback:false});
+  const guard = beginNavigationTransition(route.projectId);
+  if (!route.projectId) {
+    return openPersonalWorkspace({historyMode:'none', navigationGuard:guard});
+  }
+  if (route.projectId !== state.projectId || !state.project) {
+    return selectProject(route.projectId, {
+      view:route.view,
+      canvas:route.canvas,
+      historyMode:'none',
+      navigationGuard:guard,
+      route,
+    });
+  }
+  if (route.canvas !== ARCHITECTURE_CANVAS_MODE) {
+    return setArchitectureCanvasMode(route.canvas, {
+      pushHistory:false,
+      historyMode:'none',
+      navigationGuard:guard,
+      route,
+    });
+  }
+  state.currentView = route.view;
+  state.canvasDeepLinkApplied = Boolean(route.canvas && route.nodeId);
+  state.canvasDeepLinkFocusPending = Boolean(route.canvas && route.nodeId);
+  state.inspectorTab = route.inspectorTab;
+  if (route.canvas && route.nodeId) {
+    state.selectedComponentId = route.nodeId;
+    state.selectedEdgeId = null;
+    state.graphFocusMode = 'connected';
+    state.canvasInspectorOpen = true;
+  } else if (!route.canvas) {
+    state.selectedComponentId = null;
+    state.selectedEdgeId = null;
+    state.inspectorTab = 'overview';
+  }
+  if (!commitNavigation(route, {historyMode:'none', guard})) return false;
+  render();
+  return true;
+}
+
+window.addEventListener('popstate', () => { void restoreNavigationFromLocation(); });
 window.matchMedia('(max-width: 760px)').addEventListener('change', syncMobileSidebarLayers);
+
 async function initializeWorkspace() {
+  const initialRoute = readNavigationRoute(window.location, {useStorageFallback:true});
+  const initialProjectId = initialRoute.projectId;
+  const guard = beginNavigationTransition(initialProjectId);
+  state.projectId = initialProjectId;
+  ARCHITECTURE_CANVAS_MODE = initialRoute.canvas;
+  syncArchitectureCanvasDomMode();
   try {
-    const initialProjectId = state.projectId;
-    const projectsPromise = loadProjects()
+    const projectsPromise = loadProjects({guard})
       .then(() => ({error: null}))
       .catch((error) => ({error}));
     const startupContextRequest = initialProjectId ? beginWorkspaceContextRequest(initialProjectId) : null;
@@ -6261,68 +6656,88 @@ async function initializeWorkspace() {
           .then((context) => ({context, error: null}))
           .catch((error) => ({context: null, error}))
       : Promise.resolve(null);
+
     if (initialProjectId) {
       const direct = await directProjectContextPromise;
       if (direct?.context
+          && navigationGenerationIsCurrent(guard)
           && workspaceContextIsCurrent(state.workspaceAsync, startupTicket)
           && isWorkspaceContextRequestCurrent(startupContextRequest)) {
         if (!bindWorkspaceContextArchitecture(state.workspaceAsync, startupTicket, direct.context.architecture?.version)) return false;
-        persistActiveProjectSelection(initialProjectId);
         state.onboarding.active = false;
         Object.assign(state, direct.context);
         clearWorkspaceOptionalData();
         clearAgentContextPreview();
-        if (ARCHITECTURE_CANVAS_MODE) state.currentView = 'architecture';
+        state.currentView = initialRoute.view;
+        state.inspectorTab = initialRoute.canvas && initialRoute.nodeId ? initialRoute.inspectorTab : 'overview';
+        state.selectedComponentId = initialRoute.canvas ? initialRoute.nodeId : null;
+        state.selectedEdgeId = null;
+        state.graphFocusMode = initialRoute.canvas && initialRoute.nodeId ? 'connected' : 'all';
+        state.canvasInspectorOpen = Boolean(initialRoute.canvas && initialRoute.nodeId);
+        state.canvasDeepLinkApplied = Boolean(initialRoute.canvas && initialRoute.nodeId);
+        state.canvasDeepLinkFocusPending = Boolean(initialRoute.canvas && initialRoute.nodeId);
+        if (!commitNavigation(initialRoute, {historyMode:'replace', guard})) return false;
         render();
-        void refreshWorkspaceOptionalResources(startupTicket, direct.context.architecture, {deferredResources:direct.context.deferredArchitectureResources});
+        void refreshWorkspaceOptionalResources(startupTicket, direct.context.architecture, {
+          deferredResources:direct.context.deferredArchitectureResources,
+        });
+        const committedGuard = captureNavigationGuard(initialProjectId);
         void projectsPromise.then((result) => {
-          if (result.error) toast(`Could not refresh the project list. ${result.error.message}`, true);
+          if (result.error && committedProjectGuardIsCurrent(committedGuard)) {
+            toast(`Could not refresh the project list. ${result.error.message}`, true);
+          }
         });
         return true;
       }
       if (direct?.error && !String(direct.error.message).startsWith('404:')) throw direct.error;
-    }
-    const projectsResult = await projectsPromise;
-    if (projectsResult.error) throw projectsResult.error;
-    const staleProjectId = state.projectId;
-    if (state.projectId && !state.projects.some((project) => project.id === state.projectId)) {
-      state.projectId = null;
-      clearActiveProjectSelection();
-      state.expandedProjectIds.delete(staleProjectId);
-      persistExpandedProjectIds();
-      const fallbackProjectId = (
-        persistedProjectId
-        && persistedProjectId !== staleProjectId
-        && state.projects.some((project) => project.id === persistedProjectId)
-      ) ? persistedProjectId : state.projects[0]?.id;
-      if (fallbackProjectId) {
-        state.expandedProjectIds.add(fallbackProjectId);
-        await selectProject(fallbackProjectId);
+      if (initialRoute.explicitProject && direct?.error && String(direct.error.message).startsWith('404:')) {
+        const projectsResult = await projectsPromise;
+        if (projectsResult.error) throw projectsResult.error;
+        if (!navigationGenerationIsCurrent(guard)) return false;
+        await openPersonalWorkspace({historyMode:'none', navigationGuard:guard});
+        toast('The project in this link is unavailable. No other project was opened instead.', true);
         return true;
       }
     }
-    if (state.projectId) {
-      persistActiveProjectSelection(state.projectId);
-      state.onboarding.active = false;
-      const ready = (await refresh()) !== false;
-      if (ready && ARCHITECTURE_CANVAS_MODE) {
-        state.currentView = 'architecture';
-        render();
+
+    const projectsResult = await projectsPromise;
+    if (projectsResult.error) throw projectsResult.error;
+    if (!navigationGenerationIsCurrent(guard)) return false;
+
+    if (initialProjectId && !state.projects.some((project) => project.id === initialProjectId)) {
+      state.expandedProjectIds.delete(initialProjectId);
+      persistExpandedProjectIds();
+      if (state.projects.length) {
+        state.expandedProjectIds.add(state.projects[0].id);
+        return selectProject(state.projects[0].id, {historyMode:'replace'});
       }
-      return ready;
     }
-    if (!state.projectId) {
-      if (WEBMCP_AGENT_MODE) {
-        state.onboarding.active = true;
-        renderOnboarding();
-      } else {
-        state.onboarding.active = false;
-        await loadProjectSnapshots();
-        renderWorkspaceHome();
-      }
-      return true;
+    if (initialProjectId) {
+      return selectProject(initialProjectId, {
+        view:initialRoute.view,
+        canvas:initialRoute.canvas,
+        historyMode:'replace',
+        route:initialRoute,
+      });
     }
+
+    supersedeWorkspaceContextRequests();
+    beginWorkspaceContext(state.workspaceAsync, null);
+    state.workspaceAsync.phase = 'ready';
+    state.workspaceAsync.architectureVersion = 0;
+    state.projectId = null;
+    state.onboarding.active = WEBMCP_AGENT_MODE;
+    if (!commitNavigation({projectId:null, view:'overview', canvas:false, nodeId:null, inspectorTab:'overview'}, {historyMode:'replace', guard})) return false;
+    if (WEBMCP_AGENT_MODE) {
+      renderOnboarding();
+    } else {
+      await loadProjectSnapshots({guard});
+      if (!navigationGenerationIsCurrent(guard)) return false;
+      renderWorkspaceHome();
+    }
+    return true;
   } catch (err) {
+    if (isSupersededNavigationError(err) || !navigationGenerationIsCurrent(guard)) return false;
     state.workspaceAsync.phase = 'failed';
     state.workspaceAsync.error = err?.message || String(err);
     toast(err.message, true);

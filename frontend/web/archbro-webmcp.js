@@ -224,7 +224,32 @@ function compactCodeArchitectureForTool(payload) {
 }
 
 function activeProjectBinding() {
-  const bridgeBinding = globalThis.window?.ArchBroWebBridge?.getActiveProjectBinding?.();
+  const bridge = globalThis.window?.ArchBroWebBridge;
+  const committedNavigation = bridge?.getCommittedNavigation?.();
+  if (typeof bridge?.getCommittedNavigation === 'function') {
+    if (!committedNavigation?.initialized) {
+      throw new Error('ArchBro navigation is still initializing.');
+    }
+    const committedProjectId = String(committedNavigation.project_id || '').trim();
+    if (!committedProjectId) throw new Error('No active ArchBro project is selected.');
+    const bridgeBinding = bridge.getActiveProjectBinding?.();
+    if (
+      !bridgeBinding
+      || String(bridgeBinding.projectId || '').trim() !== committedProjectId
+    ) {
+      throw new Error('ArchBro project navigation changed before the tool request could bind to it. Retry against the project currently on screen.');
+    }
+    return {
+      projectId: committedProjectId,
+      generation: Number.isInteger(bridgeBinding.generation) ? bridgeBinding.generation : null,
+      source: 'bridge',
+    };
+  }
+
+  // Legacy embedding surfaces without the transactional navigation bridge keep
+  // the older discovery path. Once committed navigation exists, URL/storage are
+  // never allowed to widen or resurrect a stale project.
+  const bridgeBinding = bridge?.getActiveProjectBinding?.();
   if (bridgeBinding && typeof bridgeBinding.projectId === 'string' && bridgeBinding.projectId.trim()) {
     return {
       projectId: bridgeBinding.projectId.trim(),
@@ -232,7 +257,7 @@ function activeProjectBinding() {
       source: 'bridge',
     };
   }
-  const bridgeProjectId = globalThis.window?.ArchBroWebBridge?.getActiveProjectId?.();
+  const bridgeProjectId = bridge?.getActiveProjectId?.();
   if (typeof bridgeProjectId === 'string' && bridgeProjectId.trim()) {
     return {projectId: bridgeProjectId.trim(), generation: null, source: 'bridge'};
   }
@@ -248,8 +273,16 @@ function activeProjectId() {
 }
 
 function assertActiveProjectBinding(binding) {
-  if (!binding || binding.source !== 'bridge' || binding.generation === null) return;
-  const current = globalThis.window?.ArchBroWebBridge?.getActiveProjectBinding?.();
+  if (!binding || binding.source !== 'bridge') return;
+  const bridge = globalThis.window?.ArchBroWebBridge;
+  if (typeof bridge?.getCommittedNavigation === 'function') {
+    const committed = bridge.getCommittedNavigation();
+    if (!committed?.initialized || committed.project_id !== binding.projectId) {
+      throw new Error('Active ArchBro project changed while the tool request was being prepared. Retry against the project currently on screen.');
+    }
+  }
+  if (binding.generation === null) return;
+  const current = bridge?.getActiveProjectBinding?.();
   if (
     !current
     || current.projectId !== binding.projectId
@@ -271,6 +304,7 @@ async function agentSurfaceApi(path, {method = 'GET', body, signal, projectBindi
     },
     ...(body === undefined ? {} : {body: JSON.stringify(body)}),
   });
+  if (projectBinding) assertActiveProjectBinding(projectBinding);
   if (!response.ok) {
     let detail = 'ArchBro agent surface request failed';
     try {

@@ -322,8 +322,10 @@ test('project view composer shares the typing-only rainbow edge state', async ()
 test('automatic project recovery expands the selected fallback before opening it', async () => {
   const js = await readFile(new URL('app.js', webRoot), 'utf8');
 
-  assert.match(js, /const fallbackProjectId = \([\s\S]*?\) \? persistedProjectId : state\.projects\[0\]\?\.id;/);
-  assert.match(js, /state\.expandedProjectIds\.add\(fallbackProjectId\);\s*await selectProject\(fallbackProjectId\);/);
+  const init = js.slice(js.indexOf('async function initializeWorkspace()'), js.indexOf('async function initializeApp()'));
+  assert.match(init, /state\.expandedProjectIds\.delete\(initialProjectId\);/);
+  assert.match(init, /state\.expandedProjectIds\.add\(state\.projects\[0\]\.id\);/);
+  assert.match(init, /return selectProject\(state\.projects\[0\]\.id, \{historyMode:'replace'\}\);/);
 });
 
 test('zero-project workspace stays browsable instead of forcing onboarding', async () => {
@@ -359,9 +361,13 @@ test('expanded projects persist locally alongside the current project', async ()
   assert.match(js, /persistExpandedProjectIds\(\);/);
 });
 
-test('deleting the last project returns to the personal workspace home', async () => {
+test('deleting the last project returns through the navigation authority', async () => {
   const js = await readFile(new URL('app.js', webRoot), 'utf8');
-  assert.match(js, /if \(state\.projects\.length\) \{[\s\S]*?selectProject\(state\.projects\[0\]\.id\);[\s\S]*?\} else \{[\s\S]*?renderWorkspaceHome\(\);/);
+  const deletion = js.slice(js.indexOf('async function deleteCurrentProject()'), js.indexOf('function closeDialogOnBackdrop'));
+  assert.match(deletion, /captureNavigationGuard\(deletedId\)/);
+  assert.match(deletion, /selectProject\(state\.projects\[0\]\.id, \{historyMode:'replace'\}\)/);
+  assert.match(deletion, /openPersonalWorkspace\(\{historyMode:'replace'\}\)/);
+  assert.doesNotMatch(deletion, /renderWorkspaceHome\(\)/);
 });
 
 test('Personal workspace opens the complete project home from an active project', async () => {
@@ -373,7 +379,7 @@ test('Personal workspace opens the complete project home from an active project'
   assert.match(html, /Personal workspace/);
   assert.match(js, /async function openPersonalWorkspace\(/);
   assert.match(js, /state\.projectId = null;/);
-  assert.match(js, /localStorage\.removeItem\('archbro-project-id'\);/);
+  assert.match(js, /commitNavigation\(\{projectId:null, view:'overview', canvas:false, nodeId:null, inspectorTab:'overview'\}/);
   assert.match(js, /\$\('workspaceSwitcherBtn'\)\.addEventListener\('click', openPersonalWorkspace\);/);
 });
 

@@ -166,10 +166,11 @@ test('architecture canvas reuses the canonical diagram surface with a dedicated 
   }
   assert.match(app, /ARCHITECTURE_CANVAS_MODE/);
   assert.match(app, /URL_PARAMS\.get\('canvas'\) === 'architecture'/);
-  assert.match(app, /function persistActiveProjectSelection\(projectId\)/);
-  assert.match(app, /if \(state\.projectId\) \{\s*persistActiveProjectSelection\(state\.projectId\);/);
-  assert.match(webmcp, /globalThis\.localStorage\?\.getItem\('archbro-project-id'\)\?\.trim\(\)/);
-  assert.match(webmcp, /new URLSearchParams\(globalThis\.location\?\.search \|\| ''\)\.get\('project'\)\?\.trim\(\)/);
+  assert.match(app, /function commitNavigation\(/);
+  assert.match(app, /localStorage\.setItem\('archbro-project-id', normalized\.projectId\)/);
+  const bindingAuthority=webmcp.slice(webmcp.indexOf('function activeProjectBinding()'),webmcp.indexOf('function activeProjectId()'));
+  assert.match(bindingAuthority, /getCommittedNavigation/);
+  assert.ok(bindingAuthority.indexOf("typeof bridge?.getCommittedNavigation === 'function'") < bindingAuthority.indexOf('Legacy embedding surfaces'));
   assert.match(app, /\/architecture\/canvas/);
   assert.match(app, /normalizeFullCanvasResponse/);
   assert.match(app, /groupFrames/);
@@ -304,7 +305,9 @@ test('server shared-trunk summaries compose over a parallel action representativ
 test('canvas mode switches in-page and never uses popup or location navigation', async () => {
   const app=await readFile(new URL('app.js',webRoot),'utf8');
   const section=app.slice(app.indexOf('function syncArchitectureCanvasDomMode('),app.indexOf('function setArchitectureGraphKind('));
-  assert.match(section,/history\.pushState/);
+  assert.match(section,/commitNavigation/);
+  const navigationWriter=app.slice(app.indexOf('function writeNavigationUrl('),app.indexOf('function supersededNavigationError('));
+  assert.match(navigationWriter,/history\[method\]/);
   assert.doesNotMatch(section,/window\.open\(/);
   assert.doesNotMatch(section,/window\.location\.assign/);
   assert.match(app,/addEventListener\('popstate'/);
@@ -326,6 +329,7 @@ test('canvas mode switches in-page and never uses popup or location navigation',
 
 async function canvasSwitchHarness(options = {}) {
   const app = await readFile(new URL('app.js', webRoot), 'utf8');
+  const navigation = app.slice(app.indexOf('const ROUTED_VIEWS'), app.indexOf('const architectureViewCache'));
   const asyncState = app.slice(
     app.indexOf('// WORKSPACE_ASYNC_STATE_START'),
     app.indexOf('// WORKSPACE_ASYNC_STATE_END') + '// WORKSPACE_ASYNC_STATE_END'.length,
@@ -338,11 +342,14 @@ async function canvasSwitchHarness(options = {}) {
     selectedEdgeId:'edge-1', inspectorTab:'tasks', graphFocusMode:'connected', collapsedNodeIds:new Set(['group']),
     canvasDeepLinkApplied:true, canvasDeepLinkFocusPending:false, canvasInspectorOpen:true,
     tracePathRequest:{source_id:'node:api'}, tracePathResult:{status:'FOUND'}, tracePathLoading:false, tracePathError:null, diagramError:null,
+    navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:Boolean(options.initialMode),nodeId:options.initialMode?'api':null,inspectorTab:options.initialMode?'tasks':'overview'}},
   };
   const calls = {push:0,replace:0,clear:0,render:0,load:0,cache:[],toasts:[]};
   const context = {
-    state, URL, ARCHITECTURE_CANVAS_MODE:Boolean(options.initialMode), architectureCanvasModeRequest:0,
-    window:{location:{href:`https://archbro.invalid/?project=project-1${options.initialMode ? '&canvas=architecture' : ''}`}},
+    state, URL, URLSearchParams, views:{overview:{},tasks:{},architecture:{}}, INSPECTOR_TABS:new Set(['overview','dependencies','tasks','evidence','code','decisions']),
+    ARCHITECTURE_CANVAS_MODE:Boolean(options.initialMode), architectureCanvasModeRequest:0,
+    localStorage:{getItem(){return null;},setItem(){},removeItem(){}},
+    window:{location:{href:`https://archbro.invalid/?project=project-1&view=architecture${options.initialMode ? '&canvas=architecture&node=api&tab=tasks' : ''}`}},
     history:{
       pushState(_state,_title,url){calls.push += 1; context.window.location.href = url;},
       replaceState(_state,_title,url){calls.replace += 1; context.window.location.href = url;},
@@ -355,7 +362,7 @@ async function canvasSwitchHarness(options = {}) {
     render:() => {calls.render += 1; if(options.renderFailure && calls.render === 1) throw new Error('render failed');},
     toast:message => calls.toasts.push(message), console,
   };
-  runInNewContext(`${asyncState}\n${helpers}\n${section}\n
+  runInNewContext(`${navigation}\n${asyncState}\n${helpers}\n${section}\n
     state.workspaceAsync=makeWorkspaceAsyncState(state.projectId);
     const contextTicket=beginWorkspaceContext(state.workspaceAsync,state.projectId);
     bindWorkspaceContextArchitecture(state.workspaceAsync,contextTicket,state.architecture?.version);
@@ -368,6 +375,7 @@ async function canvasSwitchHarness(options = {}) {
 function comparableCanvasSwitchState(value) {
   const copy = {...value, collapsedNodeIds:[...(value.collapsedNodeIds || [])]};
   delete copy.workspaceAsync;
+  if (copy.navigation) copy.navigation = {...copy.navigation, generation:0};
   return JSON.parse(JSON.stringify(copy));
 }
 
@@ -378,7 +386,10 @@ test('canvas switch failure preserves all reading state in both directions', asy
     assert.equal(await h.switchMode(!initialMode), false);
     assert.deepEqual(comparableCanvasSwitchState(h.state), comparableCanvasSwitchState(before));
     assert.equal(h.context.ARCHITECTURE_CANVAS_MODE, initialMode);
-    assert.equal(h.context.window.location.href, url);
+    const restoredUrl = new URL(h.context.window.location.href);
+    assert.equal(restoredUrl.searchParams.get('project'), 'project-1');
+    assert.equal(restoredUrl.searchParams.get('view'), 'architecture');
+    assert.equal(restoredUrl.searchParams.get('canvas') === 'architecture', initialMode);
     assert.equal(h.calls.push, 0); assert.equal(h.calls.clear, 0); assert.equal(h.calls.render, 0);
     assert.equal(h.state.workspaceAsync.resources.canvas.status, 'ready');
     assert.equal(h.state.workspaceAsync.resources.canvas.refreshing, false);
@@ -411,6 +422,8 @@ test('canvas switch back to the current mode cancels an in-flight opposite switc
   assert.equal(h.context.ARCHITECTURE_CANVAS_MODE, false);
   assert.deepEqual(comparableCanvasSwitchState(h.state), comparableCanvasSwitchState(before));
   assert.equal(h.calls.push, 0); assert.equal(h.calls.clear, 0);
+  assert.equal(new URL(h.context.window.location.href).searchParams.get('project'), 'project-1');
+  assert.equal(new URL(h.context.window.location.href).searchParams.get('view'), 'architecture');
   assert.equal(h.state.workspaceAsync.resources.canvas.status, 'ready');
   assert.equal(h.state.workspaceAsync.resources.canvas.refreshing, false);
 });
@@ -445,7 +458,10 @@ test('canvas switch rolls back reading state after a synchronous commit failure'
   assert.equal(await h.switchMode(true), false);
   assert.deepEqual(comparableCanvasSwitchState(h.state), comparableCanvasSwitchState(before));
   assert.equal(h.context.ARCHITECTURE_CANVAS_MODE, false);
-  assert.equal(h.context.window.location.href, url);
+  const restoredUrl = new URL(h.context.window.location.href);
+  assert.equal(restoredUrl.searchParams.get('project'), 'project-1');
+  assert.equal(restoredUrl.searchParams.get('view'), 'architecture');
+  assert.equal(restoredUrl.searchParams.has('canvas'), false);
   assert.equal(h.state.workspaceAsync.resources.canvas.status, 'ready');
   assert.equal(h.state.workspaceAsync.resources.canvas.refreshing, false);
 });
@@ -462,6 +478,7 @@ test('canvas switch uses the current cached diagram without a reload', async () 
 
 test('canvas switch fences an older pending Project Diagram resource load', async () => {
   const app = await readFile(new URL('app.js', webRoot), 'utf8');
+  const navigation = app.slice(app.indexOf('const ROUTED_VIEWS'), app.indexOf('const architectureViewCache'));
   const asyncState = app.slice(
     app.indexOf('// WORKSPACE_ASYNC_STATE_START'),
     app.indexOf('// WORKSPACE_ASYNC_STATE_END') + '// WORKSPACE_ASYNC_STATE_END'.length,
@@ -486,9 +503,12 @@ test('canvas switch fences an older pending Project Diagram resource load', asyn
     selectedEdgeId:null, inspectorTab:'overview', graphFocusMode:'all', collapsedNodeIds:new Set(),
     canvasDeepLinkApplied:false, canvasDeepLinkFocusPending:false, canvasInspectorOpen:false,
     tracePathRequest:null, tracePathResult:null, tracePathLoading:false, tracePathError:null,
+    navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:false,nodeId:null,inspectorTab:'overview'}},
   };
   const context = {
-    state, URL, ARCHITECTURE_CANVAS_MODE:false, architectureCanvasModeRequest:0,
+    state, URL, URLSearchParams, views:{overview:{},tasks:{},architecture:{}}, INSPECTOR_TABS:new Set(['overview']),
+    ARCHITECTURE_CANVAS_MODE:false, architectureCanvasModeRequest:0,
+    localStorage:{getItem(){return null;},setItem(){},removeItem(){}},
     window:{location:{href:'https://archbro.invalid/?project=project-1'}},
     history:{pushState(_state,_title,url){context.window.location.href=url;},replaceState(_state,_title,url){context.window.location.href=url;}},
     loadArchitectureDiagram:async() => new Promise(resolve => {resolveProjectDiagram=resolve;}),
@@ -497,7 +517,7 @@ test('canvas switch fences an older pending Project Diagram resource load', asyn
     cacheArchitectureView:() => {}, resetArchitectureViewCache:() => {}, syncArchitectureCanvasDomMode:() => {},
     clearArchitectureTracePath:() => {}, render:() => {}, toast:() => {}, console,
   };
-  runInNewContext(`${asyncState}\n${refresh}\n${helpers}\n${mode}\n
+  runInNewContext(`${navigation}\n${asyncState}\n${refresh}\n${helpers}\n${mode}\n
     state.workspaceAsync=makeWorkspaceAsyncState('project-1');
     const ticket=beginWorkspaceContext(state.workspaceAsync,'project-1');
     bindWorkspaceContextArchitecture(state.workspaceAsync,ticket,7);
@@ -544,7 +564,7 @@ test('workspace restore never presents the signed-out landing screen as loading 
   assert.doesNotMatch(core,/architecture\/canvas|code-architecture/);
   assert.match(app,/void refreshWorkspaceOptionalResources\(/);
   const workspaceInit=app.slice(app.indexOf('async function initializeWorkspace()'),app.indexOf('async function initializeApp()'));
-  assert.match(workspaceInit,/const projectsPromise = loadProjects\(\)/);
+  assert.match(workspaceInit,/const projectsPromise = loadProjects\(\{guard\}\)/);
   assert.match(workspaceInit,/const directProjectContextPromise = initialProjectId/);
   assert.match(workspaceInit,/loadProjectCoreContext\(initialProjectId/);
   assert.ok(workspaceInit.indexOf('await directProjectContextPromise') < workspaceInit.indexOf('await projectsPromise'));

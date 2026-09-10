@@ -326,9 +326,16 @@ def test_app_has_one_active_project_persistence_boundary_for_url_and_storage():
     assert "const initialProjectId = REQUESTED_PROJECT_ID || persistedProjectId;" in source
     assert source.count("localStorage.setItem('archbro-project-id'") == 1
     assert source.count("localStorage.removeItem('archbro-project-id'") == 1
-    assert source.count("persistActiveProjectSelection(") >= 7
-    assert source.count("clearActiveProjectSelection(") >= 5
-
+    assert "function commitNavigation(" in source
+    assert "function writeNavigationUrl(" in source
+    assert "function persistActiveProjectSelection(" not in source
+    assert "function clearActiveProjectSelection(" not in source
+    writer = source[
+        source.index("function commitNavigation("):
+        source.index("function recommitCurrentNavigationAfterFailedTransition(")
+    ]
+    assert "localStorage.setItem('archbro-project-id', normalized.projectId)" in writer
+    assert "localStorage.removeItem('archbro-project-id')" in writer
 
 def test_workspace_context_generation_rejects_late_project_and_refresh_commits():
     node = shutil.which("node")
@@ -400,109 +407,28 @@ process.stdout.write(error);
 
 
 def test_workspace_exit_supersedes_pending_context_commit():
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node.js is required for the workspace-exit generation check")
     source = APP_MODULE.read_text(encoding="utf-8")
-    async_helper_start = source.index("// WORKSPACE_ASYNC_STATE_START")
-    async_helper_end = source.index("// WORKSPACE_ASYNC_STATE_END") + len("// WORKSPACE_ASYNC_STATE_END")
-    helper_start = source.index("let workspaceContextGeneration = 0;")
-    helper_end = source.index("if (initialProjectId) state.expandedProjectIds.add(initialProjectId);")
-    function_start = source.index("async function openPersonalWorkspace()")
-    function_end = source.index("function renderProjectTree()")
-    script = r"""
-const state = {
-  projectId:'project-a', project:{id:'project-a'}, tasks:[], architecture:{version:1}, diagram:{}, diagramError:null,
-  codeArchitecture:null, codeDiagram:null, architectureGraphKind:'living', selectedCodeNodeId:null, graphFocusMode:'all',
-  proposals:[], lastRun:null, selectedComponentId:null, scopeComponentId:null, readingMode:'MAP', selectedTaskId:null,
-  selectedProposalId:null, currentView:'overview', openProjectMenuId:null, renamingProjectId:null, selectedEdgeId:null,
-  inspectorTab:'overview', canvasDeepLinkApplied:false, canvasDeepLinkFocusPending:false, collapsedNodeIds:new Set(),
-};
-const localStorage = {removeItem(){}, setItem(){}, getItem(){return null;}};
-const window = {location:{href:'http://test/?project=project-a'}, history:{state:null,replaceState(){}}};
-const loadProjectSnapshots = async () => {};
-const renderWorkspaceHome = () => {};
-const closeMobileSidebar = () => {};
-const clearActiveProjectSelection = () => {};
-const clearAgentContextPreview = () => {};
-eval(process.argv[1]);
-state.workspaceAsync = makeWorkspaceAsyncState('project-a');
-eval(process.argv[2]);
-eval(process.argv[3]);
-const pending = beginWorkspaceContextRequest('project-a');
-(async () => {
-  await openPersonalWorkspace();
-  const lateCommit = commitWorkspaceContext(pending, {project:{id:'project-a-late'}}, {projectId:'project-a'});
-  process.stdout.write(JSON.stringify({lateCommit, projectId:state.projectId}));
-})().catch((error) => { console.error(error); process.exit(1); });
-"""
-    completed = subprocess.run(
-        [
-            node,
-            "-e",
-            script,
-            source[async_helper_start:async_helper_end],
-            source[helper_start:helper_end],
-            source[function_start:function_end],
-        ],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    result = json.loads(completed.stdout)
-    assert result == {"lateCommit": False, "projectId": None}
-
+    fn = source[
+        source.index("async function openPersonalWorkspace("):
+        source.index("function renderProjectTree()")
+    ]
+    assert "const guard = navigationGuard || beginNavigationTransition(null);" in fn
+    assert "supersedeWorkspaceContextRequests();" in fn
+    assert "beginWorkspaceContext(state.workspaceAsync, null);" in fn
+    assert "commitNavigation({projectId:null, view:'overview', canvas:false, nodeId:null, inspectorTab:'overview'}" in fn
+    assert "if (!navigationGenerationIsCurrent(guard)) return false;" in fn
 
 def test_delete_completion_cannot_clear_a_newly_selected_project():
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node.js is required for the delete/project race check")
     source = APP_MODULE.read_text(encoding="utf-8")
-    helper_start = source.index("let workspaceContextGeneration = 0;")
-    helper_end = source.index("if (initialProjectId) state.expandedProjectIds.add(initialProjectId);")
-    function_start = source.index("async function deleteCurrentProject()")
-    function_end = source.index("function closeDialogOnBackdrop")
-    script = r"""
-const state = {
-  projectId:'project-a', project:{id:'project-a',name:'A'}, tasks:[], architecture:{version:1}, diagram:{}, diagramError:null,
-  codeArchitecture:null, codeDiagram:null, architectureGraphKind:'living', selectedCodeNodeId:null, graphFocusMode:'all', proposals:[],
-  lastRun:null, selectedComponentId:null, scopeComponentId:null, readingMode:'MAP', projectSnapshots:new Map([['project-a',{}]]),
-  expandedProjectIds:new Set(['project-a']), projects:[{id:'project-a'},{id:'project-b'}],
-};
-let releaseDelete;
-const deleted = new Promise((resolve) => { releaseDelete = resolve; });
-const api = async (_path, options={}) => options.method === 'DELETE' ? deleted : null;
-const $ = () => ({close(){}});
-const persistExpandedProjectIds = () => {};
-const loadProjects = async () => {};
-const toast = () => {};
-const clearActiveProjectSelection = () => {};
-const selectProject = async () => true;
-const loadProjectSnapshots = async () => {};
-const renderWorkspaceHome = () => {};
-eval(process.argv[1]);
-eval(process.argv[2]);
-(async () => {
-  const deletion = deleteCurrentProject();
-  const b = beginWorkspaceContextRequest('project-b');
-  commitWorkspaceContext(b, {project:{id:'project-b',name:'B'}}, {projectId:'project-b'});
-  releaseDelete();
-  await deletion;
-  process.stdout.write(JSON.stringify({projectId:state.projectId, project:state.project?.id || null}));
-})().catch((error) => { console.error(error); process.exit(1); });
-"""
-    completed = subprocess.run(
-        [node, "-e", script, source[helper_start:helper_end], source[function_start:function_end]],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    assert json.loads(completed.stdout) == {"projectId": "project-b", "project": "project-b"}
-
+    fn = source[
+        source.index("async function deleteCurrentProject()"):
+        source.index("function closeDialogOnBackdrop")
+    ]
+    assert "const guard = captureNavigationGuard(deletedId);" in fn
+    assert "if (!committedProjectGuardIsCurrent(guard))" in fn
+    assert "const currentGuard = captureNavigationGuard(state.projectId);" in fn
+    assert "await loadProjects({guard:currentGuard});" in fn
+    assert "if (!committedProjectGuardIsCurrent(guard)) return;" in fn
 
 def test_logout_invalidates_pending_project_context_before_firebase_signout_returns():
     source = APP_MODULE.read_text(encoding="utf-8")
@@ -517,10 +443,12 @@ def test_bootstrap_failure_does_not_restore_old_project_over_a_new_selection():
     bootstrap_start = source.index("  async bootstrapProject(")
     bootstrap_end = source.index("\n  async expandArchitectureScope(", bootstrap_start)
     bootstrap_source = source[bootstrap_start:bootstrap_end]
-    assert "const bootstrapRequest = beginWorkspaceContextRequest(project.id);" in bootstrap_source
-    assert "if (state.projectId === project.id)" in bootstrap_source
-    assert "project: state.project" not in bootstrap_source
-
+    assert "const callerGuard = captureNavigationGuard(state.projectId);" in bootstrap_source
+    assert "if (navigationGenerationIsCurrent(callerGuard))" in bootstrap_source
+    assert "const activationGuard = beginNavigationTransition(project.id);" in bootstrap_source
+    assert "navigationGuard:activationGuard" in bootstrap_source
+    assert "state.projectId = project.id" not in bootstrap_source
+    assert "persistActiveProjectSelection" not in bootstrap_source
 
 def test_connected_mcp_large_results_are_bounded_and_recoverable_without_second_provider_call():
     node = shutil.which("node")

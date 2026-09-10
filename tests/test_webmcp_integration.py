@@ -79,6 +79,13 @@ def test_webmcp_ui_mode_is_explicit_but_site_tools_auto_register_on_the_normal_u
     assert "function webMcpModeEnabled()" not in module
     assert "queueMicrotask(() => { autoRegisterArchBroWebMCP()" in module
 
+def test_frontend_app_parse_and_canvas_contract_regression():
+    root = Path(__file__).resolve().parents[1]
+    app = (root / "frontend" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "WEBMCP_ARCHITECTURE_KINDSconst" not in app
+    assert "const WEBMCP_ARCHITECTURE_KINDS = new Set([" in app
+    assert "archbro.canvas-layout.v10" in app
+
 def test_webmcp_asset_uses_current_imperative_document_model_context_surface(dsn):
     client = make_client(dsn)
     root = Path(__file__).resolve().parents[1]
@@ -102,7 +109,8 @@ def test_webmcp_asset_uses_current_imperative_document_model_context_surface(dsn
     assert "WEBMCP_PUBLIC_HOSTS" not in app.text
     assert "Built-in architecture generation is disabled in WebMCP Agent Mode." in app.text
     brief_block = app.text.split("async getProjectBrief()", 1)[1].split("async getDecisionContext()", 1)[0]
-    assert "await refresh();" in brief_block
+    assert "const capture = captureWebMcpProject();" in brief_block
+    assert "await refreshWebMcpProject(capture);" in brief_block
     assert "appInitializationPromise = initialize();" in app.text
     for method in (
         "bootstrapProject",
