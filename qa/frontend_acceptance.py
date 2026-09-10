@@ -407,7 +407,7 @@ def run(open_report: bool = False, stage3: bool = False) -> int:
         wait_for_health(server, base_url)
         test_env = env.copy()
         test_env["ARCHBRO_BASE_URL"] = base_url
-        test_env["ARCHBRO_FINAL_FIX_CASES"] = "autonomous_surface_sweep,architecture_inspector_disclosure,architecture_canvas_interactions"
+        test_env["ARCHBRO_FINAL_FIX_CASES"] = "autonomous_surface_sweep,architecture_inspector_disclosure,architecture_canvas_interactions,canvas_committed_navigation,keyboard_and_mobile_layers,task_architecture_navigation"
         completed = subprocess.run(
             [sys.executable, str(ROOT / "qa" / "playwright_final_fix.py")],
             cwd=ROOT,

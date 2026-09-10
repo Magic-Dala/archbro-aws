@@ -646,7 +646,12 @@ def open_page(browser: Browser, backend: FakeBackend, *, viewport: dict | None =
     errors: list[str] = []
     page = context.new_page()
     page.on("pageerror", lambda error: errors.append(str(error)))
-    page.goto(BASE_URL, wait_until="networkidle")
+    try:
+        page.goto(BASE_URL, wait_until="networkidle")
+        assert not errors, errors
+    except Exception:
+        context.close()
+        raise
     return context, page, errors
 
 
@@ -924,11 +929,9 @@ def case_keyboard_and_mobile_layers(browser: Browser) -> None:
         page.wait_for_function("() => document.activeElement?.dataset.component === 'alpha-experience'")
         page.keyboard.press("ArrowRight")
         scoped_anchor = page.locator('[data-component="alpha-experience"][data-projection-role="SCOPE"]')
-        scoped_anchor.wait_for(state="visible")
-        assert "Workspace Experience" in page.locator("#graphCanvas").inner_text()
-        page.wait_for_function("() => document.activeElement?.dataset.component === 'alpha-experience'")
-        graph_back = page.locator('[data-graph-back]')
-        graph_back.focus()
+        page.locator(".graph-scope-bar strong", has_text="Workspace Experience").wait_for(state="visible")
+        assert scoped_anchor.count() == 0
+        page.wait_for_function("() => document.activeElement?.hasAttribute('data-graph-back')")
         page.keyboard.press("Enter")
         root_node = page.locator('[data-component="alpha-experience"][data-node-action="drill"]')
         root_node.wait_for(state="visible")
@@ -992,7 +995,8 @@ def case_task_architecture_navigation(browser: Browser) -> None:
         target.wait_for(state="visible")
         page.wait_for_function("() => document.querySelector('[data-component=\"task-nav-composer\"]')?.classList.contains('selected')")
         assert "selected" in (target.get_attribute("class") or "")
-        assert page.locator('[data-component="task-nav-experience"][data-projection-role="SCOPE"]').is_visible()
+        assert page.locator('[data-component="task-nav-experience"][data-projection-role="SCOPE"]').count() == 0
+        assert page.locator(".graph-scope-bar strong", has_text="Workspace Experience").is_visible()
 
         page.locator('[data-project-id="task-nav"] [data-project-view="tasks"]').click()
         linked_row = page.locator('[data-task-navigate="task-linked"]')
@@ -1136,6 +1140,92 @@ def case_architecture_inspector_disclosure(browser: Browser) -> None:
                 page.wait_for_timeout(80)
                 assert_inspector_geometry()
         assert "inspector-collaboration_and_notification" in page.locator("#nodeEvidence").inner_text()
+        assert not errors, errors
+
+
+def case_canvas_committed_navigation(browser: Browser) -> None:
+    project_id = "canvas-route"
+    backend = FakeBackend([project(project_id, "Canvas Committed Navigation")])
+    backend.contexts[project_id]["architecture"] = canvas_architecture(project_id)
+    context, page, errors = open_page(browser, backend, identity="email:canvas-route@example.com", project_id=project_id)
+    with diagnostic_scope(context.close):
+        page.goto(
+            f"{BASE_URL}?canvas=architecture&project={project_id}&node={project_id}-api&tab=dependencies",
+            wait_until="networkidle",
+        )
+        page.locator(f'[data-component="{project_id}-api"].selected').wait_for(state="visible")
+        page.locator(f'[data-component="{project_id}-validator"]').dispatch_event("click")
+        page.locator('[data-inspector-tab="tasks"]').click()
+        page.wait_for_function("() => new URL(location.href).searchParams.get('node') === 'canvas-route-validator'")
+        page.locator("#architectureCanvasBtn").click()
+        page.wait_for_function("() => document.body.dataset.architectureCanvasMode === 'false'")
+        page.locator("#architectureCanvasBtn").click()
+        page.wait_for_function("() => document.body.dataset.architectureCanvasMode === 'true'")
+        page.locator('[data-component="canvas-route-validator"].selected').wait_for(state="visible")
+        assert page.locator('[data-inspector-tab="tasks"]').get_attribute("aria-pressed") == "true"
+        assert parse_qs(urlsplit(page.url).query)["node"] == ["canvas-route-validator"]
+        assert parse_qs(urlsplit(page.url).query)["tab"] == ["tasks"]
+
+        # Graph-kind presentation is not a navigation intent. Returning to the
+        # Living graph must restore the same committed Living selection.
+        page.locator('[data-architecture-graph-kind="code"]').click()
+        page.wait_for_function("() => document.querySelector('#graphCanvas')?.dataset.graphKind === 'code'")
+        page.locator('[data-architecture-graph-kind="living"]').click()
+        page.wait_for_function("() => document.querySelector('#graphCanvas')?.dataset.graphKind === 'living'")
+        page.locator('[data-component="canvas-route-validator"].selected').wait_for(state="visible")
+        committed = page.evaluate("() => window.ArchBroWebBridge.getCommittedNavigation()")
+        assert committed["node_id"] == "canvas-route-validator"
+        assert committed["inspector_tab"] == "tasks"
+
+        # Collapsing a selected descendant promotes the visible group owner and
+        # synchronizes that selection through the navigation authority.
+        core_fold = page.locator('.canvas-group-fold[data-fold-group="node:canvas-route-core"]')
+        core_fold.click()
+        page.wait_for_function("() => new URL(location.href).searchParams.get('node') === 'canvas-route-core'")
+        page.locator('[data-component="canvas-route-core"].selected').wait_for(state="visible")
+        committed = page.evaluate("() => window.ArchBroWebBridge.getCommittedNavigation()")
+        assert committed["node_id"] == "canvas-route-core"
+
+        # A history route back to a descendant hidden by that collapse must
+        # expand its ancestors before deriving the visible projection.
+        page.evaluate("""() => {
+            const url = new URL(location.href);
+            url.searchParams.set('node', 'canvas-route-validator');
+            url.searchParams.set('tab', 'tasks');
+            history.pushState({}, '', url);
+            window.dispatchEvent(new PopStateEvent('popstate'));
+        }""")
+        page.locator('[data-component="canvas-route-validator"].selected').wait_for(state="visible")
+        assert page.locator('.canvas-group-summary[data-fold-group="node:canvas-route-core"]').count() == 0
+        committed = page.evaluate("() => window.ArchBroWebBridge.getCommittedNavigation()")
+        assert committed["node_id"] == "canvas-route-validator"
+
+        # An explicit Canvas history entry without a node owns the empty
+        # selection. It must not inherit the previous entry's local selection.
+        page.evaluate("""() => {
+            const url = new URL(location.href);
+            url.searchParams.delete('node');
+            url.searchParams.delete('tab');
+            history.pushState({}, '', url);
+            window.dispatchEvent(new PopStateEvent('popstate'));
+        }""")
+        page.wait_for_function("""() =>
+            window.ArchBroWebBridge.getCommittedNavigation().node_id === null &&
+            !document.querySelector('.node-card.selected')
+        """)
+        assert page.locator("#view-architecture .graph-layout").evaluate("node => !node.classList.contains('has-canvas-inspector')")
+        assert "node" not in parse_qs(urlsplit(page.url).query)
+        assert "tab" not in parse_qs(urlsplit(page.url).query)
+
+        page.evaluate("""() => {
+            const url = new URL(location.href);
+            url.searchParams.set('node', 'missing-node');
+            url.searchParams.set('tab', 'code');
+            history.pushState({}, '', url);
+            window.dispatchEvent(new PopStateEvent('popstate'));
+        }""")
+        page.wait_for_function("() => !new URL(location.href).searchParams.has('node')")
+        assert page.locator(".node-card.selected").count() == 0
         assert not errors, errors
 
 
@@ -2054,6 +2144,7 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
 
 
 CASES = [
+    ("canvas_committed_navigation", case_canvas_committed_navigation),
     ("autonomous_surface_sweep", case_autonomous_surface_sweep),
     ("landing_authentication_teaser", case_landing_authentication_teaser),
     ("progressive_project_creation", case_progressive_project_creation),
@@ -2115,6 +2206,23 @@ def run_case_with_static_server(case) -> None:
     original_base_url = BASE_URL
     web_root = Path(__file__).resolve().parents[1] / "frontend" / "web"
     class LaneStaticHandler(SimpleHTTPRequestHandler):
+        def do_GET(self) -> None:
+            # Supply the local runtime configuration when no application server
+            # is running. Project data is still owned by each case's FakeBackend.
+            path = urlsplit(self.path).path
+            if path == "/runtime-config.js":
+                content_type = "application/javascript"
+                body = 'window.__ARCHBRO_RUNTIME_CONFIG__ = {"auth_mode":"local","firebase":null};'
+            else:
+                super().do_GET()
+                return
+            encoded = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
         def translate_path(self, path: str) -> str:
             if path.startswith("/static/"):
                 path = path[len("/static/"):]
@@ -2145,6 +2253,22 @@ def test_s2_04_architecture_canvas_interactions_browser() -> None:
 
 def test_s2_05_architecture_inspector_disclosure_browser() -> None:
     run_case_with_static_server(case_architecture_inspector_disclosure)
+
+def test_canvas_committed_navigation_browser() -> None:
+    run_case_with_static_server(case_canvas_committed_navigation)
+
+
+def test_scoped_keyboard_focus_browser() -> None:
+    run_case_with_static_server(case_keyboard_and_mobile_layers)
+
+
+def test_task_architecture_navigation_browser() -> None:
+    run_case_with_static_server(case_task_architecture_navigation)
+
+
+def test_autonomous_surface_sweep_browser() -> None:
+    run_case_with_static_server(case_autonomous_surface_sweep)
+
 
 def main() -> None:
     requested = {name for name in os.getenv("ARCHBRO_FINAL_FIX_CASES", "").split(",") if name}

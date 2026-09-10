@@ -14,11 +14,7 @@ const prototype = window.ArchbroPrototype;
 const URL_PARAMS = new URLSearchParams(window.location.search);
 let ARCHITECTURE_CANVAS_MODE = URL_PARAMS.get('canvas') === 'architecture';
 const REQUESTED_PROJECT_ID = String(URL_PARAMS.get('project') || '').trim() || null;
-const REQUESTED_ARCHITECTURE_NODE_ID = String(URL_PARAMS.get('node') || '').trim() || null;
 const INSPECTOR_TABS = new Set(['overview','dependencies','tasks','evidence','code','decisions']);
-const REQUESTED_INSPECTOR_TAB = INSPECTOR_TABS.has(String(URL_PARAMS.get('tab') || '').trim().toLowerCase())
-  ? String(URL_PARAMS.get('tab')).trim().toLowerCase()
-  : 'overview';
 const persistedProjectId = localStorage.getItem('archbro-project-id');
 const initialProjectId = REQUESTED_PROJECT_ID || persistedProjectId;
 const WEBMCP_AGENT_MODE = new URLSearchParams(window.location.search).get('mode') === 'webmcp';
@@ -166,7 +162,7 @@ const state = {
   tracePathLoading: false,
   tracePathError: null,
   tracePathRequestSerial: 0,
-  inspectorTab: REQUESTED_INSPECTOR_TAB,
+  inspectorTab: 'overview',
   canvasDeepLinkApplied: false,
   canvasDeepLinkFocusPending: false,
   graphFocusMode: 'all',
@@ -1666,10 +1662,22 @@ async function selectProject(projectId, {
     state.currentView = ROUTED_VIEWS.has(view) ? view : 'overview';
     if (route?.canvas && route?.nodeId) {
       state.selectedComponentId = route.nodeId;
+      state.selectedEdgeId = null;
       state.inspectorTab = route.inspectorTab || 'overview';
       state.canvasInspectorOpen = true;
-      state.canvasDeepLinkApplied = true;
-      state.canvasDeepLinkFocusPending = true;
+      state.canvasDeepLinkApplied = false;
+      state.canvasDeepLinkFocusPending = false;
+    } else if (route?.canvas) {
+      // A caller may restore the current project without going through the
+      // popstate handler. The explicit empty Canvas route still owns selection.
+      state.selectedComponentId = null;
+      state.selectedEdgeId = null;
+      state.inspectorTab = 'overview';
+      state.canvasInspectorOpen = false;
+      state.canvasDeepLinkApplied = false;
+      state.canvasDeepLinkFocusPending = false;
+      state.graphFocusMode = 'all';
+      clearArchitectureTracePath({render:false});
     } else if (!canvas) {
       state.selectedComponentId = null;
       state.selectedEdgeId = null;
@@ -1727,8 +1735,8 @@ async function selectProject(projectId, {
       currentView: ROUTED_VIEWS.has(view) ? view : (canvas ? 'architecture' : 'overview'),
       inspectorTab: canvas && route?.nodeId ? (route.inspectorTab || 'overview') : 'overview',
       canvasInspectorOpen: Boolean(canvas && route?.nodeId),
-      canvasDeepLinkApplied: Boolean(canvas && route?.nodeId),
-      canvasDeepLinkFocusPending: Boolean(canvas && route?.nodeId),
+      canvasDeepLinkApplied: false,
+      canvasDeepLinkFocusPending: false,
     });
     if (!retainOptional) clearWorkspaceOptionalData();
     state.onboarding.active = false;
@@ -2956,13 +2964,18 @@ function toggleGraphNodeCollapse(nodeId) {
   if (!ARCHITECTURE_CANVAS_MODE) return false;
   const node = diagramNodeById(nodeId);
   if (!node || node.childCount < 1) return false;
+  let selectionChanged = false;
   if (state.collapsedNodeIds.has(nodeId)) state.collapsedNodeIds.delete(nodeId);
   else {
     state.collapsedNodeIds.add(nodeId);
     const selected=diagramNodeByComponentId(state.selectedComponentId);
-    if(selected && (selected.hierarchyPath || []).slice(0,-1).includes(nodeId)) state.selectedComponentId=node.component_id;
+    if (selected && (selected.hierarchyPath || []).slice(0,-1).includes(nodeId)) {
+      state.selectedComponentId = node.component_id;
+      selectionChanged = true;
+    }
   }
   state.selectedEdgeId = null;
+  if (selectionChanged) syncArchitectureCanvasSelectionUrl();
   renderGraph();
   return true;
 }
@@ -3007,7 +3020,15 @@ async function navigateGraphScope(scopeComponentId, {focusComponentId = state.sc
     }
     settleWorkspaceResource(state.workspaceAsync, request, 'ready');
     render();
-    if (focusComponentId && typeof document !== 'undefined') setTimeout(() => document.querySelector(`[data-component="${CSS.escape(focusComponentId)}"]`)?.focus(), 0);
+    if (typeof document !== 'undefined') setTimeout(() => {
+      if (!graphTransitionIsCurrent(transition)) return;
+      const componentTarget = focusComponentId
+        ? document.querySelector(`[data-component="${CSS.escape(focusComponentId)}"]`)
+        : null;
+      // The scope bar represents a root omitted from the scoped graph.
+      // Keep keyboard focus on a visible control after reconciliation.
+      (componentTarget || (targetScope ? document.querySelector('[data-graph-back]') : null))?.focus();
+    }, 0);
     return true;
   } catch (err) {
     if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphTransitionIsCurrent(transition)) return false;
@@ -3541,7 +3562,9 @@ async function setArchitectureCanvasMode(enabled, {
       state.inspectorTab = requestedInspectorTab || 'overview';
       state.canvasInspectorOpen = true;
       state.graphFocusMode = 'connected';
-    } else if (invalidRequestedNode) {
+    } else if (enabled && route) {
+      // An explicit Canvas route with no node is itself authoritative. Do not
+      // inherit the selection from the previously displayed history entry.
       state.selectedComponentId = null;
       state.selectedEdgeId = null;
       state.inspectorTab = 'overview';
@@ -3554,6 +3577,10 @@ async function setArchitectureCanvasMode(enabled, {
     const routeHistoryMode = route
       ? (invalidRequestedNode && resolvedHistoryMode === 'none' ? 'replace' : resolvedHistoryMode)
       : 'none';
+    if (enabled && route) {
+      state.canvasDeepLinkApplied = true;
+      state.canvasDeepLinkFocusPending = Boolean(requestedNode);
+    }
     if (!commitNavigation({
       projectId,
       view:state.currentView,
@@ -3593,8 +3620,9 @@ async function setArchitectureCanvasMode(enabled, {
     state.canvasDeepLinkApplied = false;
     reconcileGraphInteractionState(nextDiagram, currentInteraction);
 
-    const selectionId = requestedNodeId || state.selectedComponentId;
-    const invalidRequestedNode = Boolean(enabled && requestedNodeId && !diagramNodeByComponentId(requestedNodeId, nextDiagram));
+    const routeOwnsSelection = Boolean(enabled && route);
+    const selectionId = routeOwnsSelection ? requestedNodeId : state.selectedComponentId;
+    const invalidRequestedNode = Boolean(routeOwnsSelection && requestedNodeId && !diagramNodeByComponentId(requestedNodeId, nextDiagram));
     if (selectionId && diagramNodeByComponentId(selectionId, nextDiagram)) {
       state.selectedComponentId = selectionId;
       state.selectedEdgeId = null;
@@ -3604,7 +3632,7 @@ async function setArchitectureCanvasMode(enabled, {
         const target = diagramNodeByComponentId(selectionId, nextDiagram);
         (target?.hierarchyPath || []).slice(0, -1).forEach((id) => state.collapsedNodeIds.delete(id));
       }
-    } else if (requestedNodeId) {
+    } else if (routeOwnsSelection) {
       state.selectedComponentId = null;
       state.selectedEdgeId = null;
       state.inspectorTab = 'overview';
@@ -3612,7 +3640,9 @@ async function setArchitectureCanvasMode(enabled, {
       clearArchitectureTracePath({render:false});
     }
     state.canvasInspectorOpen = Boolean(enabled && state.selectedComponentId);
-    state.canvasDeepLinkApplied = Boolean(enabled && requestedNodeId && !invalidRequestedNode);
+    // Selection has already been reconciled with this projection. Rendering
+    // must preserve it even when this mode switch has no explicit deep link.
+    state.canvasDeepLinkApplied = Boolean(enabled);
     state.canvasDeepLinkFocusPending = Boolean(enabled && requestedNodeId && !invalidRequestedNode);
     syncArchitectureCanvasDomMode();
     if (resourceRequest) settleWorkspaceResource(state.workspaceAsync, resourceRequest, nextDiagram ? 'ready' : 'empty');
@@ -3665,10 +3695,10 @@ async function toggleArchitectureCanvas() {
 
 function setArchitectureGraphKind(kind, {render = renderGraph} = {}) {
   if (!['living','code'].includes(kind)) return false;
+  if (state.architectureGraphKind === kind) return true;
   state.architectureGraphKind = kind;
-  state.selectedComponentId = null;
-  state.selectedCodeNodeId = null;
-  state.graphFocusMode = 'all';
+  // Living and Code graphs own independent selections. Switching presentation
+  // must not erase the Living selection encoded by the committed Canvas route.
   render();
   updateInstructionContext();
   return true;
@@ -4524,6 +4554,38 @@ function graphEdgeLabelPlacements(edges, nodes) {
   return result;
 }
 
+function applyCanvasNavigationToDiagram(diagram) {
+  if (!ARCHITECTURE_CANVAS_MODE || state.canvasDeepLinkApplied) return;
+  const route = state.navigation.committed;
+  if (!route?.canvas || route.projectId !== state.projectId) return;
+  const requestedNode = route.nodeId
+    ? diagram.nodes.find((node) => node.component_id === route.nodeId)
+    : null;
+  if (requestedNode) {
+    (requestedNode.hierarchyPath || []).slice(0, -1).forEach((nodeId) => state.collapsedNodeIds.delete(nodeId));
+    state.selectedComponentId = requestedNode.component_id;
+    state.selectedEdgeId = null;
+    state.inspectorTab = INSPECTOR_TABS.has(route.inspectorTab) ? route.inspectorTab : 'overview';
+    state.graphFocusMode = 'connected';
+    state.canvasDeepLinkFocusPending = true;
+    state.canvasInspectorOpen = true;
+  } else {
+    state.selectedComponentId = null;
+    state.selectedEdgeId = null;
+    state.inspectorTab = 'overview';
+    state.graphFocusMode = 'all';
+    state.canvasDeepLinkFocusPending = false;
+    state.canvasInspectorOpen = false;
+    clearArchitectureTracePath({render:false});
+    if (route.nodeId) {
+      commitNavigation({...route, nodeId:null, inspectorTab:'overview'}, {
+        historyMode:'replace', guard:captureNavigationGuard(state.projectId),
+      });
+    }
+  }
+  state.canvasDeepLinkApplied = true;
+}
+
 function renderGraph() {
   renderArchitectureChrome();
   document.querySelector('#view-architecture .graph-layout')?.classList.toggle('has-canvas-inspector', state.architectureGraphKind === 'code' || state.canvasInspectorOpen);
@@ -4552,27 +4614,10 @@ function renderGraph() {
     $('graphReviewState').textContent = loading ? 'Diagram loading' : 'Diagram unavailable'; renderSelectedNode(); renderLists(); return;
   }
   const diagram = state.diagram;
+  // Apply committed navigation before deriving the visible projection. A route
+  // to a descendant may need to expand collapsed ancestors first.
+  applyCanvasNavigationToDiagram(diagram);
   const display = graphDisplayModel(diagram);
-  if (ARCHITECTURE_CANVAS_MODE && !state.canvasDeepLinkApplied) {
-    const requestedNode = REQUESTED_ARCHITECTURE_NODE_ID
-      ? diagram.nodes.find((node)=>node.component_id===REQUESTED_ARCHITECTURE_NODE_ID)
-      : null;
-    if (requestedNode) {
-      state.selectedComponentId = requestedNode.component_id;
-      state.selectedEdgeId = null;
-      state.inspectorTab = REQUESTED_INSPECTOR_TAB;
-      state.graphFocusMode = 'connected';
-      state.canvasDeepLinkFocusPending = true;
-      state.canvasInspectorOpen = true;
-    } else if (REQUESTED_ARCHITECTURE_NODE_ID) {
-      state.selectedComponentId = null;
-      state.selectedEdgeId = null;
-      state.inspectorTab = 'overview';
-      state.graphFocusMode = 'all';
-      state.canvasDeepLinkFocusPending = false;
-    }
-    state.canvasDeepLinkApplied = true;
-  }
   document.querySelector('#view-architecture .graph-layout')?.classList.toggle('has-canvas-inspector',state.canvasInspectorOpen);
   const selected = diagramNodeByComponentId(state.selectedComponentId);
   if (state.selectedComponentId && !selected) state.selectedComponentId = null;
@@ -6971,18 +7016,23 @@ async function restoreNavigationFromLocation() {
     });
   }
   state.currentView = route.view;
-  state.canvasDeepLinkApplied = Boolean(route.canvas && route.nodeId);
-  state.canvasDeepLinkFocusPending = Boolean(route.canvas && route.nodeId);
+  state.canvasDeepLinkApplied = false;
+  state.canvasDeepLinkFocusPending = false;
   state.inspectorTab = route.inspectorTab;
   if (route.canvas && route.nodeId) {
     state.selectedComponentId = route.nodeId;
     state.selectedEdgeId = null;
     state.graphFocusMode = 'connected';
     state.canvasInspectorOpen = true;
-  } else if (!route.canvas) {
+  } else {
+    // Popstate is an explicit navigation intent. A Canvas URL without `node`
+    // means no selected component, not "keep whatever was selected before".
     state.selectedComponentId = null;
     state.selectedEdgeId = null;
     state.inspectorTab = 'overview';
+    state.graphFocusMode = 'all';
+    state.canvasInspectorOpen = false;
+    clearArchitectureTracePath({render:false});
   }
   if (!commitNavigation(route, {historyMode:'none', guard})) return false;
   render();
@@ -7028,8 +7078,8 @@ async function initializeWorkspace() {
         state.selectedEdgeId = null;
         state.graphFocusMode = initialRoute.canvas && initialRoute.nodeId ? 'connected' : 'all';
         state.canvasInspectorOpen = Boolean(initialRoute.canvas && initialRoute.nodeId);
-        state.canvasDeepLinkApplied = Boolean(initialRoute.canvas && initialRoute.nodeId);
-        state.canvasDeepLinkFocusPending = Boolean(initialRoute.canvas && initialRoute.nodeId);
+        state.canvasDeepLinkApplied = false;
+        state.canvasDeepLinkFocusPending = false;
         if (!commitNavigation(initialRoute, {historyMode:'replace', guard})) return false;
         render();
         void refreshWorkspaceOptionalResources(startupTicket, direct.context.architecture, {
