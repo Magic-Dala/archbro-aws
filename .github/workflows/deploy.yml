@@ -46,6 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # CI and Deploy are separate workflows, so both start on a branch push.
       # This gate prevents Deploy from touching GCP until the CI workflow has
@@ -56,7 +58,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for attempt in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             payload="$(gh api -H 'Accept: application/vnd.github+json' \
               "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100")"
             status="$(jq -r '[.check_runs[] | select(.name == "Python")] | sort_by(.started_at) | last | .status // ""' <<<"$payload")"
@@ -76,46 +78,52 @@ jobs:
 
       - name: Resolve the target environment
         id: target
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          case "${{ github.ref_name }}" in
+          case "$REF_NAME" in
             main) echo "stack=archbro-main" >> "$GITHUB_OUTPUT"
                   echo "dir=/opt/archbro/main" >> "$GITHUB_OUTPUT"
                   echo "host=archbro.magicdala.com" >> "$GITHUB_OUTPUT" ;;
             dev)  echo "stack=archbro-dev" >> "$GITHUB_OUTPUT"
                   echo "dir=/opt/archbro/dev" >> "$GITHUB_OUTPUT"
                   echo "host=archbro-dev.magicdala.com" >> "$GITHUB_OUTPUT" ;;
-            *)    echo "::error::refusing to deploy branch ${{ github.ref_name }}"
+            *)    echo "::error::refusing to deploy branch $REF_NAME"
                   exit 1 ;;
           esac
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         id: auth
         with:
           workload_identity_provider: projects/382990620621/locations/global/workloadIdentityPools/github/providers/github
           service_account: archbro-deployer@magic-dala.iam.gserviceaccount.com
           token_format: access_token
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
 
       - name: Build and push
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           gcloud auth configure-docker "$REGISTRY" --quiet
           # Pinned rather than inferred: the VM is x86_64, and a runner that
           # happened to be arm64 would produce an image it cannot execute.
           docker build --platform linux/amd64 \
-            -t "$IMAGE_REPO:${{ github.ref_name }}" \
-            -t "$IMAGE_REPO:${{ github.ref_name }}-${{ github.sha }}" .
-          docker push "$IMAGE_REPO:${{ github.ref_name }}"
-          docker push "$IMAGE_REPO:${{ github.ref_name }}-${{ github.sha }}"
+            -t "$IMAGE_REPO:$REF_NAME" \
+            -t "$IMAGE_REPO:$REF_NAME-$GITHUB_SHA" .
+          docker push "$IMAGE_REPO:$REF_NAME"
+          docker push "$IMAGE_REPO:$REF_NAME-$GITHUB_SHA"
 
       - name: Upload the compose file and the deploy script
+        env:
+          STACK: ${{ steps.target.outputs.stack }}
         run: |
           # Home directory, not /tmp. /tmp has the sticky bit, so a file left
           # by one OS Login account cannot be overwritten by another, and the
           # deploy account differs from any human who has run this by hand.
           gcloud compute scp \
             deploy/stack/docker-compose.prod.yml \
-            "${GCE_INSTANCE}:archbro-${{ steps.target.outputs.stack }}.yml" \
+            "${GCE_INSTANCE}:archbro-${STACK}.yml" \
             --zone="$GCE_ZONE" --project="$GCP_PROJECT" --quiet
           gcloud compute scp deploy/deploy-stack.sh \
             "${GCE_INSTANCE}:deploy-stack.sh" \
@@ -146,10 +154,14 @@ jobs:
               http://${STACK}-app:8080/healthz"
 
       - name: Report
+        env:
+          STACK: ${{ steps.target.outputs.stack }}
+          HOST: ${{ steps.target.outputs.host }}
+          IMAGE: ${{ env.IMAGE_REPO }}:${{ github.ref_name }}-${{ github.sha }}
         run: |
           {
             echo "### Deployed"
-            echo "- environment: \`${{ steps.target.outputs.stack }}\`"
-            echo "- host: https://${{ steps.target.outputs.host }}"
-            echo "- image: \`${{ env.IMAGE_REPO }}:${{ github.ref_name }}-${{ github.sha }}\`"
+            echo "- environment: \`$STACK\`"
+            echo "- host: https://$HOST"
+            echo "- image: \`$IMAGE\`"
           } >> "$GITHUB_STEP_SUMMARY"
