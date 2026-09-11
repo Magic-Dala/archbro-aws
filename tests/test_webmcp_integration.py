@@ -208,6 +208,11 @@ def test_webmcp_bootstrap_bridge_is_single_agent_call_without_builtin_model(dsn)
     assert "normalizeInitialPlanningTrace(planningTrace, normalizedComponents)" in bootstrap_block
     assert "planning_trace: normalizedPlanningTrace" in bootstrap_block
     assert "children: []" not in bootstrap_block
+    assert "await resolveBootstrapInitialization(project.id, null)" in bootstrap_block
+    assert "await resolveBootstrapInitialization(project.id, result)" in bootstrap_block
+    assert "bootstrapOutcomeUnknownError(project.id" in bootstrap_block
+    assert "project: initializedProject" in bootstrap_block
+    assert "context: mutationContext" in bootstrap_block
 
     human_ui_block = app.text.split("async function confirmGoalAndGenerate()", 1)[1].split("function backToCurrentProject()", 1)[0]
     assert "await generateInitialArchitecture()" in human_ui_block

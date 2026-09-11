@@ -13,23 +13,23 @@ const externalResultCache = new Map();
 let staleReloadScheduled = false;
 
 const WEBMCP_MODEL_TOOL_DESCRIPTIONS = {
-  [`${TOOL_PREFIX}ping`]: 'Check WebMCP build identity without mutation or model use.',
-  [`${TOOL_PREFIX}get_agent_context`]: 'Get project context or server-owned node preview.',
-  [`${TOOL_PREFIX}get_architecture_diagram`]: 'Read one canonical architecture scope with deterministic layout.',
-  [`${TOOL_PREFIX}publish_code_architecture`]: 'Publish revision-pinned implementation evidence only.',
-  [`${TOOL_PREFIX}get_code_architecture`]: 'Read the latest implementation-evidence snapshot.',
-  [`${TOOL_PREFIX}get_architecture_node_context`]: 'Read bounded authored upstream/downstream architecture context.',
-  [`${TOOL_PREFIX}find_architecture_path`]: 'Find a directed path through authored architecture relationships.',
-  [`${TOOL_PREFIX}bootstrap_project`]: 'Create Architecture v1 atomically with stable ids, planning trace, relationships and tasks.',
-  [`${TOOL_PREFIX}expand_architecture_scope`]: 'Propose one child level under an accepted component for human review.',
-  [`${TOOL_PREFIX}get_architecture_decision_context`]: 'Read accepted architecture and evidence for a governed decision.',
-  [`${TOOL_PREFIX}submit_architecture_recommendation`]: 'Submit evidence-backed architecture advice; changes remain pending human review.',
-  [`${TOOL_PREFIX}create_task`]: 'Create an implementation task without calling the built-in model.',
-  [`${TOOL_PREFIX}update_task_status`]: 'Start or complete one task deterministically.',
-  [`${TOOL_PREFIX}record_project_observation`]: 'Record external evidence without changing accepted architecture.',
-  [`${TOOL_PREFIX}list_connected_mcp_servers`]: 'List connected external MCP sources.',
-  [`${TOOL_PREFIX}list_connected_mcp_tools`]: 'List tools exposed by one connected MCP source.',
-  [`${TOOL_PREFIX}call_connected_mcp_tool`]: 'Call a connected MCP tool; large output uses result_ref.',
+  [`${TOOL_PREFIX}ping`]: 'Check WebMCP build.',
+  [`${TOOL_PREFIX}get_agent_context`]: 'Read project/node context.',
+  [`${TOOL_PREFIX}get_architecture_diagram`]: 'Read architecture layout.',
+  [`${TOOL_PREFIX}publish_code_architecture`]: 'Publish revision-pinned code evidence.',
+  [`${TOOL_PREFIX}get_code_architecture`]: 'Read implementation evidence.',
+  [`${TOOL_PREFIX}get_architecture_node_context`]: 'Read authored dependency context.',
+  [`${TOOL_PREFIX}find_architecture_path`]: 'Find an authored architecture path.',
+  [`${TOOL_PREFIX}bootstrap_project`]: 'Create Architecture v1; obey SYSTEM_MAP roots and depth-first preorder.',
+  [`${TOOL_PREFIX}expand_architecture_scope`]: 'Propose one child level for review.',
+  [`${TOOL_PREFIX}get_architecture_decision_context`]: 'Read architecture decision evidence.',
+  [`${TOOL_PREFIX}submit_architecture_recommendation`]: 'Submit architecture advice for review.',
+  [`${TOOL_PREFIX}create_task`]: 'Create a task without model use.',
+  [`${TOOL_PREFIX}update_task_status`]: 'Start or complete a task.',
+  [`${TOOL_PREFIX}record_project_observation`]: 'Record evidence without architecture change.',
+  [`${TOOL_PREFIX}list_connected_mcp_servers`]: 'List connected MCP sources.',
+  [`${TOOL_PREFIX}list_connected_mcp_tools`]: 'List tools from a connected MCP.',
+  [`${TOOL_PREFIX}call_connected_mcp_tool`]: 'Call connected MCP; large output uses result_ref.',
 };
 
 function compactInputSchemaForModel(value, {propertyMap = false} = {}) {
@@ -46,10 +46,28 @@ function compactInputSchemaForModel(value, {propertyMap = false} = {}) {
 }
 
 function compactToolForModel(tool) {
+  const inputSchema = compactInputSchemaForModel(tool.inputSchema);
+  if (tool.name === `${TOOL_PREFIX}bootstrap_project`) {
+    const properties = inputSchema?.properties;
+    const planning = properties?.planning_trace?.properties;
+    if (properties?.components) {
+      properties.components.description = 'SYSTEM_MAP roots; each must have children.';
+    }
+    if (planning?.system_map_root_ids) {
+      planning.system_map_root_ids.description = 'Root ids in component order; all EXPANDED.';
+    }
+    if (planning?.scope_evaluations) {
+      planning.scope_evaluations.description = 'One per component in depth-first preorder.';
+    }
+    const evaluation = planning?.scope_evaluations?.items?.properties;
+    if (evaluation?.child_ids) {
+      evaluation.child_ids.description = 'EXPANDED: ordered child ids; JUSTIFIED_LEAF: empty.';
+    }
+  }
   return {
     ...tool,
     description: WEBMCP_MODEL_TOOL_DESCRIPTIONS[tool.name] || tool.description,
-    inputSchema: compactInputSchemaForModel(tool.inputSchema),
+    inputSchema,
   };
 }
 

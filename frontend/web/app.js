@@ -5969,6 +5969,33 @@ function webMcpContext() {
   };
 }
 
+// Keep mutation receipts bound to the project that was actually mutated even
+// when the person navigates elsewhere before the request finishes.
+// WEBMCP_MUTATION_CONTEXT_HELPERS_START
+function captureWebMcpProject() {
+  webMcpRequireProject();
+  const projectId = state.projectId;
+  return {projectId, guard:captureNavigationGuard(projectId)};
+}
+
+function webMcpProjectStillCurrent(capture) {
+  return Boolean(capture)
+    && committedProjectGuardIsCurrent(capture.guard)
+    && state.projectId === capture.projectId;
+}
+
+function webMcpMutationContext(capture) {
+  return webMcpProjectStillCurrent(capture)
+    ? webMcpContext()
+    : {project_id:capture?.projectId || null, navigation_superseded:true};
+}
+
+async function refreshWebMcpProject(capture) {
+  if (!webMcpProjectStillCurrent(capture)) return false;
+  return refresh({projectId:capture.projectId, guard:capture.guard});
+}
+// WEBMCP_MUTATION_CONTEXT_HELPERS_END
+
 const WEBMCP_ARCHITECTURE_KINDS = new Set([
   'SYSTEM', 'UI', 'SERVICE', 'AGENT', 'TOOL', 'DATA_STORE', 'STATE',
   'EXTERNAL_SERVICE', 'INFRASTRUCTURE',
@@ -6102,6 +6129,100 @@ function normalizeInitialPlanningTrace(rawTrace, normalizedComponents) {
   };
 }
 
+// A bootstrap mutation can succeed server-side even when its response is lost.
+// Never invite an agent to retry until a canonical read-back proves the outcome.
+// WEBMCP_BOOTSTRAP_RECONCILIATION_START
+function bootstrapArchitectureVersion(result) {
+  const version = result?.architecture?.version;
+  return Number.isInteger(version) && version === 1 ? version : null;
+}
+
+function classifyBootstrapReadback(bootstrap) {
+  if (!bootstrap || bootstrap.schema !== 'archbro.workspace-bootstrap.v2') {
+    return {status:'UNKNOWN', reason:'invalid_workspace_bootstrap'};
+  }
+  const architectureVersion = bootstrap.architecture?.version;
+  const projectVersion = bootstrap.project?.architecture_version;
+  if (
+    Number.isInteger(architectureVersion)
+    && architectureVersion >= 1
+    && projectVersion === architectureVersion
+  ) {
+    return {
+      status:'INITIALIZED',
+      project:bootstrap.project,
+      architecture:bootstrap.architecture,
+      tasks:Array.isArray(bootstrap.tasks) ? bootstrap.tasks : [],
+    };
+  }
+  if (architectureVersion === 0 && projectVersion === 0) {
+    return {
+      status:'NOT_INITIALIZED',
+      project:bootstrap.project,
+      architecture:bootstrap.architecture,
+      tasks:[],
+    };
+  }
+  return {
+    status:'UNKNOWN',
+    reason:'architecture_version_mismatch',
+    project:bootstrap.project || null,
+    architecture:bootstrap.architecture || null,
+  };
+}
+
+async function reconcileBootstrapInitialization(projectId) {
+  try {
+    const bootstrap = await api(`/projects/${encodeURIComponent(projectId)}/workspace-bootstrap?reading_mode=MAP`);
+    return classifyBootstrapReadback(bootstrap);
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (/^404:\s*project not found\b/i.test(message)) return {status:'NOT_FOUND'};
+    return {status:'UNKNOWN', reason:'readback_failed', error:message};
+  }
+}
+
+async function resolveBootstrapInitialization(projectId, result) {
+  const directVersion = bootstrapArchitectureVersion(result);
+  if (directVersion !== null) {
+    return {
+      status:'INITIALIZED',
+      result,
+      project:null,
+      architecture_version:directVersion,
+      reconciled:false,
+    };
+  }
+  const reconciliation = await reconcileBootstrapInitialization(projectId);
+  if (reconciliation.status !== 'INITIALIZED') return {...reconciliation, result};
+  const recoveredResult = {
+    ...(result && typeof result === 'object' && !Array.isArray(result) ? result : {}),
+    architecture:reconciliation.architecture,
+    tasks:reconciliation.tasks,
+  };
+  return {
+    status:'INITIALIZED',
+    result:recoveredResult,
+    project:reconciliation.project,
+    architecture_version:reconciliation.architecture.version,
+    reconciled:true,
+  };
+}
+
+function bootstrapOutcomeUnknownError(projectId, reason = 'readback_failed') {
+  const error = new Error(
+    `Bootstrap initialization outcome is unknown for project ${projectId}; do not retry automatically. The project was retained for reconciliation.`,
+  );
+  error.code = 'ARCHBRO_BOOTSTRAP_OUTCOME_UNKNOWN';
+  error.project_id = projectId;
+  error.mutation_outcome = 'UNKNOWN';
+  error.may_have_written = true;
+  error.next_step = 'Read the project bootstrap state before retrying.';
+  error.reason = reason;
+  return error;
+}
+// WEBMCP_BOOTSTRAP_RECONCILIATION_END
+
 window.ArchBroWebBridge = {
   getCommittedNavigation() {
     return committedNavigationSnapshot();
@@ -6165,6 +6286,8 @@ window.ArchBroWebBridge = {
     });
     let result = null;
     let initializationReconciled = false;
+    let resolvedProject = null;
+    let committedArchitectureVersion = null;
     try {
       result = await api(`/projects/${project.id}/interactive-initial-architecture`, {
         method: 'POST',
@@ -6176,15 +6299,17 @@ window.ArchBroWebBridge = {
         }),
       });
     } catch (initializationError) {
-      const reconciliation = await reconcileBootstrapInitialization(project.id);
-      if (reconciliation.status === 'INITIALIZED') {
+      const resolution = await resolveBootstrapInitialization(project.id, null);
+      if (resolution.status === 'INITIALIZED') {
         initializationReconciled = true;
+        resolvedProject = resolution.project;
+        committedArchitectureVersion = resolution.architecture_version;
         result = {
-          architecture: reconciliation.architecture,
+          ...resolution.result,
           reconciled_after_initialization_error: true,
         };
-      } else if (reconciliation.status === 'NOT_INITIALIZED' || reconciliation.status === 'NOT_FOUND') {
-        if (reconciliation.status === 'NOT_INITIALIZED') {
+      } else if (resolution.status === 'NOT_INITIALIZED' || resolution.status === 'NOT_FOUND') {
+        if (resolution.status === 'NOT_INITIALIZED') {
           try {
             await api(`/projects/${project.id}`, {method:'DELETE'});
           } catch (_cleanupError) {
@@ -6193,9 +6318,37 @@ window.ArchBroWebBridge = {
         }
         throw initializationError;
       } else {
-        const ambiguous = new Error(`${initializationError.message} Initialization outcome is ambiguous; the created project was retained for reconciliation.`);
+        const ambiguous = bootstrapOutcomeUnknownError(project.id, resolution.reason);
         ambiguous.cause = initializationError;
         throw ambiguous;
+      }
+    }
+
+    if (committedArchitectureVersion === null) {
+      const resolution = await resolveBootstrapInitialization(project.id, result);
+      if (resolution.status === 'INITIALIZED') {
+        result = resolution.result;
+        resolvedProject = resolution.project;
+        committedArchitectureVersion = resolution.architecture_version;
+        if (resolution.reconciled) {
+          initializationReconciled = true;
+          result = {...result, reconciled_after_invalid_response:true};
+        }
+      } else if (resolution.status === 'NOT_INITIALIZED' || resolution.status === 'NOT_FOUND') {
+        if (resolution.status === 'NOT_INITIALIZED') {
+          try {
+            await api(`/projects/${project.id}`, {method:'DELETE'});
+          } catch (_cleanupError) {
+            // Read-back proved initialization absent; cleanup remains best-effort.
+          }
+        }
+        const invalid = new Error('Bootstrap returned an invalid canonical architecture result and read-back confirmed initialization was not committed.');
+        invalid.code = 'ARCHBRO_BOOTSTRAP_NOT_COMMITTED';
+        invalid.project_id = project.id;
+        invalid.mutation_outcome = 'NOT_COMMITTED';
+        throw invalid;
+      } else {
+        throw bootstrapOutcomeUnknownError(project.id, resolution.reason);
       }
     }
 
@@ -6223,14 +6376,19 @@ window.ArchBroWebBridge = {
       }
     }
     const capture = {projectId:project.id, guard:captureNavigationGuard(project.id)};
+    const initializedProject = {...(resolvedProject || project), architecture_version:committedArchitectureVersion};
+    const mutationContext = {
+      ...webMcpMutationContext(capture),
+      architecture_version: committedArchitectureVersion,
+    };
     return {
-      project,
       ...result,
+      project: initializedProject,
       mutation_outcome: 'INITIALIZED',
       initialization_reconciled: initializationReconciled,
       ui_refresh: uiRefresh,
       built_in_model_called: false,
-      context: webMcpMutationContext(capture),
+      context: mutationContext,
     };
   },
 

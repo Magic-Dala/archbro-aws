@@ -14,6 +14,17 @@ def _one_line(value: object, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+def _goal_lines(value: object, limit: int = 600) -> list[str]:
+    """Bound the projection without collapsing canonical paragraphs or lists."""
+    text = str(value or "")
+    bounded = text[:limit]
+    return [
+        "- goal: |",
+        *("  " + line for line in bounded.split("\n")),
+        f"- goal_truncated: {str(len(text) > limit).lower()}",
+    ]
+
+
 def build_agent_context(
     repository: ProjectRepositoryPort,
     project_id: str,
@@ -44,7 +55,7 @@ def build_agent_context(
         f"- id: {project.id}",
         f"- name: {_one_line(project.name, 120)}",
         f"- status: {project.status.value}",
-        f"- goal: {_one_line(project.goal, 600)}",
+        *_goal_lines(project.goal),
         "",
         "## Architecture",
         f"- accepted_version: {architecture.version}",

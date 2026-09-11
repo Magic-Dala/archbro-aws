@@ -80,7 +80,7 @@ def test_webmcp_model_inventory_stays_within_fixed_context_budget():
     assert len(encoded) <= MAX_MODEL_INVENTORY_CHARS
 
 
-def test_webmcp_model_schemas_keep_validation_but_drop_redundant_prose():
+def test_webmcp_model_schemas_keep_validation_and_bootstrap_contract_prose():
     inventory = _model_inventory()
     by_name = {tool["name"]: tool for tool in inventory}
     agent_context = by_name["archbro_get_agent_context"]
@@ -94,7 +94,24 @@ def test_webmcp_model_schemas_keep_validation_but_drop_redundant_prose():
     assert "expansion_policy" not in agent_context["inputSchema"]["properties"]
     assert agent_context["inputSchema"]["properties"]["expected_architecture_version"]["minimum"] == 1
     assert "planning_trace" in bootstrap["inputSchema"]["required"]
-    assert bootstrap["inputSchema"]["properties"]["components"]["maxItems"] == 6
+    bootstrap_properties = bootstrap["inputSchema"]["properties"]
+    assert bootstrap_properties["components"]["maxItems"] == 6
+    assert bootstrap_properties["components"]["description"] == (
+        "SYSTEM_MAP roots; each must have children."
+    )
+    planning = bootstrap_properties["planning_trace"]["properties"]
+    assert planning["system_map_root_ids"]["description"] == (
+        "Root ids in component order; all EXPANDED."
+    )
+    assert planning["scope_evaluations"]["description"] == (
+        "One per component in depth-first preorder."
+    )
+    evaluation = planning["scope_evaluations"]["items"]["properties"]
+    assert evaluation["child_ids"]["description"] == (
+        "EXPANDED: ordered child ids; JUSTIFIED_LEAF: empty."
+    )
+    assert "SYSTEM_MAP root" in bootstrap["description"]
+    assert "depth-first preorder" in bootstrap["description"]
     assert code_snapshot["inputSchema"]["properties"]["revision"]["pattern"] == "^[0-9a-fA-F]{40}$"
     assert code_snapshot["inputSchema"]["properties"]["source_evidence"]["maxItems"] == 160
     assert connected_call["inputSchema"]["properties"]["result_ref"]["minLength"] == 1
@@ -449,6 +466,29 @@ def test_bootstrap_failure_does_not_restore_old_project_over_a_new_selection():
     assert "navigationGuard:activationGuard" in bootstrap_source
     assert "state.projectId = project.id" not in bootstrap_source
     assert "persistActiveProjectSelection" not in bootstrap_source
+
+
+def test_bootstrap_result_resolves_committed_architecture_version_before_success():
+    source = APP_MODULE.read_text(encoding="utf-8")
+    bootstrap_start = source.index("  async bootstrapProject(")
+    bootstrap_end = source.index("\n  async expandArchitectureScope(", bootstrap_start)
+    bootstrap_source = source[bootstrap_start:bootstrap_end]
+    assert "let committedArchitectureVersion = null;" in bootstrap_source
+    assert "await resolveBootstrapInitialization(project.id, null)" in bootstrap_source
+    assert "await resolveBootstrapInitialization(project.id, result)" in bootstrap_source
+    assert "bootstrapOutcomeUnknownError(project.id" in bootstrap_source
+    assert "project: initializedProject" in bootstrap_source
+    assert "architecture_version:committedArchitectureVersion" in bootstrap_source
+    assert "architecture_version: committedArchitectureVersion" in bootstrap_source
+    assert "context: mutationContext" in bootstrap_source
+
+
+def test_instruction_context_does_not_duplicate_raw_goal_into_event_payload():
+    source = APP_MODULE.read_text(encoding="utf-8")
+    start = source.index("function currentInstructionContext()")
+    end = source.index("function updateInstructionContext()", start)
+    context_source = source[start:end]
+    assert "project_goal" not in context_source
 
 def test_connected_mcp_large_results_are_bounded_and_recoverable_without_second_provider_call():
     node = shutil.which("node")
