@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -9,6 +10,7 @@ import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "deploy-stack.sh"
+DEPLOY_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "deploy.yml"
 IDENTITY_SCRIPT = Path(__file__).resolve().parents[1] / "qa" / "setup_archbro_identity_platform.ps1"
 
 
@@ -122,6 +124,99 @@ def test_dev_rejects_mixed_runtime_auth_modes(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert "ARCHBRO_ENV=production" in result.stdout + result.stderr
+
+
+def test_dev2_accepts_complete_firebase_cutover_contract(tmp_path: Path) -> None:
+    """dev2 is externally reachable like dev, so it takes dev's contract, not a weaker one."""
+
+    result = _validate(
+        tmp_path,
+        "archbro-dev2",
+        "\n".join(
+            [
+                "ARCHBRO_ENV=production",
+                "ARCHBRO_AUTH_MODE=firebase",
+                "FIREBASE_PROJECT_ID=archbro-dev-example",
+                "ARCHBRO_FIREBASE_API_KEY=example-key",
+                "ARCHBRO_FIREBASE_AUTH_DOMAIN=archbro-main-example.firebaseapp.com",
+                "",
+            ]
+        ),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_dev2_rejects_explicit_local_staging_contract(tmp_path: Path) -> None:
+    """The deterministic local-demo principal collapses OAuth sessions across users."""
+
+    result = _validate(
+        tmp_path,
+        "archbro-dev2",
+        "ARCHBRO_ENV=local\nARCHBRO_AUTH_MODE=local\n",
+    )
+    assert result.returncode != 0
+    assert "ARCHBRO_ENV=production" in result.stdout + result.stderr
+
+
+def test_a_stack_nobody_deploys_is_still_refused(tmp_path: Path) -> None:
+    """The case arms are an allow-list; widening it must stay deliberate."""
+
+    result = _validate(
+        tmp_path,
+        "archbro-anything",
+        "ARCHBRO_ENV=production\nARCHBRO_AUTH_MODE=firebase\n",
+    )
+    assert result.returncode != 0
+    assert "unsupported stack" in result.stdout + result.stderr
+
+
+def test_every_stack_the_workflow_deploys_has_an_arm_in_the_script() -> None:
+    """The two files decide different halves of one question and can drift apart.
+
+    `deploy.yml` maps a branch to a stack name; `deploy-stack.sh` decides which
+    stack names it will serve. A branch added to the first and not the second
+    builds an image, pushes it, uploads the compose file, and only then refuses
+    -- on the VM, after the registry write. Holding them in step here makes that
+    a failing test instead.
+    """
+
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    script = SCRIPT.read_text(encoding="utf-8")
+
+    deployed = set(re.findall(r'stack=(archbro-[a-z0-9-]+)', workflow))
+    assert deployed, "no stack targets found in deploy.yml"
+
+    # Case arms may name several stacks at once (`archbro-dev | archbro-dev2)`),
+    # so the arm is matched whole and then split.
+    served = {
+        name.strip()
+        for arm in re.findall(
+            r'^[ \t]*(archbro-[a-z0-9-]+(?:[ \t]*\|[ \t]*archbro-[a-z0-9-]+)*)\)',
+            script,
+            re.MULTILINE,
+        )
+        for name in arm.split("|")
+    }
+
+    assert deployed <= served, (
+        f"deploy.yml deploys {sorted(deployed - served)} but deploy-stack.sh refuses them"
+    )
+
+
+def test_every_branch_the_workflow_triggers_on_resolves_to_a_stack() -> None:
+    """A push that builds an image and then cannot name a target wastes the build."""
+
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+
+    triggered = re.search(r'push:\s*\n\s*branches:\s*\[([^\]]*)\]', workflow)
+    assert triggered, "could not read the deploy trigger branch list"
+    branches = {name.strip() for name in triggered.group(1).split(",") if name.strip()}
+
+    resolved = set(re.findall(r'^\s*([a-z0-9]+)\)\s*echo "stack=', workflow, re.MULTILINE))
+
+    assert branches <= resolved, (
+        f"deploy.yml triggers on {sorted(branches - resolved)} but cannot resolve them to a stack"
+    )
 
 
 def test_main_rejects_local_staging_contract(tmp_path: Path) -> None:

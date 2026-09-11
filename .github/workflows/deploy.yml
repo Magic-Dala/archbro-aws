@@ -2,6 +2,7 @@
 #
 # main -> archbro-main -> /opt/archbro/main -> archbro.magicdala.com
 # dev  -> archbro-dev  -> /opt/archbro/dev  -> archbro-dev.magicdala.com
+# dev2 -> archbro-dev2 -> /opt/archbro/dev2 -> archbro-dev2.magicdala.com
 #
 # The stacks use separate Compose projects, containers, default networks, and
 # database volumes. They currently share only the external archbro-edge ingress
@@ -21,7 +22,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, dev2]
   workflow_dispatch:
 
 permissions:
@@ -88,6 +89,9 @@ jobs:
             dev)  echo "stack=archbro-dev" >> "$GITHUB_OUTPUT"
                   echo "dir=/opt/archbro/dev" >> "$GITHUB_OUTPUT"
                   echo "host=archbro-dev.magicdala.com" >> "$GITHUB_OUTPUT" ;;
+            dev2) echo "stack=archbro-dev2" >> "$GITHUB_OUTPUT"
+                  echo "dir=/opt/archbro/dev2" >> "$GITHUB_OUTPUT"
+                  echo "host=archbro-dev2.magicdala.com" >> "$GITHUB_OUTPUT" ;;
             *)    echo "::error::refusing to deploy branch $REF_NAME"
                   exit 1 ;;
           esac

@@ -184,11 +184,11 @@ case "$STACK" in
         # Main serves production traffic and must never fall back to local auth.
         require_production_firebase
         ;;
-    archbro-dev)
-        # Dev is also externally reachable. Cloudflare Access protects the edge,
-        # but provider OAuth/session isolation depends on each browser having a
-        # distinct verified principal. The deterministic local-demo identity is
-        # therefore never valid for a deployed dev stack.
+    archbro-dev | archbro-dev2)
+        # Both dev stacks are externally reachable. Cloudflare Access protects
+        # the edge, but provider OAuth/session isolation depends on each browser
+        # having a distinct verified principal. The deterministic local-demo
+        # identity is therefore never valid for a deployed dev stack.
         require_production_firebase
         ;;
     *)

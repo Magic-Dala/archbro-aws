@@ -7,10 +7,12 @@ Cloudflare, never in this repository.
 ## Overview
 
 ```
-                     ┌─ production host ──── tunnel: archbro-main ──┐
+                     ┌─ production host ───── tunnel: archbro-main ─┐
 Cloudflare ──────────┤                                              ├── GCE VM "magicdala"
-                     └─ development host                            │
-                          └─ Access (email allowlist) ─ tunnel: archbro-dev ┘
+                     ├─ development host                            │
+                     │    └─ Access (email allowlist) ─ archbro-dev  │
+                     └─ second development host                     │
+                          └─ Access (email allowlist) ─ archbro-dev2 ┘
 
 VM inbound: 80 closed · 443 closed · 22 open (deploys only)
 ```
@@ -23,7 +25,7 @@ can open a connection to the application except through Cloudflare.
 
 | Resource | Identifier | Purpose |
 | --- | --- | --- |
-| Compute instance | `magicdala`, zone `us-central1-a`, e2-medium | Runs both stacks |
+| Compute instance | `magicdala`, zone `us-central1-a`, e2-medium | Runs every stack |
 | Artifact Registry | project deployment-image repository | Deployment images |
 | Workload Identity Pool | `github`, provider `github` | Lets GitHub Actions authenticate without a stored key |
 | Service account | deployment service account | The identity Actions assumes |
@@ -53,13 +55,15 @@ pushes roughly 600KB rather than 155MB.
 /opt/archbro/                  # root-only, mode 750, because the .env files hold secrets
 ├── main/          .env  docker-compose.yml
 ├── dev/           .env  docker-compose.yml
+├── dev2/          .env  docker-compose.yml
 ├── cloudflared-main/  .env(TUNNEL_TOKEN)  docker-compose.yml
-└── cloudflared-dev/   .env(TUNNEL_TOKEN)  docker-compose.yml
+├── cloudflared-dev/   .env(TUNNEL_TOKEN)  docker-compose.yml
+└── cloudflared-dev2/  .env(TUNNEL_TOKEN)  docker-compose.yml
 ```
 
 `.env` files are placed **by hand** and are never written by the deploy workflow.
-Both `archbro-main` and `archbro-dev` fail closed unless they have the complete
-production/Firebase contract (`ARCHBRO_ENV=production`,
+`archbro-main`, `archbro-dev` and `archbro-dev2` all fail closed unless they
+have the complete production/Firebase contract (`ARCHBRO_ENV=production`,
 `ARCHBRO_AUTH_MODE=firebase`, a Firebase project id,
 `ARCHBRO_FIREBASE_API_KEY`, and `ARCHBRO_FIREBASE_AUTH_DOMAIN`). The development
 stack is externally reachable too, so it cannot use the deterministic
@@ -80,8 +84,8 @@ own repositories. With the variable unset, which is the default, every pass is a
 no-op. It serves nothing, so it stays off the tunnel network even though it
 holds the repository credential.
 
-Each environment is a separate Compose project (`archbro-main`, `archbro-dev`),
-so containers, networks, and database volumes never overlap. The stacks join a
+Each environment is a separate Compose project (`archbro-main`, `archbro-dev`,
+`archbro-dev2`), so containers, networks, and database volumes never overlap. The stacks join a
 shared external network, `archbro-edge`, which is how the tunnel connectors
 reach them without anything being published on the host.
 
@@ -91,9 +95,15 @@ reach them without anything being published on the host.
 | --- | --- |
 | Tunnel (main) | `archbro-main` |
 | Tunnel (dev) | `archbro-dev` |
-| Access application | `Archbro dev` |
+| Tunnel (dev2) | `archbro-dev2` |
+| Access application | `ArchBro dev`, `ArchBro dev2` |
 | Access policy | team email allowlist |
 | Login method | One-time PIN |
+
+A dev environment's Access application is what stands between its host and the
+open internet, so it is created **before** that environment's connector is
+started for the first time. A connector running ahead of its Access application
+serves the host to anyone who knows the name.
 
 Each environment uses a proxied CNAME that targets its Cloudflare Tunnel. Proxying is
 required: Access only applies to traffic that passes through Cloudflare.
@@ -117,8 +127,14 @@ front of a service is only half the job; the direct path has to disappear.
 
 ## Deployment
 
-`main` and `dev` deploy on a push to the matching branch. Anything else is
-refused by the workflow.
+`main`, `dev` and `dev2` deploy on a push to the matching branch. Anything else
+is refused by the workflow.
+
+Two files decide different halves of that: `deploy.yml` maps a branch to a stack
+name, and `deploy-stack.sh` decides which stack names it serves. A branch added
+to one and not the other builds an image, pushes it, and only then refuses, on
+the VM, after the registry write -- so `tests/test_deploy_runtime_contract.py`
+holds the two in step.
 
 1. Authenticate to Google via Workload Identity Federation — no stored key
 2. Build for `linux/amd64` (pinned: the VM is x86_64) and push two tags

@@ -204,7 +204,7 @@ For deterministic WebMCP acceptance without built-in model calls:
 ARCHBRO_PROVIDER=fake
 ```
 
-Both deployed stacks (`archbro-main` and `archbro-dev`) must set
+Every deployed stack (`archbro-main`, `archbro-dev`, `archbro-dev2`) must set
 `ARCHBRO_ENV=production` and `ARCHBRO_AUTH_MODE=firebase`. Deployment validation
 fails closed if Firebase identity or its public browser config is missing; the
 local-development principal is valid only for direct local development and cannot
