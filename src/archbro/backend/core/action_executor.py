@@ -4,12 +4,15 @@ import json
 from datetime import datetime, timezone
 
 from archbro.backend.core.contracts import (
+    AcceptanceTaskChange,
     AgentAction,
     AgentActionType,
     Architecture,
+    ArchitectureAcceptancePreview,
     ArchitectureChangeProposal,
     ProjectStatus,
     ProposalStatus,
+    SupersededProposalPreview,
     Task,
     TaskProposal,
 )
@@ -195,11 +198,106 @@ class ActionExecutor:
         for note in plan.notes:
             self.repository.add_note(project_id, note)
 
+    def preview_proposal_acceptance(
+        self, project_id: str, proposal_id: str
+    ) -> ArchitectureAcceptancePreview:
+        snapshot = self.repository.load_agent_context_snapshot(project_id, event_scan_limit=1)
+        proposal = next((item for item in snapshot.proposals if item.id == proposal_id), None)
+        if proposal is None:
+            raise KeyError(proposal_id)
+        if proposal.project_id != project_id or proposal.status != ProposalStatus.PENDING:
+            raise ValueError("proposal is not pending for this project")
+
+        architecture = snapshot.architecture
+        if proposal.base_architecture_version != architecture.version:
+            raise ValueError(
+                "stale architecture proposal: expected accepted architecture "
+                f"v{proposal.base_architecture_version}, current is v{architecture.version}"
+            )
+        project = snapshot.project
+        if project.architecture_version != architecture.version:
+            raise ValueError(
+                "project architecture version is inconsistent with accepted architecture: "
+                f"project=v{project.architecture_version}, architecture=v{architecture.version}"
+            )
+        tasks = snapshot.tasks
+        plan = ArchitectureAcceptanceReconciler().build_plan(
+            architecture=architecture,
+            proposal=proposal,
+            tasks=tasks,
+        )
+
+        tasks_by_id = {task.id: task for task in tasks}
+        task_updates: list[AcceptanceTaskChange] = []
+        for updated in plan.updated_tasks:
+            before = tasks_by_id[updated.id]
+            changed_fields = [
+                field
+                for field in ("status", "title", "description", "related_component")
+                if getattr(before, field) != getattr(updated, field)
+            ]
+            task_updates.append(
+                AcceptanceTaskChange(
+                    task_id=updated.id,
+                    before=before,
+                    after=updated,
+                    changed_fields=changed_fields,
+                    blocked=(
+                        before.status != updated.status
+                        and updated.status.value == "BLOCKED"
+                    ),
+                    remapped=before.related_component != updated.related_component,
+                )
+            )
+
+        superseded_reason = (
+            f"Superseded by accepted proposal {proposal.id} when accepted architecture "
+            f"advanced to v{plan.architecture.version}."
+        )
+        superseded = [
+            SupersededProposalPreview(
+                proposal_id=peer.id,
+                base_architecture_version=peer.base_architecture_version,
+                superseded_at_architecture_version=plan.architecture.version,
+                reason=superseded_reason,
+            )
+            for peer in snapshot.proposals
+            if peer.id != proposal.id
+            and peer.status == ProposalStatus.PENDING
+            and peer.base_architecture_version != plan.architecture.version
+        ]
+        previous_decisions = len(architecture.decisions)
+        return ArchitectureAcceptancePreview(
+            proposal_id=proposal.id,
+            proposal_status=proposal.status,
+            actionable=True,
+            current_architecture_version=architecture.version,
+            resulting_architecture_version=plan.architecture.version,
+            components_before=architecture.components,
+            components_after=plan.architecture.components,
+            relationships_before=architecture.relationships,
+            relationships_after=plan.architecture.relationships,
+            decisions_added=plan.architecture.decisions[previous_decisions:],
+            task_updates=task_updates,
+            created_tasks=list(plan.created_tasks),
+            blocked_task_ids=[change.task_id for change in task_updates if change.blocked],
+            remapped_tasks=[
+                {
+                    "task_id": change.task_id,
+                    "from_component": change.before.related_component,
+                    "to_component": change.after.related_component,
+                }
+                for change in task_updates
+                if change.remapped
+            ],
+            superseded_proposals=superseded,
+            warnings=[],
+        )
+
     def accept_proposal(self, project_id: str, proposal_id: str) -> ArchitectureChangeProposal:
         proposal = self.repository.get_proposal(proposal_id)
         if proposal.project_id != project_id or proposal.status != ProposalStatus.PENDING:
             raise ValueError("proposal is not pending for this project")
-
         architecture = self.repository.get_architecture(project_id)
         if proposal.base_architecture_version != architecture.version:
             raise ValueError(
@@ -225,7 +323,17 @@ class ActionExecutor:
                 "updated_at": datetime.now(timezone.utc),
             }
         )
-        accepted_proposal = proposal.model_copy(update={"status": ProposalStatus.ACCEPTED})
+        resolved_at = datetime.now(timezone.utc)
+        accepted_proposal = proposal.model_copy(
+            update={
+                "status": ProposalStatus.ACCEPTED,
+                "resolved_at": resolved_at,
+                "resolution_reason": (
+                    f"Accepted against architecture v{architecture.version}; "
+                    f"advanced accepted architecture to v{plan.architecture.version}."
+                ),
+            }
+        )
         updated_task_ids = {task.id for task in plan.updated_tasks}
 
         self.repository.save_acceptance_state(
@@ -247,7 +355,13 @@ class ActionExecutor:
         proposal = self.repository.get_proposal(proposal_id)
         if proposal.project_id != project_id or proposal.status != ProposalStatus.PENDING:
             raise ValueError("proposal is not pending for this project")
-        rejected_proposal = proposal.model_copy(update={"status": ProposalStatus.REJECTED})
+        rejected_proposal = proposal.model_copy(
+            update={
+                "status": ProposalStatus.REJECTED,
+                "resolved_at": datetime.now(timezone.utc),
+                "resolution_reason": "Human reviewer chose to keep the current architecture.",
+            }
+        )
         self.repository.save_proposal_decision(
             project_id=project_id,
             proposal=rejected_proposal,

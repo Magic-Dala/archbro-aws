@@ -353,7 +353,7 @@ def test_acceptance_rejects_multiple_replacements_of_same_component_before_write
 def test_acceptance_rejects_proposal_created_for_an_older_architecture_version(dsn):
     repo, project = _repo_with_project(dsn)
     first = _proposal(project.id)
-    second = _proposal(
+    superseded_peer = _proposal(
         project.id,
         proposed_changes=[
             {
@@ -364,17 +364,92 @@ def test_acceptance_rejects_proposal_created_for_an_older_architecture_version(d
         ],
     )
     repo.save_proposal(first)
-    repo.save_proposal(second)
+    repo.save_proposal(superseded_peer)
 
     ActionExecutor(repo).accept_proposal(project.id, first.id)
     assert repo.get_architecture(project.id).version == 2
 
+    superseded = repo.get_proposal(superseded_peer.id)
+    assert superseded.status == ProposalStatus.SUPERSEDED
+    assert superseded.superseded_by_proposal_id == first.id
+    assert superseded.superseded_at_architecture_version == 2
+    assert "advanced to v2" in superseded.resolution_reason
+
+    # A delayed proposal can still arrive after the accepted transition. It remains
+    # auditable as PENDING, but the executor must reject its stale v1 base before
+    # any second architecture mutation is attempted.
+    stale = _proposal(
+        project.id,
+        proposed_changes=[
+            {
+                "operation": "replace_component",
+                "component_id": "primary_store",
+                "new_name": "Store D",
+            }
+        ],
+    )
+    repo.save_proposal(stale)
     with pytest.raises(ValueError, match="stale architecture proposal"):
-        ActionExecutor(repo).accept_proposal(project.id, second.id)
+        ActionExecutor(repo).accept_proposal(project.id, stale.id)
 
     assert repo.get_architecture(project.id).version == 2
     assert repo.get_architecture(project.id).find_component("primary_store").name == "Store B"
-    assert repo.get_proposal(second.id).status == ProposalStatus.PENDING
+    assert repo.get_proposal(stale.id).status == ProposalStatus.PENDING
+
+def test_acceptance_preview_is_read_only_and_matches_committed_reconciliation(dsn):
+    repo, project = _repo_with_project(dsn)
+    task = Task(
+        title="Implement Store A persistence",
+        description="Build the Store A adapter.",
+        status=TaskStatus.IN_PROGRESS,
+        related_component="primary_store",
+    )
+    repo.save_task(project.id, task)
+    accepted = _proposal(project.id)
+    peer = _proposal(
+        project.id,
+        proposed_changes=[{
+            "operation": "replace_component",
+            "component_id": "primary_store",
+            "new_name": "Store C",
+        }],
+    )
+    repo.save_proposal(accepted)
+    repo.save_proposal(peer)
+    executor = ActionExecutor(repo)
+    before = repo.snapshot(project.id)
+
+    preview = executor.preview_proposal_acceptance(project.id, accepted.id)
+
+    assert repo.snapshot(project.id) == before
+    assert preview.current_architecture_version == 1
+    assert preview.resulting_architecture_version == 2
+    preview_before = Architecture(components=preview.components_before)
+    preview_after = Architecture(components=preview.components_after)
+    assert preview_before.find_component("primary_store").name == "Store A"
+    assert preview_after.find_component("primary_store").name == "Store B"
+    assert [item.proposal_id for item in preview.superseded_proposals] == [peer.id]
+    assert any(change.task_id == task.id for change in preview.task_updates)
+    assert preview.created_tasks
+
+    executor.accept_proposal(project.id, accepted.id)
+    architecture = repo.get_architecture(project.id)
+    tasks = repo.list_tasks(project.id)
+    assert architecture.components == preview.components_after
+    assert architecture.relationships == preview.relationships_after
+    for change in preview.task_updates:
+        committed = next(item for item in tasks if item.id == change.task_id)
+        for field in change.changed_fields:
+            assert getattr(committed, field) == getattr(change.after, field)
+    for created in preview.created_tasks:
+        assert any(
+            item.title == created.title
+            and item.description == created.description
+            and item.status == created.status
+            and item.related_component == created.related_component
+            for item in tasks
+        )
+    assert repo.get_proposal(peer.id).status == ProposalStatus.SUPERSEDED
 
 
 def test_acceptance_rejects_noop_component_replacement_without_bumping_architecture(dsn):
@@ -616,6 +691,15 @@ def test_acceptance_rechecks_base_version_inside_commit(dsn, monkeypatch):
     stale_architecture = repo.get_architecture(project.id)
     stale_project = repo.get_project(project.id)
     first = _proposal(project.id)
+    repo.save_proposal(first)
+
+    ActionExecutor(repo).accept_proposal(project.id, first.id)
+    assert PostgresProjectRepository.get_architecture(repo, project.id).version == 2
+
+    # Simulate a delayed request whose proposal and planning reads still reflect
+    # v1, while the durable repository has already committed v2. Creating this
+    # proposal after the first commit avoids conflating the race check with the
+    # intentional atomic superseding of peers that already existed at commit time.
     second = _proposal(
         project.id,
         proposed_changes=[
@@ -626,14 +710,7 @@ def test_acceptance_rechecks_base_version_inside_commit(dsn, monkeypatch):
             }
         ],
     )
-    repo.save_proposal(first)
     repo.save_proposal(second)
-
-    ActionExecutor(repo).accept_proposal(project.id, first.id)
-    assert PostgresProjectRepository.get_architecture(repo, project.id).version == 2
-
-    # Simulate a second request that planned against v1 before the first request
-    # committed. The atomic repository check must observe the real persisted v2.
     monkeypatch.setattr(repo, "get_architecture", lambda _project_id: stale_architecture)
     monkeypatch.setattr(repo, "get_project", lambda _project_id: stale_project)
 
@@ -644,7 +721,6 @@ def test_acceptance_rechecks_base_version_inside_commit(dsn, monkeypatch):
     assert accepted.version == 2
     assert accepted.find_component("primary_store").name == "Store B"
     assert PostgresProjectRepository.get_proposal(repo, second.id).status == ProposalStatus.PENDING
-
 
 def test_reject_cannot_overwrite_a_concurrent_accept(dsn, monkeypatch):
     repo, project = _repo_with_project(dsn)

@@ -138,9 +138,21 @@
     return profiles[session.id];
   }
 
-  function deriveNeedsYou(proposals = [], tasks = [], notifications = {architectureApprovals: true, blockedTasks: true}) {
+  function deriveNeedsYou(proposals = [], tasks = [], notifications = {architectureApprovals: true, blockedTasks: true}, architectureVersion = null) {
     const preferences = isPlainObject(notifications) ? notifications : {};
-    const approvals = preferences.architectureApprovals !== false ? proposals.filter((proposal) => proposal.status === 'PENDING').map((proposal) => ({
+    const validArchitectureVersion = architectureVersion !== null
+      && architectureVersion !== undefined
+      && architectureVersion !== ''
+      && Number.isInteger(Number(architectureVersion));
+    const approvals = preferences.architectureApprovals !== false ? proposals.filter((proposal) => (
+      validArchitectureVersion
+      && proposal.status === 'PENDING'
+      && proposal.base_architecture_version !== null
+      && proposal.base_architecture_version !== undefined
+      && proposal.base_architecture_version !== ''
+      && Number.isInteger(Number(proposal.base_architecture_version))
+      && Number(proposal.base_architecture_version) === Number(architectureVersion)
+    )).map((proposal) => ({
       kind: 'proposal', id: proposal.id, title: 'Architecture approval', description: proposal.reason,
     })) : [];
     const blockers = preferences.blockedTasks !== false ? tasks.filter((task) => task.status === 'BLOCKED').map((task) => ({

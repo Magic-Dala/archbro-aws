@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
@@ -22,9 +23,10 @@ test('Archbro loads the approved modular A logo and favicon', async () => {
     readFile(new URL('index.html', webRoot), 'utf8'),
     readFile(new URL('archbro-logo.svg', webRoot), 'utf8'),
   ]);
+  const hash = createHash('sha256').update(logo.replace(/\r\n/g, '\n')).digest('hex').slice(0, 16);
 
-  assert.match(page, /<link rel="icon" href="\/static\/archbro-logo\.svg\?v=20260829-3" \/>/);
-  assert.match(page, /<img class="brand-symbol" src="\/static\/archbro-logo\.svg\?v=20260829-3" alt="" \/>/);
+  assert.ok(page.includes(`<link rel="icon" href="/static/archbro-logo.svg?v=${hash}" />`));
+  assert.ok(page.includes(`<img class="brand-symbol" src="/static/archbro-logo.svg?v=${hash}" alt="" />`));
   assert.match(logo, /<title>Archbro modular A logo<\/title>/);
   assert.match(logo, /<desc>A modular capital A with a four-point AI spark at the upper right\.<\/desc>/);
 

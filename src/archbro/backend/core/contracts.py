@@ -118,6 +118,7 @@ class ProposalStatus(StrEnum):
     PENDING = "PENDING"
     ACCEPTED = "ACCEPTED"
     REJECTED = "REJECTED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 class ArchitectureOption(StrEnum):
@@ -294,6 +295,45 @@ class ArchitectureChangeProposal(BaseModel):
     recommended_option: ArchitectureOption
     status: ProposalStatus = ProposalStatus.PENDING
     created_at: datetime = Field(default_factory=utcnow)
+    resolved_at: datetime | None = None
+    resolution_reason: str | None = None
+    superseded_by_proposal_id: str | None = None
+    superseded_at_architecture_version: int | None = Field(default=None, ge=0)
+
+
+class AcceptanceTaskChange(BaseModel):
+    task_id: str
+    before: Task
+    after: Task
+    changed_fields: list[str] = Field(default_factory=list)
+    blocked: bool = False
+    remapped: bool = False
+
+
+class SupersededProposalPreview(BaseModel):
+    proposal_id: str
+    base_architecture_version: int | None = None
+    superseded_at_architecture_version: int
+    reason: str
+
+
+class ArchitectureAcceptancePreview(BaseModel):
+    proposal_id: str
+    proposal_status: ProposalStatus
+    actionable: bool
+    current_architecture_version: int
+    resulting_architecture_version: int
+    components_before: list[Component] = Field(default_factory=list)
+    components_after: list[Component] = Field(default_factory=list)
+    relationships_before: list[Relationship] = Field(default_factory=list)
+    relationships_after: list[Relationship] = Field(default_factory=list)
+    decisions_added: list[str] = Field(default_factory=list)
+    task_updates: list[AcceptanceTaskChange] = Field(default_factory=list)
+    created_tasks: list[Task] = Field(default_factory=list)
+    blocked_task_ids: list[str] = Field(default_factory=list)
+    remapped_tasks: list[dict[str, str | None]] = Field(default_factory=list)
+    superseded_proposals: list[SupersededProposalPreview] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class TaskProposal(BaseModel):

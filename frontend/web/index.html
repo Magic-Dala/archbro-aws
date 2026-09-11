@@ -4,14 +4,14 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Archbro</title>
-  <link rel="icon" href="/static/archbro-logo.svg?v=20260829-3" />
-  <link rel="stylesheet" href="/static/styles.css?v=bab2cffae80e44f3" />
-  <link rel="stylesheet" href="/static/progress.css?v=20260829-3" />
+  <link rel="icon" href="/static/archbro-logo.svg?v=35cea50bf08b54c3" />
+  <link rel="stylesheet" href="/static/styles.css?v=f2a7125ae3121034" />
+  <link rel="stylesheet" href="/static/progress.css?v=90e493c3fd6518b1" />
 </head>
 <body>
   <section id="bootstrapExperience" class="bootstrap-experience" aria-live="polite" aria-label="Restoring Archbro workspace">
     <div class="bootstrap-experience-card">
-      <img src="/static/archbro-logo.svg?v=20260829-3" alt="" />
+      <img src="/static/archbro-logo.svg?v=35cea50bf08b54c3" alt="" />
       <div class="bootstrap-experience-copy">
         <strong>Archbro</strong>
         <span id="bootstrapExperienceMessage">Restoring your workspace…</span>
@@ -25,7 +25,7 @@
   <section id="entryExperience" class="entry-experience hidden">
     <header class="entry-topbar">
       <a class="entry-brand" href="#" aria-label="Archbro home">
-        <img src="/static/archbro-logo.svg?v=20260829-3" alt="" />
+        <img src="/static/archbro-logo.svg?v=35cea50bf08b54c3" alt="" />
         <span>Archbro</span>
       </a>
       <button id="landingLoginBtn" class="btn secondary" type="button">Log in</button>
@@ -101,7 +101,7 @@
 
   <div id="workspaceShell" class="shell hidden">
     <aside id="workspaceSidebar" class="sidebar">
-      <div class="brand"><span class="brand-mark"><img class="brand-symbol" src="/static/archbro-logo.svg?v=20260829-3" alt="" /></span><span>Archbro</span></div>
+      <div class="brand"><span class="brand-mark"><img class="brand-symbol" src="/static/archbro-logo.svg?v=35cea50bf08b54c3" alt="" /></span><span>Archbro</span></div>
       <button id="workspaceSwitcherBtn" class="workspace-switcher" type="button" aria-label="Open Personal workspace"><span class="workspace-switcher-icon" aria-hidden="true">⌂</span><span>Personal workspace</span></button>
       <button id="newProjectBtn" class="new-project-button" type="button"><span>＋ New Project</span><kbd>⌘N</kbd></button>
       <div class="project-tree-heading">Projects</div>
@@ -174,6 +174,11 @@
           </div>
           <div id="projectCards" class="project-cards" aria-label="Projects"></div>
         </section>
+        <nav id="workspaceTabs" class="workspace-tabs-shell hidden" role="tablist" aria-label="Project execution workspace">
+          <button id="workspaceTabTasks" class="workspace-tab" type="button" role="tab" aria-selected="true" aria-controls="workspaceTabTasksPanel" tabindex="0" data-workspace-tab="tasks" aria-label="Tasks (0)"><span>Tasks</span><span id="taskTabCount" class="workspace-tab-count">0</span></button>
+          <button id="workspaceTabReview" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="workspaceTabReviewPanel" tabindex="-1" data-workspace-tab="review" aria-label="Architecture Review (0)"><span>Architecture Review</span><span id="reviewTabCount" class="workspace-tab-count">0</span></button>
+        </nav>
+
         <div id="view-overview" class="view active">
           <div class="welcome"><div><h2 id="welcomeTitle">Project overview</h2><p id="overviewMessage">The system is aligned with the latest observed state.</p></div></div>
           <div class="metrics">
@@ -218,9 +223,20 @@
           </div>
         </div>
 
-        <div id="view-tasks" class="view">
-          <div class="section-intro"><div><h2>Tasks</h2><p>Everything humans and the agent can act on, using the shared V0 Task contract.</p></div></div>
-          <div class="tasks-layout"><article class="panel task-queue"><div class="panel-head"><h3>Queue</h3><span id="taskTotal" class="muted">0 tasks</span></div><div id="taskList" class="task-list"></div></article><aside class="panel filter-panel"><h3>Status legend</h3><div class="legend"><span><i class="status-dot todo"></i>TODO</span><span><i class="status-dot progress"></i>IN PROGRESS</span><span><i class="status-dot blocked"></i>BLOCKED</span><span><i class="status-dot done"></i>DONE</span></div><p class="muted">Human Start/Done clicks are authoritative task state and apply immediately. The Agent observes that state alongside later project signals.</p></aside></div>
+        <div id="workspaceTabTasksPanel" class="workspace-tabpanel hidden" role="tabpanel" aria-labelledby="workspaceTabTasks" tabindex="0">
+          <div id="view-tasks" class="view">
+            <div class="tasks-layout"><article class="panel task-queue"><div class="panel-head"><h3>Queue</h3><span id="taskTotal" class="muted">0 tasks</span></div><div id="taskList" class="task-list"></div></article><aside class="panel filter-panel"><h3>Status legend</h3><div class="legend"><span><i class="status-dot todo"></i>To do</span><span><i class="status-dot progress"></i>In progress</span><span><i class="status-dot blocked"></i>Blocked</span><span><i class="status-dot done"></i>Done</span></div><p class="muted">Human Start/Done clicks are authoritative task state. Open a task to inspect its requirements; status actions apply through the existing task boundary.</p></aside></div>
+          </div>
+        </div>
+
+        <div id="workspaceTabReviewPanel" class="workspace-tabpanel hidden" role="tabpanel" aria-labelledby="workspaceTabReview" tabindex="0">
+          <section id="proposalReviewSurface" class="proposal-review-surface" aria-labelledby="proposalReviewTitle">
+            <header class="proposal-review-surface-head">
+              <div><small class="eyebrow">ARCHITECTURE DECISION</small><h2 id="proposalReviewTitle">Architecture review</h2><p>Review proposed architecture changes before deciding whether to accept them.</p></div>
+            </header>
+            <div id="proposalList" class="proposal-list" aria-live="polite"></div>
+            <footer id="proposalDecisionBar" class="proposal-decision-bar"><div><strong id="proposalDecisionLabel">Your decision</strong><span id="proposalDecisionDescription">Review the changes before applying.</span><p id="proposalDecisionNotice" class="proposal-decision-notice" role="status"></p></div><div class="proposal-decision-actions"><button class="btn secondary" type="button" data-proposal-decision="reject">Keep Current</button><button class="btn primary" type="button" data-proposal-decision="accept">Accept changes</button></div></footer>
+          </section>
         </div>
 
         <div id="view-architecture" class="view">
@@ -230,6 +246,17 @@
             <aside class="graph-side"><article id="graphEvidencePanel" class="panel graph-side-panel graph-evidence-panel"><h3 id="graphEvidenceTitle">Why this status?</h3><div id="nodeEvidence"><p class="muted">Select a node to inspect the accepted architecture.</p></div></article><article id="selectedNode" class="panel graph-side-panel selected-node"><small>SYSTEM HEALTH</small><h3>No inspection selected</h3><p>Only open a colored problem area when you need to understand what changed or what is blocked.</p></article><article id="graphDecisionPanel" class="panel graph-side-panel graph-secondary-panel"><h3 id="graphDecisionTitle">Architecture decisions</h3><div id="decisionList" class="bullet-list"></div></article><article id="graphRiskPanel" class="panel graph-side-panel graph-secondary-panel"><h3 id="graphRiskTitle">Risks & assumptions</h3><div id="riskList" class="bullet-list"></div></article></aside>
           </div>
         </div>
+
+        <aside id="taskDetailPanel" class="task-detail-panel hidden" aria-labelledby="taskDetailTitle" aria-describedby="taskDetailDescription">
+          <header class="task-detail-header">
+            <div><small class="eyebrow">TASK DETAILS</small><h2 id="taskDetailTitle">Task</h2><span id="taskDetailDescription" class="sr-only">Inspect task requirements and take an action.</span></div>
+            <button id="taskDetailClose" class="dialog-close task-detail-close" type="button" aria-label="Close task details">×</button>
+          </header>
+          <div id="taskDetailBody" class="task-detail-body"></div>
+          <footer class="task-detail-footer">
+            <button id="taskDetailAction" class="btn primary" type="button">Start task</button>
+          </footer>
+        </aside>
 
         <div id="globalAgentDock" class="global-agent-dock hidden">
           <aside id="agentContextTray" class="agent-context-tray hidden" aria-live="polite">
@@ -292,7 +319,6 @@
     </form>
   </dialog>
 
-  <dialog id="proposalReviewDialog" class="project-dialog proposal-review-dialog" aria-labelledby="proposalReviewDialogTitle"><div class="dialog-head"><h3 id="proposalReviewDialogTitle">Architecture review</h3><button class="dialog-close" type="button" data-close-dialog="proposalReviewDialog" aria-label="Close">×</button></div><div id="proposalList" class="proposal-list"></div></dialog>
 
   <dialog id="accountSettingsDialog" class="project-dialog account-settings-dialog" aria-labelledby="accountSettingsTitle"><form id="accountSettingsForm" method="dialog"><div class="dialog-head"><div><small>ACCOUNT &amp; SYSTEM</small><h3 id="accountSettingsTitle">Profile</h3></div><button class="dialog-close" type="button" data-close-dialog="accountSettingsDialog" aria-label="Close">×</button></div><nav class="settings-nav" aria-label="Account sections"><button type="button" data-settings-panel="profile">Profile</button><button type="button" data-settings-panel="preferences">Preferences</button><button type="button" data-settings-panel="settings">Settings</button></nav><section id="settingsPanel"></section><div class="dialog-actions"><button class="btn secondary" type="button" data-close-dialog="accountSettingsDialog">Cancel</button><button class="btn primary" type="submit">Save changes</button></div></form></dialog>
 
@@ -415,10 +441,9 @@
 
   <div id="toast" class="toast hidden"></div>
   <script src="/runtime-config.js"></script>
-  <script src="/static/prototype.js?v=20260901-firebase-uid"></script>
+  <script src="/static/prototype.js?v=bd187140bfd50057"></script>
   <script src="/static/firebase-auth-client.js?v=20260901-auth-providers"></script>
-  <script type="module" src="/static/app.js?v=f09d352f8cabf0e0"></script>
+  <script type="module" src="/static/app.js?v=e548c668cb950869"></script>
   <script type="module" src="/static/archbro-webmcp.js?v=ef5e8f65352bb894"></script>
 </body>
 </html>
-

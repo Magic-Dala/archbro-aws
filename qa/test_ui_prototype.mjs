@@ -259,10 +259,16 @@ test('human approvals and account settings live in top-right controls', async ()
 
 test('Needs You derives pending proposals before blocked tasks', () => {
   const items = prototype.deriveNeedsYou(
-    [{id: 'proposal-1', status: 'PENDING', reason: 'Review data boundary'}],
+    [{id: 'proposal-1', status: 'PENDING', base_architecture_version:3, reason: 'Review data boundary'}],
     [{id: 'task-1', status: 'BLOCKED', title: 'Choose provider'}],
+    undefined,
+    3,
   );
   assert.deepEqual(items.map((item) => item.kind), ['proposal', 'task']);
+  assert.deepEqual(
+    prototype.deriveNeedsYou([{id:'missing', status:'PENDING'}], [], undefined, null),
+    [],
+  );
 });
 
 test('prototype CSS keeps the Product Canvas responsive and motion-aware', async () => {

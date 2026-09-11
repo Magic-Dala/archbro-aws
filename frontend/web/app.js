@@ -8,7 +8,15 @@ import {
   signInWithGoogleAccount,
   signOutFromFirebase,
   usesFirebaseAuthentication,
-} from './firebase-auth.js?v=20260901-auth-providers';
+} from './firebase-auth.js?v=854f576b09bf4d69';
+import {
+  bindProposalDecisionControls,
+  formatTaskEnum,
+  isProposalActionable,
+  reconcileWorkspaceSelection,
+  resolveTaskDependencies,
+  taskInstructionContext,
+} from './review-helpers.js?v=854be06a4562dd3b';
 
 const prototype = window.ArchbroPrototype;
 const URL_PARAMS = new URLSearchParams(window.location.search);
@@ -179,9 +187,20 @@ const state = {
   agentContextPolicy: 'ASK_ALL',
   agentContextTelemetryVisible: true,
   selectedTaskId: null,
+  taskDetailId: null,
+  taskDetailOrigin: null,
+  taskActionNotice: null,
   selectedProposalId: null,
+  proposalUpdating: new Set(),
+  proposalDecisionNotice: null,
+  notificationTransientMessage: null,
+  proposalPreviews: new Map(),
+  proposalPreviewSerial: 0,
   currentView: 'overview',
   projectContextRequestSerial: 0,
+  workspaceTab: 'tasks',
+  workspaceTabMemory: new Map(),
+  workspaceTabScrollMemory: new Map(),
   taskUpdating: new Set(),
   workingRequests: new Map(),
   workingRequestSerial: 0,
@@ -276,7 +295,14 @@ function readNavigationRoute(locationLike = window.location, {useStorageFallback
   const nodeId = projectId && canvas ? (String(params.get('node') || '').trim() || null) : null;
   const requestedTab = String(params.get('tab') || '').trim().toLowerCase();
   const inspectorTab = nodeId && INSPECTOR_TABS.has(requestedTab) ? requestedTab : 'overview';
-  return {projectId, explicitProject, view, canvas, nodeId, inspectorTab};
+  let requestedWorkspaceTab = String(params.get('workspace') || '').trim().toLowerCase();
+  if (!workspaceTabNames.includes(requestedWorkspaceTab) && useStorageFallback && projectId) {
+    requestedWorkspaceTab = String(localStorage.getItem(`archbro-workspace-tab:${projectId}`) || '').trim().toLowerCase();
+  }
+  const workspaceTab = projectId && view === 'tasks' && workspaceTabNames.includes(requestedWorkspaceTab)
+    ? requestedWorkspaceTab
+    : 'tasks';
+  return {projectId, explicitProject, view, canvas, nodeId, inspectorTab, workspaceTab};
 }
 
 function beginNavigationTransition(projectId = state.projectId) {
@@ -307,12 +333,15 @@ function navigationSnapshotFromState(overrides = {}) {
   const canvas = Object.prototype.hasOwnProperty.call(overrides, 'canvas') ? Boolean(overrides.canvas) : ARCHITECTURE_CANVAS_MODE;
   const nodeId = Object.prototype.hasOwnProperty.call(overrides, 'nodeId') ? overrides.nodeId : state.selectedComponentId;
   const inspectorTab = Object.prototype.hasOwnProperty.call(overrides, 'inspectorTab') ? overrides.inspectorTab : state.inspectorTab;
+  const requestedWorkspaceTab = Object.prototype.hasOwnProperty.call(overrides, 'workspaceTab') ? overrides.workspaceTab : state.workspaceTab;
+  const workspaceTab = view === 'tasks' && workspaceTabNames.includes(requestedWorkspaceTab) ? requestedWorkspaceTab : 'tasks';
   return {
     projectId: projectId || null,
     view: ROUTED_VIEWS.has(view) ? view : 'overview',
     canvas,
     nodeId: projectId && canvas ? (nodeId || null) : null,
     inspectorTab: projectId && canvas && nodeId && INSPECTOR_TABS.has(inspectorTab) ? inspectorTab : 'overview',
+    workspaceTab,
   };
 }
 
@@ -326,6 +355,7 @@ function committedNavigationSnapshot() {
     canvas: Boolean(committed?.canvas),
     node_id: committed?.nodeId || null,
     inspector_tab: committed?.inspectorTab || 'overview',
+    workspace_tab: committed?.workspaceTab || 'tasks',
   };
 }
 
@@ -342,6 +372,8 @@ function writeNavigationUrl(snapshot, historyMode = 'replace') {
   else url.searchParams.delete('node');
   if (snapshot.projectId && snapshot.canvas && snapshot.nodeId && snapshot.inspectorTab !== 'overview') url.searchParams.set('tab', snapshot.inspectorTab);
   else url.searchParams.delete('tab');
+  if (snapshot.projectId && snapshot.view === 'tasks') url.searchParams.set('workspace', snapshot.workspaceTab);
+  else url.searchParams.delete('workspace');
   const method = historyMode === 'push' ? 'pushState' : 'replaceState';
   history[method]({archbroNavigation: snapshot}, '', url.toString());
 }
@@ -353,6 +385,10 @@ function commitNavigation(snapshot, {historyMode = 'replace', guard = null} = {}
   state.navigation.initialized = true;
   if (normalized.projectId) localStorage.setItem('archbro-project-id', normalized.projectId);
   else localStorage.removeItem('archbro-project-id');
+  if (normalized.projectId && normalized.view === 'tasks') {
+    localStorage.setItem(`archbro-workspace-tab:${normalized.projectId}`, normalized.workspaceTab);
+    state.workspaceTabMemory.set(workspaceProjectKey(normalized.projectId), normalized.workspaceTab);
+  }
   writeNavigationUrl(normalized, historyMode);
   return true;
 }
@@ -383,6 +419,157 @@ function architectureViewCacheKey(surface, projectId, architectureVersion, scope
   const normalizedSurface = surface === 'canvas' ? 'canvas' : 'project';
   const scope = normalizedSurface === 'canvas' ? 'ROOT' : (scopeComponentId || 'ROOT');
   return `${projectId || ''}|${Number(architectureVersion) || 0}|${normalizedSurface}|${scope}|${normalizedArchitectureReadingMode(readingMode)}`;
+}
+
+const workspaceTabMeta = {
+  tasks: {title: 'Tasks', subtitle: 'Concrete, actionable work shared by humans and the agent.'},
+  review: {title: 'Architecture Review', subtitle: 'Review proposed architecture changes before they become the accepted design.'},
+};
+const workspaceTabNames = ['tasks', 'review'];
+
+function workspaceProjectKey(projectId = state.projectId) {
+  return projectId || '__no-project__';
+}
+
+function workspaceTabForProject(projectId = state.projectId) {
+  const remembered = state.workspaceTabMemory.get(workspaceProjectKey(projectId));
+  if (workspaceTabNames.includes(remembered)) return remembered;
+  const persisted = projectId
+    ? String(localStorage.getItem(`archbro-workspace-tab:${projectId}`) || '').trim().toLowerCase()
+    : '';
+  return workspaceTabNames.includes(persisted) ? persisted : 'tasks';
+}
+
+function workspaceTabScrollForProject(projectId = state.projectId) {
+  const key = workspaceProjectKey(projectId);
+  if (!state.workspaceTabScrollMemory.has(key)) state.workspaceTabScrollMemory.set(key, {tasks: 0, review: 0});
+  return state.workspaceTabScrollMemory.get(key);
+}
+
+function workspaceScrollTop() {
+  return Math.max(window.scrollY || 0, document.documentElement?.scrollTop || 0, $('workspaceMain')?.scrollTop || 0);
+}
+
+function rememberWorkspaceTabScroll(tabName = state.workspaceTab) {
+  if (!workspaceTabNames.includes(tabName)) return;
+  workspaceTabScrollForProject()[tabName] = workspaceScrollTop();
+}
+
+function restoreWorkspaceTabScroll(tabName = state.workspaceTab) {
+  const scrollTop = workspaceTabScrollForProject()[tabName] || 0;
+  requestAnimationFrame(() => {
+    window.scrollTo(0, scrollTop);
+    const workspaceMain = $('workspaceMain');
+    if (workspaceMain) workspaceMain.scrollTop = scrollTop;
+  });
+}
+
+function workspaceTabCount(tabName) {
+  if (tabName === 'tasks') return state.tasks.length;
+  return state.proposals.filter((proposal) => isProposalActionable(proposal, state.architecture)).length;
+}
+
+function applyWorkspaceTabInvariants(tabName, {focusedProposalId = null} = {}) {
+  const next = reconcileWorkspaceSelection({
+    tabName,
+    tasks: state.tasks,
+    proposals: state.proposals,
+    architectureVersion: state.architecture?.version,
+    selectedTaskId: state.selectedTaskId,
+    taskDetailId: state.taskDetailId,
+    taskDetailOrigin: state.taskDetailOrigin,
+    selectedProposalId: state.selectedProposalId,
+    focusedProposalId,
+  });
+  const clearedTaskContext = Boolean(
+    (state.selectedTaskId || state.taskDetailId)
+      && !next.selectedTaskId
+      && !next.taskDetailId,
+  );
+  Object.assign(state, next);
+  state.workspaceTab = tabName;
+  if (clearedTaskContext || tabName === 'review') clearAgentContextPreview();
+  return next;
+}
+
+function renderWorkspaceTabs() {
+  const shell = $('workspaceTabs');
+  if (!shell) return;
+  const visible = state.currentView === 'tasks';
+  const activeTab = workspaceTabNames.includes(state.workspaceTab) ? state.workspaceTab : 'tasks';
+  shell.classList.toggle('hidden', !visible);
+  workspaceTabNames.forEach((tabName) => {
+    const button = $(`workspaceTab${tabName === 'tasks' ? 'Tasks' : 'Review'}`);
+    const panel = $(`workspaceTab${tabName === 'tasks' ? 'Tasks' : 'Review'}Panel`);
+    const count = $(`${tabName === 'tasks' ? 'task' : 'review'}TabCount`);
+    if (!button || !panel) return;
+    const selected = visible && activeTab === tabName;
+    const total = workspaceTabCount(tabName);
+    button.setAttribute('aria-selected', String(selected));
+    button.setAttribute('aria-label', `${workspaceTabMeta[tabName].title} (${total})`);
+    button.tabIndex = selected ? 0 : -1;
+    panel.hidden = !selected;
+    panel.classList.toggle('hidden', !selected);
+    if (count) count.textContent = String(total);
+  });
+  if (visible) {
+    $('pageTitle').textContent = workspaceTabMeta[activeTab].title;
+    $('pageSubtitle').textContent = workspaceTabMeta[activeTab].subtitle;
+  }
+}
+
+function switchWorkspaceTab(tabName, {
+  restoreScroll = true,
+  focus = false,
+  focusedProposalId = null,
+  historyMode = 'push',
+  navigationGuard = null,
+} = {}) {
+  if (!workspaceTabNames.includes(tabName) || state.onboarding.active) return false;
+  if (state.currentView !== 'tasks') {
+    switchView('tasks', {workspaceTab: tabName, restoreScroll, historyMode, navigationGuard, focusedProposalId});
+    if (focus) $(`workspaceTab${tabName === 'tasks' ? 'Tasks' : 'Review'}`)?.focus();
+    return true;
+  }
+  const changed = state.workspaceTab !== tabName;
+  const guard = navigationGuard || (changed ? beginNavigationTransition(state.projectId) : captureNavigationGuard(state.projectId));
+  if (!navigationGenerationIsCurrent(guard)) return false;
+  rememberWorkspaceTabScroll(state.workspaceTab);
+  applyWorkspaceTabInvariants(tabName, {focusedProposalId});
+  if (!commitNavigation({
+    projectId: state.projectId,
+    view: 'tasks',
+    canvas: ARCHITECTURE_CANVAS_MODE,
+    nodeId: null,
+    inspectorTab: 'overview',
+    workspaceTab: tabName,
+  }, {historyMode: changed ? historyMode : 'replace', guard})) return false;
+  renderWorkspaceTabs();
+  renderTaskDetails();
+  renderProposals();
+  updateInstructionContext();
+  if (restoreScroll) restoreWorkspaceTabScroll(tabName);
+  if (focus) $(`workspaceTab${tabName === 'tasks' ? 'Tasks' : 'Review'}`)?.focus();
+  return true;
+}
+
+function handleWorkspaceTabKeydown(event) {
+  if (!workspaceTabNames.includes(event.currentTarget.dataset.workspaceTab)) return;
+  const currentIndex = workspaceTabNames.indexOf(event.currentTarget.dataset.workspaceTab);
+  let nextIndex = null;
+  if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % workspaceTabNames.length;
+  if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + workspaceTabNames.length) % workspaceTabNames.length;
+  if (event.key === 'Home') nextIndex = 0;
+  if (event.key === 'End') nextIndex = workspaceTabNames.length - 1;
+  if (nextIndex !== null) {
+    event.preventDefault();
+    switchWorkspaceTab(workspaceTabNames[nextIndex], {focus: true});
+    return;
+  }
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    switchWorkspaceTab(event.currentTarget.dataset.workspaceTab, {focus: true});
+  }
 }
 
 function resetArchitectureViewCache(projectId, architectureVersion) {
@@ -1084,13 +1271,19 @@ function toggleProjectMenu(projectId) {
 }
 
 function toggleProjectExpanded(projectId) {
+  const activeNode = document.activeElement?.closest?.('[data-project-id]');
+  const restoreToggleFocus = Boolean(
+    document.activeElement?.hasAttribute?.('data-project-toggle')
+    && activeNode?.dataset.projectId === projectId
+  );
   if (state.expandedProjectIds.has(projectId)) state.expandedProjectIds.delete(projectId);
   else state.expandedProjectIds.add(projectId);
   persistExpandedProjectIds();
   renderProjectTree();
-  setTimeout(() => [...document.querySelectorAll('[data-project-id]')]
+  if (!restoreToggleFocus) return;
+  [...document.querySelectorAll('[data-project-id]')]
     .find((node) => node.dataset.projectId === projectId)
-    ?.querySelector('[data-project-toggle]')?.focus(), 0);
+    ?.querySelector('[data-project-toggle]')?.focus({preventScroll:true});
 }
 
 function mobileSidebarEnabled() {
@@ -1660,6 +1853,9 @@ async function selectProject(projectId, {
   if (projectId === state.projectId && state.project && canvas === ARCHITECTURE_CANVAS_MODE) {
     state.onboarding.active = false;
     state.currentView = ROUTED_VIEWS.has(view) ? view : 'overview';
+    if (state.currentView === 'tasks') {
+      applyWorkspaceTabInvariants(route?.workspaceTab || workspaceTabForProject(projectId));
+    }
     if (route?.canvas && route?.nodeId) {
       state.selectedComponentId = route.nodeId;
       state.selectedEdgeId = null;
@@ -1689,6 +1885,7 @@ async function selectProject(projectId, {
       canvas,
       nodeId:route?.nodeId ?? state.selectedComponentId,
       inspectorTab:route?.inspectorTab ?? state.inspectorTab,
+      workspaceTab:state.currentView === 'tasks' ? state.workspaceTab : 'tasks',
     }, {historyMode, guard})) return false;
     render();
     return true;
@@ -1712,6 +1909,7 @@ async function selectProject(projectId, {
 
     ARCHITECTURE_CANVAS_MODE = Boolean(canvas);
     syncArchitectureCanvasDomMode();
+    const nextView = ROUTED_VIEWS.has(view) ? view : (canvas ? 'architecture' : 'overview');
     Object.assign(state, context, {
       projectId,
       lastRun: null,
@@ -1731,13 +1929,25 @@ async function selectProject(projectId, {
       graphFocusMode: canvas && route?.nodeId ? 'connected' : 'all',
       collapsedNodeIds: new Set(),
       selectedTaskId: null,
+      taskDetailId: null,
+      taskDetailOrigin: null,
+      taskActionNotice: null,
       selectedProposalId: null,
-      currentView: ROUTED_VIEWS.has(view) ? view : (canvas ? 'architecture' : 'overview'),
+      proposalUpdating: new Set(),
+      proposalDecisionNotice: null,
+      notificationTransientMessage: null,
+      proposalPreviews: new Map(),
+      proposalPreviewSerial: state.proposalPreviewSerial + 1,
+      workspaceTab: nextView === 'tasks'
+        ? (route?.workspaceTab || workspaceTabForProject(projectId))
+        : 'tasks',
+      currentView: nextView,
       inspectorTab: canvas && route?.nodeId ? (route.inspectorTab || 'overview') : 'overview',
       canvasInspectorOpen: Boolean(canvas && route?.nodeId),
       canvasDeepLinkApplied: false,
       canvasDeepLinkFocusPending: false,
     });
+    if (state.currentView === 'tasks') applyWorkspaceTabInvariants(state.workspaceTab);
     if (!retainOptional) clearWorkspaceOptionalData();
     state.onboarding.active = false;
     state.expandedProjectIds.add(projectId);
@@ -1748,6 +1958,7 @@ async function selectProject(projectId, {
       canvas:ARCHITECTURE_CANVAS_MODE,
       nodeId:state.selectedComponentId,
       inspectorTab:state.inspectorTab,
+      workspaceTab:state.currentView === 'tasks' ? state.workspaceTab : 'tasks',
     }, {historyMode, guard})) return false;
     render();
     void refreshWorkspaceOptionalResources(ticket, context.architecture, {
@@ -1804,6 +2015,9 @@ async function refresh({projectId = state.projectId, guard = captureNavigationGu
     // an architecture-version bump. Only the newest successful core refresh is
     // allowed to invalidate them; failed or superseded refreshes preserve cache.
     invalidateArchitectureViewCache(projectId);
+    state.proposalPreviews.clear();
+    state.proposalPreviewSerial += 1;
+    if (state.currentView === 'tasks') applyWorkspaceTabInvariants(state.workspaceTab);
     if (!retainOptional) clearWorkspaceOptionalData();
     clearAgentContextPreview();
     render();
@@ -1849,7 +2063,14 @@ function startOnboarding() {
     lastError: null,
   };
   state.selectedTaskId = null;
+  state.taskDetailId = null;
+  state.taskDetailOrigin = null;
+  state.taskActionNotice = null;
+  state.workspaceTab = 'tasks';
   state.selectedProposalId = null;
+  state.proposalUpdating.clear();
+  state.proposalDecisionNotice = null;
+  state.notificationTransientMessage = null;
   state.selectedComponentId = null;
   state.selectedCodeNodeId = null;
   state.architectureGraphKind = 'living';
@@ -2307,9 +2528,14 @@ function closeOverlay({returnFocus = false} = {}) {
 
 function renderNotifications() {
   const profile = prototype.currentProfile(localStorage);
-  const items = state.onboarding.active ? [] : prototype.deriveNeedsYou(state.proposals, state.tasks, profile?.notifications);
+  const items = state.onboarding.active ? [] : prototype.deriveNeedsYou(state.proposals, state.tasks, profile?.notifications, state.architecture?.version);
   $('notificationBadge').textContent = items.length;
   $('notificationBadge').classList.toggle('hidden', items.length === 0);
+  if (state.notificationTransientMessage) {
+    $('notificationCount').textContent = 'Updated';
+    $('notificationList').innerHTML = `<p class="notification-empty" role="status" tabindex="-1">${escapeHtml(state.notificationTransientMessage)}</p>`;
+    return;
+  }
   $('notificationCount').textContent = `${items.length} request${items.length === 1 ? '' : 's'}`;
   $('notificationList').innerHTML = items.length
     ? items.map((item) => `<button class="notification-item" type="button" data-attention-kind="${item.kind}" data-attention-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.description)}</span></button>`).join('')
@@ -2325,8 +2551,8 @@ function attentionItemExists(kind, id) {
 
 function showUnavailableAttentionItem() {
   closeTopMenus();
-  $('notificationList').innerHTML = '<p class="notification-empty" role="status" tabindex="-1">Item no longer available. The project has been refreshed.</p>';
-  $('notificationCount').textContent = 'Updated';
+  state.notificationTransientMessage = 'Item no longer available. The project has been refreshed.';
+  renderNotifications();
   $('notificationMenu').classList.remove('hidden');
   $('notificationBtn').setAttribute('aria-expanded', 'true');
   setTimeout(() => $('notificationList').querySelector('[role="status"]')?.focus(), 0);
@@ -2342,18 +2568,13 @@ async function openAttentionItem(kind, id) {
     }
   }
   if (kind === 'proposal') {
-    state.selectedProposalId = id;
-    renderProposals();
-    updateInstructionContext();
-    showDialog('proposalReviewDialog', $('notificationBtn'));
+    if (!isProposalActionable(state.proposals.find((item) => item.id === id), state.architecture)) return false;
+    switchWorkspaceTab('review', {focusedProposalId:id});
     setTimeout(() => document.querySelector(`[data-proposal-select="${CSS.escape(id)}"]`)?.focus(), 0);
     return true;
   }
-  state.selectedTaskId = id;
-  switchView('tasks');
-  renderTasks();
-  setTimeout(() => document.querySelector(`[data-task-select="${CSS.escape(id)}"]`)?.focus(), 0);
-  return true;
+  switchView('tasks', {workspaceTab: 'tasks'});
+  return openTaskDetails(id, 'tasks');
 }
 
 function closeTopMenus() {
@@ -2369,6 +2590,10 @@ function toggleTopMenu(buttonId, menuId) {
   clearProjectMenuFocusQueue();
   closeTopMenus();
   if (!opening) return;
+  if (menuId === 'notificationMenu' && state.notificationTransientMessage) {
+    state.notificationTransientMessage = null;
+    renderNotifications();
+  }
   $(menuId).classList.remove('hidden');
   $(buttonId).setAttribute('aria-expanded', 'true');
   const target = menuId === 'notificationMenu'
@@ -2428,7 +2653,13 @@ function resetEphemeralSessionState() {
   state.scopeComponentId = null;
   state.readingMode = 'MAP';
   state.selectedTaskId = null;
+  state.taskDetailId = null;
+  state.taskDetailOrigin = null;
+  state.taskActionNotice = null;
   state.selectedProposalId = null;
+  state.proposalUpdating.clear();
+  state.proposalDecisionNotice = null;
+  state.notificationTransientMessage = null;
   state.lastRun = null;
   clearAgentContextPreview();
   state.projects = [];
@@ -2560,8 +2791,8 @@ function render() {
 
   const ready = state.tasks.filter((t) => t.status === 'TODO' && (t.owner === 'HUMAN' || t.owner === 'UNASSIGNED'));
   const running = state.tasks.filter((t) => t.status === 'IN_PROGRESS');
-  const pending = state.proposals.filter((p) => p.status === 'PENDING');
-  const needsYou = prototype.deriveNeedsYou(state.proposals, state.tasks, prototype.currentProfile(localStorage)?.notifications);
+  const pending = state.proposals.filter((p) => isProposalActionable(p, state.architecture));
+  const needsYou = prototype.deriveNeedsYou(state.proposals, state.tasks, prototype.currentProfile(localStorage)?.notifications, state.architecture?.version);
 
   $('readyCount').textContent = `${ready.length} ready task${ready.length === 1 ? '' : 's'}`;
   $('readySub').textContent = ready[0]?.title || (awaiting ? 'Architecture generation pending' : 'No actionable human task yet');
@@ -2583,6 +2814,7 @@ function render() {
   document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
   $(`view-${activeView}`).classList.add('active');
 
+  renderWorkspaceTabs();
   renderTasks();
   renderProposals();
   renderNotifications();
@@ -2595,33 +2827,78 @@ function render() {
 }
 
 function renderTasks() {
+  const focusedTaskId = document.activeElement?.dataset?.taskOpen || null;
+  const focusedTaskOrigin = document.activeElement?.dataset?.taskOrigin || null;
   const order = {IN_PROGRESS: 0, TODO: 1, BLOCKED: 2, DONE: 3};
   const sorted = [...state.tasks].sort((a, b) => order[a.status] - order[b.status]);
   $('taskTotal').textContent = `${sorted.length} task${sorted.length === 1 ? '' : 's'}`;
-  $('taskList').innerHTML = sorted.length ? sorted.map((task) => taskRow(task, true)).join('') : '<p class="muted">No tasks yet.</p>';
-  $('overviewTasks').innerHTML = sorted.filter((t) => t.status !== 'DONE').slice(0, 3).map((task) => taskRow(task, false)).join('') || '<p class="muted">No active tasks.</p>';
-  document.querySelectorAll('[data-task-action]').forEach((btn) => btn.addEventListener('click', () => updateTask(btn.dataset.taskId, btn.dataset.taskAction)));
-  document.querySelectorAll('#taskList [data-task-select]').forEach((button) => button.addEventListener('click', () => selectTaskContext(button.dataset.taskSelect)));
-  document.querySelectorAll('#taskList [data-task-navigate]').forEach((row) => {
-    row.addEventListener('dblclick', (event) => {
-      if (event.target.closest('[data-task-action]')) return;
-      navigateTaskToArchitecture(row.dataset.taskNavigate);
-    });
-    row.addEventListener('keydown', (event) => {
-      if (event.target !== row || event.key !== 'Enter') return;
+  $('taskList').innerHTML = sorted.length ? sorted.map((task) => taskRow(task, true, 'tasks')).join('') : '<p class="muted">No tasks yet.</p>';
+  $('overviewTasks').innerHTML = sorted.filter((t) => t.status !== 'DONE').slice(0, 3).map((task) => taskRow(task, false, 'overview')).join('') || '<p class="muted">No active tasks.</p>';
+  document.querySelectorAll('[data-task-open]').forEach((button) => {
+    const open = () => openTaskDetails(button.dataset.taskOpen, button.dataset.taskOrigin || state.currentView);
+    button.addEventListener('click', open);
+    // Native button activation dispatches Space on keyup. A concurrent workspace
+    // projection can replace the focused task row between keydown and keyup,
+    // losing that click. Commit the Space activation on keydown so rerenders can
+    // restore focus to the replacement without dropping the person's action.
+    button.addEventListener('keydown', (event) => {
+      if ((event.key !== ' ' && event.key !== 'Spacebar') || event.repeat) return;
       event.preventDefault();
-      navigateTaskToArchitecture(row.dataset.taskNavigate);
+      open();
     });
   });
+  document.querySelectorAll('[data-task-action]').forEach((btn) => btn.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    updateTask(btn.dataset.taskId, btn.dataset.taskAction);
+  }));
+  renderTaskDetails();
+  renderWorkspaceTabs();
+  if (focusedTaskId) {
+    const container = focusedTaskOrigin === 'overview' ? '#overviewTasks' : '#taskList';
+    document.querySelector(`${container} [data-task-open="${CSS.escape(focusedTaskId)}"]`)?.focus({preventScroll:true});
+  }
 }
 
-function selectTaskContext(taskId) {
-  state.selectedTaskId = taskId;
+function openTaskDetails(taskId, originView = state.currentView, {preserveOrigin = false} = {}) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task) return false;
+  if (!preserveOrigin || !state.taskDetailOrigin) state.taskDetailOrigin = {view: originView, taskId};
+  state.taskDetailId = task.id;
+  state.selectedTaskId = task.id;
   state.selectedProposalId = null;
   state.selectedComponentId = null;
-  renderTasks();
   updateInstructionContext();
-  setTimeout(() => document.querySelector(`[data-task-select="${CSS.escape(taskId)}"]`)?.focus(), 0);
+  renderTasks();
+  setTimeout(() => $('taskDetailClose')?.focus(), 0);
+  return true;
+}
+
+function closeTaskDetails({restoreFocus = true} = {}) {
+  const origin = state.taskDetailOrigin;
+  state.taskDetailId = null;
+  state.taskDetailOrigin = null;
+  renderTasks();
+  if (!restoreFocus) return;
+  if (origin?.view && origin.view !== state.currentView) switchView(origin.view);
+  const container = origin?.view === 'overview' ? '#overviewTasks' : '#taskList';
+  setTimeout(() => document.querySelector(`${container} [data-task-open="${CSS.escape(origin?.taskId || '')}"]`)?.focus(), 0);
+}
+
+function taskActionForStatus(task) {
+  if (WEBMCP_AGENT_MODE) return null;
+  const updating = state.taskUpdating.has(task.id);
+  if (task.status === 'TODO') return {action: 'start', label: updating ? 'Starting…' : 'Start task'};
+  if (task.status === 'IN_PROGRESS') return {action: 'done', label: updating ? 'Saving…' : 'Mark done'};
+  if (task.status === 'DONE') return {action: 'reopen', label: updating ? 'Reopening…' : 'Reopen'};
+  return {action: 'blocked', label: 'Blocked', disabled: true};
+}
+
+function taskActionMarkup(task) {
+  const action = taskActionForStatus(task);
+  if (!action) return '';
+  const data = action.action === 'blocked' ? '' : ` data-task-action="${action.action}"`;
+  return `<button class="task-row-action${action.action === 'blocked' ? ' is-blocked' : ''}" type="button" data-task-id="${escapeHtml(task.id)}"${data} ${action.disabled || state.taskUpdating.has(task.id) ? 'disabled' : ''}>${action.label}</button>`;
 }
 
 async function navigateTaskToArchitecture(taskId) {
@@ -2643,76 +2920,354 @@ async function navigateTaskToArchitecture(taskId) {
   return true;
 }
 
-function taskRow(t, selectable = false) {
+function taskRow(t, selectable = false, originView = 'tasks') {
   const selected = selectable && state.selectedTaskId === t.id;
-  const updating = state.taskUpdating.has(t.id);
-  const action = WEBMCP_AGENT_MODE ? '' : t.status === 'TODO'
-    ? `<button data-task-action="start" data-task-id="${escapeHtml(t.id)}" ${updating ? 'disabled' : ''}>${updating ? 'Starting…' : 'Start task'}</button>`
-    : t.status === 'IN_PROGRESS'
-      ? `<button data-task-action="done" data-task-id="${escapeHtml(t.id)}" ${updating ? 'disabled' : ''}>${updating ? 'Saving…' : 'Mark done'}</button>`
-      : '';
-  const content = selectable
-    ? `<button class="task-context-button" type="button" data-task-select="${escapeHtml(t.id)}" aria-pressed="${selected}" aria-label="Use ${escapeHtml(t.title)} as Agent context"><strong>${escapeHtml(t.title)}</strong><p>${escapeHtml(t.description || `${t.owner} · ${t.source}`)}</p></button>${action}`
-    : `<div><strong>${escapeHtml(t.title)}</strong><p>${escapeHtml(t.description || `${t.owner} · ${t.source}`)}</p>${action}</div>`;
-  const navigable = selectable && Boolean(t.related_component);
-  const navigationAttrs = navigable ? ` data-task-navigate="${escapeHtml(t.id)}" tabindex="0" aria-label="${escapeHtml(`Task ${t.title}. Double-click or press Enter to open its architecture component.`)}" title="Double-click to open related architecture component"` : '';
-  return `<div class="task-row${selected ? ' context-selected' : ''}${navigable ? ' is-architecture-linked' : ''}"${navigationAttrs}><i class="status-dot ${statusClass(t.status)}"></i><div>${content}</div><span class="status-pill ${t.status}">${t.status.replace('_', ' ')}</span></div>`;
+  const detailSelected = state.taskDetailId === t.id;
+  const action = taskActionMarkup(t);
+  return `<article class="task-row${selected ? ' context-selected' : ''}${detailSelected ? ' detail-selected' : ''}"><i class="status-dot ${statusClass(t.status)}" aria-hidden="true"></i><div class="task-row-main"><button class="task-open" type="button" data-task-open="${escapeHtml(t.id)}" data-task-origin="${escapeHtml(originView)}" aria-expanded="${detailSelected}" aria-controls="taskDetailPanel" aria-label="Open details for ${escapeHtml(t.title)}"><span class="task-row-copy"><strong>${escapeHtml(t.title)}</strong><span class="task-row-meta"><span>Owner: ${escapeHtml(formatTaskEnum(t.owner, 'Unassigned'))}</span><span>Source: ${escapeHtml(formatTaskEnum(t.source, 'Not provided'))}</span></span><span class="status-pill ${escapeHtml(t.status)}">${escapeHtml(formatTaskEnum(t.status))}</span></span><span class="task-row-chevron" aria-hidden="true">›</span></button><div class="task-row-actions">${action}</div></div></article>`;
 }
 
 async function updateTask(taskId, action) {
   const task = state.tasks.find((t) => t.id === taskId);
   if (!task || state.taskUpdating.has(taskId)) return;
-  const status = action === 'done' ? 'DONE' : 'IN_PROGRESS';
+  const status = {start: 'IN_PROGRESS', done: 'DONE', reopen: 'TODO'}[action];
+  if (!status) return;
   state.taskUpdating.add(taskId);
   renderTasks();
   try {
-    await sendEvent(
+    const result = await sendEvent(
       'TASK_UPDATED',
       {task_id: task.id, title: task.title, status, message: `Task "${task.title}" changed to ${status}. Treat this as observed human project state.`},
-      status === 'DONE' ? 'Saving completed task…' : 'Starting task…',
+      status === 'DONE' ? 'Saving completed task…' : status === 'TODO' ? 'Reopening task…' : 'Starting task…',
     );
+    state.taskActionNotice = result?.result === 'SUCCESS'
+      ? {taskId, kind: 'success', text: `${task.title} is now ${formatTaskEnum(status)}.`}
+      : {taskId, kind: 'error', text: 'The task update could not be saved. Try again.'};
   } finally {
     state.taskUpdating.delete(taskId);
     renderTasks();
   }
 }
 
+function taskDetailComponentMarkup(task) {
+  if (!task.related_component) {
+    return '<p class="task-detail-empty">No related component supplied.</p>';
+  }
+  const component = findArchitectureNode(task.related_component);
+  if (!component) {
+    return `<p class="task-detail-empty">Component unavailable · <code>${escapeHtml(task.related_component)}</code></p>`;
+  }
+  return `<div class="task-detail-component"><div><strong>${escapeHtml(component.name || component.id)}</strong><span>${escapeHtml(component.type || 'Component')}${component.responsibility ? ` · ${escapeHtml(component.responsibility)}` : ''}</span></div><button class="link-btn" type="button" data-task-component-open="${escapeHtml(task.id)}">Open component ↗</button></div>`;
+}
+
+function renderTaskDetails() {
+  const panel = $('taskDetailPanel');
+  const body = $('taskDetailBody');
+  if (!panel || !body) return;
+  const task = state.tasks.find((item) => item.id === state.taskDetailId);
+  if (!task || state.currentView === 'architecture' || (state.currentView === 'tasks' && state.workspaceTab !== 'tasks')) {
+    panel.classList.add('hidden');
+    panel.hidden = true;
+    body.innerHTML = '';
+    return;
+  }
+  panel.classList.remove('hidden');
+  panel.hidden = false;
+  $('taskDetailTitle').textContent = task.title || 'Untitled task';
+  const criteria = (Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : []).map((criterion) => String(criterion || '').trim()).filter(Boolean);
+  body.innerHTML = `<div class="task-detail-status"><span class="status-pill ${escapeHtml(task.status)}">${escapeHtml(formatTaskEnum(task.status))}</span><code>${escapeHtml(task.id)}</code></div><p class="task-detail-description">${escapeHtml(task.description || 'No description supplied.')}</p><dl class="task-detail-facts"><div><dt>Owner</dt><dd>${escapeHtml(formatTaskEnum(task.owner, 'Unassigned'))}</dd></div><div><dt>Source</dt><dd>${escapeHtml(formatTaskEnum(task.source, 'Not provided'))}</dd></div><div><dt>Status</dt><dd>${escapeHtml(formatTaskEnum(task.status))}</dd></div><div><dt>Related component</dt><dd>${task.related_component ? `<code>${escapeHtml(task.related_component)}</code>` : 'Not supplied'}</dd></div></dl><section class="task-detail-section"><h3>Acceptance criteria</h3>${criteria.length ? `<ol class="task-criteria">${criteria.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join('')}</ol>` : '<p class="task-detail-empty">No acceptance criteria supplied.</p>'}</section><section class="task-detail-section"><h3>Dependencies</h3><div class="task-dependency-list">${(() => { const dependencies = resolveTaskDependencies(task, state.tasks); return dependencies.length ? dependencies.map((dependency) => dependency.available ? `<button class="task-dependency" type="button" data-task-dependency="${escapeHtml(dependency.id)}"><span>${escapeHtml(dependency.title)}</span><span class="status-pill ${escapeHtml(dependency.status)}">${escapeHtml(formatTaskEnum(dependency.status))}</span></button>` : `<p class="task-detail-empty">Dependency unavailable · <code>${escapeHtml(dependency.id || 'No dependency ID supplied')}</code></p>`).join('') : '<p class="task-detail-empty">No dependencies listed.</p>'; })()}</div></section><section class="task-detail-section"><h3>Related architecture component</h3>${taskDetailComponentMarkup(task)}</section>${state.taskActionNotice?.taskId === task.id ? `<p class="task-action-notice ${state.taskActionNotice.kind}" role="status">${escapeHtml(state.taskActionNotice.text)}</p>` : ''}`;
+  const action = taskActionForStatus(task);
+  const actionButton = $('taskDetailAction');
+  actionButton.disabled = Boolean(action?.disabled || state.taskUpdating.has(task.id));
+  actionButton.hidden = !action;
+  actionButton.textContent = action?.label || '';
+  actionButton.dataset.taskId = task.id;
+  if (action && action.action !== 'blocked') actionButton.dataset.taskAction = action.action;
+  else delete actionButton.dataset.taskAction;
+  body.querySelectorAll('[data-task-dependency]').forEach((button) => button.addEventListener('click', () => openTaskDetails(button.dataset.taskDependency, state.taskDetailOrigin?.view || state.currentView, {preserveOrigin: true})));
+  body.querySelector('[data-task-component-open]')?.addEventListener('click', async () => {
+    const taskId = body.querySelector('[data-task-component-open]').dataset.taskComponentOpen;
+    state.taskDetailId = null;
+    state.taskDetailOrigin = null;
+    renderTasks();
+    await navigateTaskToArchitecture(taskId);
+  });
+}
+
+function proposalStatusLabel(status) {
+  return formatTaskEnum(status, 'Status not provided');
+}
+
+function proposalComponentLabel(componentId) {
+  const id = String(componentId || '').trim();
+  if (!id) return 'Component ID not supplied';
+  const component = findArchitectureNode(id);
+  return component ? `${component.name || id} · ${id}` : `Unavailable component · ${id}`;
+}
+
+function proposalEvidenceMarkup(proposal) {
+  const evidence = (Array.isArray(proposal.evidence) ? proposal.evidence : []).map((item) => String(item || '').trim()).filter(Boolean);
+  const eventIds = Array.isArray(proposal.evidence_event_ids) ? proposal.evidence_event_ids : [];
+  const events = new Map((state.activity || []).map((event) => [String(event?.id || event?.event_id || ''), event]));
+  const strings = evidence.length
+    ? `<ul class="proposal-evidence-list">${evidence.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+    : '<p class="proposal-empty">No evidence strings supplied.</p>';
+  const references = eventIds.length
+    ? `<div class="proposal-evidence-events">${eventIds.map((eventId) => {
+      const id = String(eventId || '').trim();
+      const event = events.get(id);
+      return event
+        ? `<details><summary>Evidence event · ${escapeHtml(id)}</summary><pre>${escapeHtml(JSON.stringify(event, null, 2))}</pre></details>`
+        : `<p class="proposal-unresolved">Evidence reference unavailable · <code>${escapeHtml(id || 'No event ID supplied')}</code></p>`;
+    }).join('')}</div>`
+    : '';
+  return `${strings}${references}`;
+}
+
+function proposalPreviewKey(proposal) {
+  return `${state.projectId || ''}|${proposal?.id || ''}|${Number(proposal?.base_architecture_version)}|${Number(state.architecture?.version)}`;
+}
+
+function proposalPreviewEntry(proposal) {
+  return state.proposalPreviews.get(proposalPreviewKey(proposal)) || null;
+}
+
+function previewArchitectureSnapshot(label, components, relationships) {
+  return `<details class="proposal-preview-snapshot"><summary>${escapeHtml(label)}</summary><h5>Components</h5><pre>${escapeHtml(JSON.stringify(components || [], null, 2))}</pre><h5>Relationships</h5><pre>${escapeHtml(JSON.stringify(relationships || [], null, 2))}</pre></details>`;
+}
+
+function proposalPreviewMarkup(proposal) {
+  if (!isProposalActionable(proposal, state.architecture)) {
+    const stale = proposal.status === 'PENDING';
+    return `<p class="proposal-limitation" role="note">${escapeHtml(stale
+      ? `This proposal targets architecture v${proposal.base_architecture_version ?? 'unknown'}, while the accepted architecture is v${state.architecture?.version ?? 'unknown'}. It is stale and cannot be applied.`
+      : (proposal.resolution_reason || 'This proposal is a read-only decision record.'))}</p>`;
+  }
+  const entry = proposalPreviewEntry(proposal);
+  if (!entry || entry.status === 'loading') {
+    return '<p class="proposal-preview-state" role="status">Loading the server-owned acceptance preview…</p>';
+  }
+  if (entry.status === 'error') {
+    return `<div class="proposal-preview-state error" role="alert"><p>Acceptance preview unavailable: ${escapeHtml(entry.error || 'Unknown preview error')}</p><button class="link-btn" type="button" data-retry-proposal-preview="${escapeHtml(proposal.id)}">Retry preview</button></div>`;
+  }
+  const preview = entry.data;
+  const taskUpdates = (preview.task_updates || []).map((change) => `<li><strong>${escapeHtml(change.after?.title || change.task_id)}</strong><span>${escapeHtml((change.changed_fields || []).map((field) => formatTaskEnum(field)).join(', ') || 'No tracked field changes')}</span>${change.blocked ? '<span class="status-pill BLOCKED">Blocked</span>' : ''}${change.remapped ? `<span>Component: ${escapeHtml(change.before?.related_component || 'none')} → ${escapeHtml(change.after?.related_component || 'none')}</span>` : ''}</li>`).join('');
+  const created = (preview.created_tasks || []).map((task) => `<li><strong>${escapeHtml(task.title)}</strong><span>${escapeHtml(task.description || '')}</span><span>Component: ${escapeHtml(task.related_component || 'none')}</span></li>`).join('');
+  const superseded = (preview.superseded_proposals || []).map((item) => `<li><code>${escapeHtml(item.proposal_id)}</code> · ${escapeHtml(item.reason)}</li>`).join('');
+  const warnings = (preview.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join('');
+  return `<div class="proposal-acceptance-preview" data-preview-version="${escapeHtml(preview.current_architecture_version)}"><p class="proposal-preview-version"><strong>Server acceptance plan</strong>Architecture v${escapeHtml(preview.current_architecture_version)} → v${escapeHtml(preview.resulting_architecture_version)}</p>${previewArchitectureSnapshot('Current accepted architecture', preview.components_before, preview.relationships_before)}${previewArchitectureSnapshot('Architecture after acceptance', preview.components_after, preview.relationships_after)}<h5>Task updates</h5>${taskUpdates ? `<ul class="proposal-preview-list">${taskUpdates}</ul>` : '<p class="proposal-empty">No existing tasks change.</p>'}<h5>Created tasks</h5>${created ? `<ul class="proposal-preview-list">${created}</ul>` : '<p class="proposal-empty">No tasks are created.</p>'}<h5>Proposals superseded by this acceptance</h5>${superseded ? `<ul class="proposal-preview-list">${superseded}</ul>` : '<p class="proposal-empty">No peer proposals are superseded.</p>'}${warnings ? `<h5>Warnings</h5><ul class="proposal-preview-list warnings">${warnings}</ul>` : ''}</div>`;
+}
+
+async function ensureProposalPreview(proposal, {force = false} = {}) {
+  if (!isProposalActionable(proposal, state.architecture) || !state.projectId) return null;
+  const key = proposalPreviewKey(proposal);
+  const existing = state.proposalPreviews.get(key);
+  if (!force && existing && (existing.status === 'loading' || existing.status === 'ready')) return existing.data || null;
+  const serial = ++state.proposalPreviewSerial;
+  const guard = captureNavigationGuard(state.projectId);
+  state.proposalPreviews.set(key, {status:'loading', data:null, error:null, serial});
+  renderProposals();
+  try {
+    const preview = await api(`/projects/${state.projectId}/architecture/proposals/${encodeURIComponent(proposal.id)}/acceptance-preview`);
+    if (!committedProjectGuardIsCurrent(guard) || proposalPreviewKey(proposal) !== key) return null;
+    if (!preview?.actionable
+      || preview.proposal_id !== proposal.id
+      || Number(preview.current_architecture_version) !== Number(state.architecture?.version)
+      || Number(preview.resulting_architecture_version) !== Number(state.architecture?.version) + 1) {
+      throw new Error('The preview response is stale or does not match the selected proposal.');
+    }
+    state.proposalPreviews.set(key, {status:'ready', data:preview, error:null, serial});
+    renderProposals();
+    return preview;
+  } catch (error) {
+    if (committedProjectGuardIsCurrent(guard) && state.proposalPreviews.get(key)?.serial === serial) {
+      state.proposalPreviews.set(key, {status:'error', data:null, error:error?.message || String(error), serial});
+      renderProposals();
+    }
+    return null;
+  }
+}
+
+function proposalAffectedComponentsMarkup(proposal) {
+  const affected = Array.isArray(proposal.affected_components) ? proposal.affected_components : [];
+  if (!affected.length) return '<p class="proposal-empty">No affected components supplied.</p>';
+  return `<ul class="proposal-affected-list">${affected.map((item) => {
+    const id = typeof item === 'object' ? item?.id : item;
+    const label = typeof item === 'object' && item?.name && !findArchitectureNode(id) ? `${item.name} · ${id || 'No component ID supplied'}` : proposalComponentLabel(id);
+    return findArchitectureNode(id)
+      ? `<li><button class="proposal-component-link" type="button" data-proposal-component="${escapeHtml(id)}">${escapeHtml(label)} ↗</button></li>`
+      : `<li><span class="proposal-unresolved">${escapeHtml(label)}</span></li>`;
+  }).join('')}</ul>`;
+}
+
+function proposalReviewMarkup(proposal) {
+  const title = proposal.title || proposal.reason || 'Architecture proposal';
+  const reason = proposal.reason || 'No reason supplied.';
+  const actionable = isProposalActionable(proposal, state.architecture);
+  const recommended = proposal.recommended_option ? `<p class="proposal-recommended"><strong>Recommended option</strong>${escapeHtml(proposal.recommended_option)}</p>` : '';
+  return `<article class="proposal-card${state.selectedProposalId === proposal.id ? ' context-selected' : ''}${actionable ? '' : ' is-non-actionable'}" data-proposal-card="${escapeHtml(proposal.id)}"><header class="proposal-card-header"><button class="proposal-card-select" type="button" data-proposal-select="${escapeHtml(proposal.id)}" aria-pressed="${state.selectedProposalId === proposal.id}" ${actionable ? '' : 'disabled aria-disabled="true"'}><span class="proposal-kicker">Proposal</span><h3>${escapeHtml(title)}</h3></button><span class="status-pill ${escapeHtml(proposal.status)}">${escapeHtml(proposalStatusLabel(proposal.status))}</span></header><dl class="proposal-facts"><div><dt>Reason</dt><dd>${escapeHtml(reason)}</dd></div><div><dt>Status</dt><dd>${escapeHtml(proposalStatusLabel(proposal.status))}</dd></div><div><dt>Base architecture</dt><dd>Version ${escapeHtml(proposal.base_architecture_version ?? 'not supplied')}</dd></div></dl><p class="proposal-observed"><strong>Observed change</strong>${escapeHtml(proposal.observed_change || 'No observed change supplied.')}</p><section class="proposal-review-section"><h4>Acceptance preview</h4>${proposalPreviewMarkup(proposal)}</section><section class="proposal-review-section"><h4>Evidence</h4>${proposalEvidenceMarkup(proposal)}</section><section class="proposal-review-section"><h4>Impact</h4><p>${escapeHtml(proposal.impact || 'No impact supplied.')}</p>${recommended}</section><section class="proposal-review-section"><h4>Affected components</h4>${proposalAffectedComponentsMarkup(proposal)}</section></article>`;
+}
+
+function renderProposalDecisionBar(proposal) {
+  const bar = $('proposalDecisionBar');
+  if (!bar) return;
+  const label = $('proposalDecisionLabel');
+  const description = $('proposalDecisionDescription');
+  const notice = $('proposalDecisionNotice');
+  const actions = bar.querySelector('.proposal-decision-actions');
+  const accept = bar.querySelector('[data-proposal-decision="accept"]');
+  const reject = bar.querySelector('[data-proposal-decision="reject"]');
+  bar.classList.toggle('hidden', !proposal);
+  if (!proposal) return;
+  const updating = state.proposalUpdating.has(proposal.id);
+  const actionable = isProposalActionable(proposal, state.architecture);
+  const resolved = !actionable;
+  const preview = proposalPreviewEntry(proposal);
+  label.textContent = proposal.status === 'ACCEPTED'
+    ? 'Accepted'
+    : proposal.status === 'REJECTED'
+      ? 'Kept current'
+      : proposal.status === 'SUPERSEDED'
+        ? 'Superseded'
+        : actionable ? 'Your decision' : 'Stale proposal';
+  description.textContent = proposal.status === 'ACCEPTED'
+    ? 'This proposal was accepted. Review remains available as a record of the decision.'
+    : proposal.status === 'REJECTED'
+      ? 'The current architecture was kept. Review remains available as a record of the decision.'
+      : proposal.status === 'SUPERSEDED'
+        ? (proposal.resolution_reason || 'A different accepted proposal advanced the architecture, so this proposal can no longer be applied.')
+        : actionable
+          ? 'Acceptance is enabled only after the current server reconciliation preview loads successfully.'
+          : `This proposal targets v${proposal.base_architecture_version ?? 'unknown'} and cannot change accepted architecture v${state.architecture?.version ?? 'unknown'}.`;
+  const decisionNotice = state.proposalDecisionNotice?.id === proposal.id ? state.proposalDecisionNotice : null;
+  notice.textContent = decisionNotice?.text || '';
+  notice.className = `proposal-decision-notice${decisionNotice?.kind ? ` ${decisionNotice.kind}` : ''}`;
+  actions.classList.toggle('hidden', resolved);
+  accept.disabled = updating || preview?.status !== 'ready';
+  reject.disabled = updating;
+  accept.textContent = updating ? 'Saving…' : preview?.status === 'loading' ? 'Preparing preview…' : 'Accept changes';
+  reject.textContent = updating ? 'Saving…' : 'Keep Current';
+}
+
 function renderProposals() {
-  const pending = state.proposals.filter((p) => p.status === 'PENDING');
+  const focusedProposalId = document.activeElement?.dataset?.proposalSelect || null;
+  if (state.currentView === 'tasks' && state.workspaceTab === 'review') applyWorkspaceTabInvariants('review');
+  const pending = state.proposals.filter((p) => isProposalActionable(p, state.architecture));
   $('overviewAttention').innerHTML = pending.length
-    ? `<div class="attention-card"><strong>${escapeHtml(pending[0].reason)}</strong><p>${escapeHtml(pending[0].observed_change)}</p><div class="actions"><button class="btn secondary" data-proposal="reject" data-id="${escapeHtml(pending[0].id)}">Keep current</button><button class="btn primary" data-open-proposal="${escapeHtml(pending[0].id)}">Review change</button></div></div>`
+    ? `<div class="attention-card"><strong>${escapeHtml(pending[0].reason || 'Architecture proposal')}</strong><p>${escapeHtml(pending[0].observed_change || 'Review the supplied architecture change.')}</p><div class="actions"><button class="btn secondary" data-open-proposal="${escapeHtml(pending[0].id)}">Review change</button></div></div>`
     : '<p>No pending architecture decision. The agent can maintain task/status state without asking you to approve normal aligned updates.</p>';
   const proposalList = $('proposalList');
+  const selected = state.proposals.find((proposal) => proposal.id === state.selectedProposalId && isProposalActionable(proposal, state.architecture)) || null;
   if (proposalList) proposalList.innerHTML = state.proposals.length
-    ? state.proposals.map((p) => `<article class="proposal-card${state.selectedProposalId === p.id ? ' context-selected' : ''}" data-proposal-card="${escapeHtml(p.id)}"><div class="proposal-head"><div><small>${p.status}</small><h3>${escapeHtml(p.reason)}</h3></div><span class="status-pill ${p.status}">${p.status}</span></div><p>${escapeHtml(p.observed_change)}</p><button class="proposal-context-button" type="button" data-proposal-select="${escapeHtml(p.id)}" aria-pressed="${state.selectedProposalId === p.id}">Use this proposal as Agent context</button><div class="meta"><div><small>EVIDENCE</small><p>${p.evidence.map(escapeHtml).join('<br>')}</p></div><div><small>IMPACT</small><p>${escapeHtml(p.impact)}</p></div></div>${p.status === 'PENDING' ? `<div class="actions"><button class="btn secondary" data-proposal="reject" data-id="${escapeHtml(p.id)}">Keep current</button><button class="btn primary" data-proposal="accept" data-id="${escapeHtml(p.id)}">Accept proposed change</button></div>` : ''}</article>`).join('')
+    ? state.proposals.map((proposal) => proposalReviewMarkup(proposal)).join('')
     : '<article class="panel"><h3>No architecture review needed</h3><p class="muted">Normal aligned project updates stay ambient and do not interrupt the human.</p></article>';
-  wireGoButtons();
-  document.querySelectorAll('[data-proposal]').forEach((btn) => btn.addEventListener('click', () => decideProposal(btn.dataset.id, btn.dataset.proposal)));
+  renderProposalDecisionBar(selected);
   document.querySelectorAll('[data-open-proposal]').forEach((button) => button.addEventListener('click', () => openAttentionItem('proposal', button.dataset.openProposal)));
+  bindProposalDecisionControls(
+    document.querySelectorAll('[data-proposal-decision]'),
+    () => state.selectedProposalId,
+    decideProposal,
+  );
   document.querySelectorAll('[data-proposal-select]').forEach((button) => button.addEventListener('click', () => {
-    state.selectedProposalId = button.dataset.proposalSelect;
-    state.selectedTaskId = null;
-    state.selectedComponentId = null;
-    renderProposals();
-    updateInstructionContext();
+    switchWorkspaceTab('review', {focusedProposalId:button.dataset.proposalSelect, historyMode:'replace'});
     setTimeout(() => document.querySelector(`[data-proposal-select="${CSS.escape(state.selectedProposalId)}"]`)?.focus(), 0);
   }));
+  document.querySelectorAll('[data-retry-proposal-preview]').forEach((button) => button.addEventListener('click', () => {
+    const proposal = state.proposals.find((item) => item.id === button.dataset.retryProposalPreview);
+    if (proposal) void ensureProposalPreview(proposal, {force:true});
+  }));
+  document.querySelectorAll('[data-proposal-component]').forEach((button) => button.addEventListener('click', async () => {
+    const component = findArchitectureNode(button.dataset.proposalComponent);
+    if (!component) {
+      toast(`Architecture component not found: ${button.dataset.proposalComponent}.`, true);
+      return;
+    }
+    switchView('architecture');
+    await navigateGraphScope(findArchitectureParentId(component.id) ?? null, {focusComponentId: component.id});
+  }));
+  renderWorkspaceTabs();
+  if (focusedProposalId) {
+    const replacement = document.querySelector(`[data-proposal-select="${CSS.escape(focusedProposalId)}"]`);
+    if (replacement && !replacement.disabled) replacement.focus({preventScroll:true});
+  }
+  if (selected && state.currentView === 'tasks' && state.workspaceTab === 'review') void ensureProposalPreview(selected);
+}
+
+async function readBackProposalDecision(projectId, proposalId, decision, guard) {
+  const [proposalResult, architectureResult] = await Promise.allSettled([
+    api(`/projects/${projectId}/architecture/proposals`),
+    api(`/projects/${projectId}/architecture`),
+  ]);
+  if (!committedProjectGuardIsCurrent(guard)
+    || proposalResult.status !== 'fulfilled'
+    || architectureResult.status !== 'fulfilled') {
+    return {outcome:'UNKNOWN', retryable:false, proposal:null, architecture:null};
+  }
+  const proposals = proposalResult.value;
+  const architecture = architectureResult.value;
+  const proposal = proposals.find((item) => item.id === proposalId) || null;
+  state.proposals = proposals;
+  state.architecture = architecture;
+  if (state.currentView === 'tasks') applyWorkspaceTabInvariants(state.workspaceTab);
+  const expectedStatus = decision === 'accept' ? 'ACCEPTED' : 'REJECTED';
+  if (proposal?.status === expectedStatus) {
+    return {outcome:'COMMITTED', retryable:false, proposal, architecture};
+  }
+  if (proposal?.status === 'PENDING' && isProposalActionable(proposal, architecture)) {
+    return {outcome:'NOT_COMMITTED', retryable:true, proposal, architecture};
+  }
+  if (proposal) return {outcome:'NOT_COMMITTED', retryable:false, proposal, architecture};
+  return {outcome:'UNKNOWN', retryable:false, proposal:null, architecture};
 }
 
 async function decideProposal(id, decision) {
+  const proposal = state.proposals.find((item) => item.id === id);
+  if (!['accept', 'reject'].includes(decision)) return {outcome:'NOT_COMMITTED', retryable:false, error:'Unsupported proposal decision.'};
+  if (!proposal) return {outcome:'NOT_COMMITTED', retryable:false, error:'Proposal not found.'};
+  if (!isProposalActionable(proposal, state.architecture)) return {outcome:'NOT_COMMITTED', retryable:false, proposal, error:'Proposal is not actionable against the current architecture.'};
+  if (state.proposalUpdating.has(id)) return {outcome:'UNKNOWN', retryable:false, proposal, error:'A decision outcome is already being reconciled.'};
+  if (decision === 'accept' && proposalPreviewEntry(proposal)?.status !== 'ready') {
+    void ensureProposalPreview(proposal);
+    return {outcome:'NOT_COMMITTED', retryable:true, proposal, error:'A current successful acceptance preview is required.'};
+  }
   const projectId = state.projectId;
   const guard = captureNavigationGuard(projectId);
-  if (!projectId || !committedProjectGuardIsCurrent(guard)) return;
+  if (!projectId || !committedProjectGuardIsCurrent(guard)) return {outcome:'UNKNOWN', retryable:false, proposal, error:'Project navigation is not stable.'};
+  state.proposalUpdating.add(id);
+  state.proposalDecisionNotice = {id, kind: 'pending', text: 'Saving decision…'};
+  renderProposals();
   const workingRequestId = beginWorkingRequest('', {projectId});
+  let mutationResponse = null;
+  let mutationError = null;
   try {
-    await api(`/projects/${projectId}/architecture/proposals/${id}/${decision}`, {method: 'POST'});
-    if (!committedProjectGuardIsCurrent(guard)) return;
-    toast(decision === 'accept' ? 'Architecture change accepted.' : 'Proposal rejected; current architecture preserved.');
-    await refresh({projectId, guard});
-    if (!committedProjectGuardIsCurrent(guard)) return;
-    if ($('proposalReviewDialog').open) $('proposalReviewDialog').close();
-  } catch (err) {
-    if (committedProjectGuardIsCurrent(guard)) toast(err.message, true);
+    mutationResponse = await api(`/projects/${projectId}/architecture/proposals/${id}/${decision}`, {method: 'POST'});
+  } catch (error) {
+    mutationError = error;
+  }
+  try {
+    let result = null;
+    if (mutationResponse && committedProjectGuardIsCurrent(guard)) {
+      const refreshed = await refresh({projectId, guard});
+      if (refreshed) result = {outcome:'COMMITTED', retryable:false, proposal:mutationResponse, architecture:state.architecture};
+    }
+    if (!result) result = await readBackProposalDecision(projectId, id, decision, guard);
+    if (!committedProjectGuardIsCurrent(guard)) return {outcome:'UNKNOWN', retryable:false, proposal:null, error:'Navigation changed while reconciling the decision.'};
+    if (result.outcome === 'COMMITTED') {
+      state.proposalUpdating.delete(id);
+      state.proposalDecisionNotice = {id, kind:'success', text:decision === 'accept' ? 'Architecture proposal accepted.' : 'Current architecture kept.'};
+      toast(decision === 'accept' ? 'Architecture change accepted.' : 'Current architecture kept.');
+    } else if (result.outcome === 'NOT_COMMITTED') {
+      state.proposalUpdating.delete(id);
+      const detail = mutationError?.message || (result.retryable ? 'The decision was proven not to have committed.' : 'The proposal is no longer actionable.');
+      state.proposalDecisionNotice = {id, kind:'error', text:detail};
+      toast(detail, true);
+    } else {
+      state.proposalDecisionNotice = {id, kind:'unknown', text:'The server outcome could not be verified. Controls remain disabled to prevent a duplicate decision.'};
+      toast('Decision outcome unknown; no retry was sent.', true);
+    }
+    renderProposals();
+    updateInstructionContext();
+    return {...result, decision, transport_error:mutationError?.message || null};
   } finally {
     finishWorkingRequest(workingRequestId);
   }
@@ -2759,7 +3314,7 @@ function architectureHealth(node) {
   const activeTasks = tasks.filter((task) => task.status === 'IN_PROGRESS');
   const badNodes = flattenArchitectureNodes([node]).filter((item) => /BLOCKED|DRIFT|ERROR|DEGRADED|MISMATCH/i.test(item.status || ''));
   const pendingReviews = state.proposals.filter((proposal) => {
-    if (proposal.status !== 'PENDING') return false;
+    if (!isProposalActionable(proposal, state.architecture)) return false;
     const affected = proposal.affected_components || [];
     const changed = (proposal.proposed_changes || []).map((change) => change.component_id).filter(Boolean);
     return [...affected, ...changed].some((id) => ids.has(id));
@@ -5199,8 +5754,10 @@ function currentInstructionContext() {
     project_name: state.project?.name || '',
   };
 
-  const proposal = state.proposals.find((item) => item.id === state.selectedProposalId);
-  if (proposal) {
+  const proposal = state.proposals.find((item) => (
+    item.id === state.selectedProposalId && isProposalActionable(item, state.architecture)
+  ));
+  if (proposal && state.currentView === 'tasks' && state.workspaceTab === 'review') {
     return {
       label: `Proposal · ${proposal.reason}`,
       instruction: 'Ask about this architecture proposal or add review evidence',
@@ -5209,14 +5766,14 @@ function currentInstructionContext() {
     };
   }
 
-  if (state.currentView === 'tasks') {
+  if (state.currentView === 'tasks' && state.workspaceTab === 'tasks') {
     const task = state.tasks.find((item) => item.id === state.selectedTaskId);
-    return {
-      label: task ? `Task · ${task.title}` : 'Tasks · project execution',
-      instruction: task ? 'Ask about this task or describe what changed' : 'Ask about project tasks or execution state',
-      placeholder: task ? `Example: This task is blocked because...` : 'Select a task for focused context, or describe an execution update.',
-      payload: {...base, ...(task ? {task_id: task.id, task_title: task.title, task_status: task.status, related_component: task.related_component} : {})},
-    };
+    return taskInstructionContext({view: state.currentView, projectId: state.projectId, projectName: state.project?.name || '', task});
+  }
+
+  if (state.taskDetailId) {
+    const task = state.tasks.find((item) => item.id === state.taskDetailId);
+    if (task) return taskInstructionContext({view: state.currentView, projectId: state.projectId, projectName: state.project?.name || '', task});
   }
 
   if (state.currentView === 'architecture') {
@@ -5367,15 +5924,24 @@ async function generateInitialArchitecture() {
   }
 }
 
-function switchView(name, {historyMode = 'push', navigationGuard = null} = {}) {
+function switchView(name, {
+  historyMode = 'push',
+  navigationGuard = null,
+  workspaceTab = null,
+  restoreScroll = true,
+  focusedProposalId = null,
+} = {}) {
   if (state.onboarding.active) return false;
   if (!views[name]) return false;
   const guard = navigationGuard || beginNavigationTransition(state.projectId);
   if (!navigationGenerationIsCurrent(guard)) return false;
   if (name === 'tasks') {
-    state.selectedProposalId = null;
+    const nextWorkspaceTab = workspaceTabNames.includes(workspaceTab) ? workspaceTab : workspaceTabForProject();
+    applyWorkspaceTabInvariants(nextWorkspaceTab, {focusedProposalId});
     state.selectedComponentId = null;
   } else if (name === 'architecture') {
+    state.taskDetailId = null;
+    state.taskDetailOrigin = null;
     state.selectedProposalId = null;
     state.selectedTaskId = null;
   }
@@ -5386,17 +5952,25 @@ function switchView(name, {historyMode = 'push', navigationGuard = null} = {}) {
     canvas:ARCHITECTURE_CANVAS_MODE,
     nodeId:name === 'architecture' ? state.selectedComponentId : null,
     inspectorTab:name === 'architecture' ? state.inspectorTab : 'overview',
+    workspaceTab:name === 'tasks' ? state.workspaceTab : 'tasks',
   }, {historyMode, guard})) return false;
   document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
   $(`view-${name}`).classList.add('active');
   $('pageTitle').textContent = views[name].title;
   $('pageSubtitle').textContent = views[name].subtitle;
   renderProjectTree();
+  if (name === 'architecture') renderTaskDetails();
   if (name === 'architecture') renderGraph();
+  if (name === 'tasks') {
+    renderTasks();
+    renderProposals();
+  }
+  renderWorkspaceTabs();
   updateInstructionContext();
   const workspaceMain = $('workspaceMain');
   if (workspaceMain) workspaceMain.scrollTop = 0;
   window.scrollTo(0, 0);
+  if (name === 'tasks' && restoreScroll) restoreWorkspaceTabScroll(state.workspaceTab);
   return true;
 }
 
@@ -5956,8 +6530,10 @@ function webMcpContext() {
   }
   const selectedTask = state.tasks.find((item) => item.id === state.selectedTaskId) || null;
   const selectedNode = findArchitectureNode(state.selectedComponentId || state.scopeComponentId);
-  const pending = state.proposals.filter((proposal) => proposal.status === 'PENDING');
-  const selectedProposal = state.proposals.find((proposal) => proposal.id === state.selectedProposalId) || pending[0] || null;
+  const pending = state.proposals.filter((proposal) => isProposalActionable(proposal, state.architecture));
+  const selectedProposal = state.proposals.find((proposal) => (
+    proposal.id === state.selectedProposalId && isProposalActionable(proposal, state.architecture)
+  )) || pending[0] || null;
   return {
     project: state.project,
     view: state.navigation.committed?.view || state.currentView,
@@ -6546,7 +7122,7 @@ window.ArchBroWebBridge = {
     const inProgress = state.tasks.filter((task) => task.status === 'IN_PROGRESS');
     const blocked = state.tasks.filter((task) => task.status === 'BLOCKED');
     const ready = state.tasks.filter((task) => task.status === 'TODO');
-    const pending = state.proposals.filter((proposal) => proposal.status === 'PENDING');
+    const pending = state.proposals.filter((proposal) => isProposalActionable(proposal, state.architecture));
     const recentActivity = [...(state.activity || [])].reverse().slice(0, 6).map((event) => ({
       source: event.payload?.external_source || event.source || 'SYSTEM',
       type: event.type,
@@ -6623,7 +7199,7 @@ window.ArchBroWebBridge = {
       architecture: state.architecture,
       tasks: state.tasks,
       recent_activity: [...(state.activity || [])].reverse().slice(0, 10),
-      pending_reviews: state.proposals.filter((proposal) => proposal.status === 'PENDING'),
+      pending_reviews: state.proposals.filter((proposal) => isProposalActionable(proposal, state.architecture)),
       decision_contract: {
         provider: 'webmcp-agent',
         mode: 'interactive',
@@ -6681,7 +7257,7 @@ window.ArchBroWebBridge = {
     const blockers = state.tasks.filter((task) => task.status === 'BLOCKED');
     const inProgress = state.tasks.filter((task) => task.status === 'IN_PROGRESS');
     const ready = state.tasks.filter((task) => task.status === 'TODO');
-    const pending = state.proposals.filter((proposal) => proposal.status === 'PENDING');
+    const pending = state.proposals.filter((proposal) => isProposalActionable(proposal, state.architecture));
     return {
       project: state.project,
       architecture: state.architecture,
@@ -6709,20 +7285,17 @@ window.ArchBroWebBridge = {
   async focusPendingReview() {
     await ensureAppInitialized();
     webMcpRequireProject();
-    const proposal = state.proposals.find((item) => item.status === 'PENDING') || null;
+    const proposal = state.proposals.find((item) => isProposalActionable(item, state.architecture)) || null;
     if (!proposal) {
       return {focused: false, reason: 'no-pending-review', context: webMcpContext()};
     }
-    state.selectedProposalId = proposal.id;
-    switchView('attention');
-    renderProposals();
-    updateInstructionContext();
+    switchWorkspaceTab('review', {focusedProposalId:proposal.id});
     return {focused: true, proposal, context: webMcpContext()};
   },
 
   async inspectArchitecture({componentId = null} = {}) {
     webMcpRequireProject();
-    const pending = state.proposals.filter((proposal) => proposal.status === 'PENDING');
+    const pending = state.proposals.filter((proposal) => isProposalActionable(proposal, state.architecture));
     if (!componentId) {
       return {
         project_id: state.projectId,
@@ -6757,9 +7330,8 @@ window.ArchBroWebBridge = {
     } else if (kind === 'task') {
       const task = state.tasks.find((item) => item.id === id);
       if (!task) throw new Error(`Task not found: ${id}`);
-      state.selectedTaskId = task.id;
-      switchView('tasks');
-      renderTasks();
+      switchView('tasks', {workspaceTab: 'tasks'});
+      openTaskDetails(task.id, 'tasks');
     } else if (kind === 'architecture') {
       const node = findArchitectureNode(id);
       if (!node) throw new Error(`Architecture component not found: ${id}`);
@@ -6774,9 +7346,8 @@ window.ArchBroWebBridge = {
     } else if (kind === 'proposal') {
       const proposal = state.proposals.find((item) => item.id === id);
       if (!proposal) throw new Error(`Architecture proposal not found: ${id}`);
-      state.selectedProposalId = proposal.id;
-      switchView('attention');
-      renderProposals();
+      if (!isProposalActionable(proposal, state.architecture)) throw new Error(`Architecture proposal is not actionable: ${id}`);
+      switchWorkspaceTab('review', {focusedProposalId:proposal.id});
     } else {
       throw new Error(`Unsupported ArchBro focus kind: ${kind}`);
     }
@@ -6874,10 +7445,9 @@ window.ArchBroWebBridge = {
     webMcpRequireProject();
     const proposal = state.proposals.find((item) => item.id === proposalId);
     if (!proposal) throw new Error(`Architecture proposal not found: ${proposalId}`);
-    if (proposal.status !== 'PENDING') throw new Error(`Architecture proposal ${proposalId} is not pending.`);
+    if (!isProposalActionable(proposal, state.architecture)) throw new Error(`Architecture proposal ${proposalId} is not actionable against the current architecture.`);
     if (!['accept', 'reject'].includes(decision)) throw new Error(`Unsupported proposal decision: ${decision}`);
-    await decideProposal(proposalId, decision);
-    return state.proposals.find((item) => item.id === proposalId) || null;
+    return decideProposal(proposalId, decision);
   },
 };
 
@@ -6947,7 +7517,10 @@ $('onboardingAsk').addEventListener('input', () => syncOnboardingAskRainbowState
 $('onboardingAsk').addEventListener('focus', syncOnboardingAskRainbowState);
 $('onboardingAsk').addEventListener('blur', syncOnboardingAskRainbowState);
 $('instruction').addEventListener('input', () => syncInstructionRainbowState({activate: true}));
-$('instruction').addEventListener('focus', syncInstructionRainbowState);
+$('instruction').addEventListener('focus', () => {
+  if (state.taskDetailId && !$('taskDetailPanel')?.hidden) closeTaskDetails({restoreFocus:false});
+  syncInstructionRainbowState();
+});
 $('instruction').addEventListener('blur', syncInstructionRainbowState);
 
 $('goalDraftText').addEventListener('input', () => {
@@ -7043,7 +7616,11 @@ $('newProjectNameDialog').addEventListener('cancel', handleNewProjectNameDialogC
 $('newProjectNameDialog').addEventListener('close', handleNewProjectNameDialogClose);
 document.querySelectorAll('[data-new-project-name-cancel]').forEach((button) => button.addEventListener('click', cancelNewProjectNameDialog));
 $('deleteProjectDialog').addEventListener('click', closeDialogOnBackdrop);
-$('proposalReviewDialog').addEventListener('click', closeDialogOnBackdrop);
+$('taskDetailClose').addEventListener('click', () => closeTaskDetails());
+$('taskDetailAction').addEventListener('click', () => {
+  const button = $('taskDetailAction');
+  if (button.dataset.taskId && button.dataset.taskAction) updateTask(button.dataset.taskId, button.dataset.taskAction);
+});
 $('accountSettingsDialog').addEventListener('click', closeDialogOnBackdrop);
 $('mcpConnectionsDialog').addEventListener('click', closeDialogOnBackdrop);
 $('notificationBtn').addEventListener('click', () => toggleTopMenu('notificationBtn', 'notificationMenu'));
@@ -7091,6 +7668,7 @@ document.addEventListener('keydown', (event) => {
     cancelNewProjectNameDialog();
     return;
   }
+  if (event.key === 'Escape' && document.querySelector('dialog[open]')) return;
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'n' && !event.target.closest('input, textarea, select, [contenteditable="true"]')) {
     event.preventDefault();
     closeMobileSidebar();
@@ -7103,7 +7681,28 @@ document.addEventListener('keydown', (event) => {
     closeProjectMenu({returnFocus: true});
     return;
   }
-  if (event.key === 'Escape') closeOverlay({returnFocus: true});
+  if (event.key === 'Escape') {
+    const openMenu = [['notificationBtn', 'notificationMenu'], ['accountBtn', 'accountMenu']]
+      .find(([, menuId]) => !$(menuId).classList.contains('hidden'));
+    if (openMenu) {
+      event.preventDefault();
+      closeTopMenus();
+      $(openMenu[0]).focus();
+      return;
+    }
+    if (mobileSidebarEnabled() && document.body.classList.contains('sidebar-open')) {
+      event.preventDefault();
+      closeMobileSidebar({returnFocus:true});
+      return;
+    }
+    const taskPanelVisible = state.taskDetailId
+      && !$('taskDetailPanel')?.hidden
+      && !$('taskDetailPanel')?.classList.contains('hidden');
+    if (taskPanelVisible) {
+      event.preventDefault();
+      closeTaskDetails();
+    }
+  }
 });
 
 $('landingLoginBtn').addEventListener('click', (event) => openAuthentication(event.currentTarget));
@@ -7148,6 +7747,10 @@ $('bootstrapRetryBtn')?.addEventListener('click', retryWorkspaceRestore);
 $('bootstrapLogoutBtn')?.addEventListener('click', logout);
 
 wireGoButtons();
+document.querySelectorAll('[data-workspace-tab]').forEach((button) => {
+  button.addEventListener('click', () => switchWorkspaceTab(button.dataset.workspaceTab));
+  button.addEventListener('keydown', handleWorkspaceTabKeydown);
+});
 document.querySelectorAll('[data-architecture-graph-kind]').forEach((button) => button.addEventListener('click', () => setArchitectureGraphKind(button.dataset.architectureGraphKind)));
 $('architectureCanvasBtn')?.addEventListener('click', toggleArchitectureCanvas);
 async function restoreNavigationFromLocation() {
@@ -7174,6 +7777,7 @@ async function restoreNavigationFromLocation() {
     });
   }
   state.currentView = route.view;
+  if (route.view === 'tasks') applyWorkspaceTabInvariants(route.workspaceTab);
   state.canvasDeepLinkApplied = false;
   state.canvasDeepLinkFocusPending = false;
   state.inspectorTab = route.inspectorTab;
@@ -7231,6 +7835,7 @@ async function initializeWorkspace() {
         clearWorkspaceOptionalData();
         clearAgentContextPreview();
         state.currentView = initialRoute.view;
+        state.workspaceTab = initialRoute.view === 'tasks' ? initialRoute.workspaceTab : 'tasks';
         state.inspectorTab = initialRoute.canvas && initialRoute.nodeId ? initialRoute.inspectorTab : 'overview';
         state.selectedComponentId = initialRoute.canvas ? initialRoute.nodeId : null;
         state.selectedEdgeId = null;
@@ -7238,6 +7843,7 @@ async function initializeWorkspace() {
         state.canvasInspectorOpen = Boolean(initialRoute.canvas && initialRoute.nodeId);
         state.canvasDeepLinkApplied = false;
         state.canvasDeepLinkFocusPending = false;
+        if (state.currentView === 'tasks') applyWorkspaceTabInvariants(state.workspaceTab);
         if (!commitNavigation(initialRoute, {historyMode:'replace', guard})) return false;
         render();
         void refreshWorkspaceOptionalResources(startupTicket, direct.context.architecture, {

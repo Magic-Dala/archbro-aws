@@ -499,7 +499,10 @@ def _overlay_maps(
     proposals_by_component: dict[str, list[ArchitectureChangeProposal]] = defaultdict(list)
     proposal_ids_by_component: dict[str, set[str]] = defaultdict(set)
     for proposal in proposals:
-        if proposal.status != ProposalStatus.PENDING:
+        if (
+            proposal.status != ProposalStatus.PENDING
+            or proposal.base_architecture_version != architecture.version
+        ):
             continue
         for component_id in proposal.affected_components:
             path = index.paths.get(component_id)

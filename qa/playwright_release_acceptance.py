@@ -322,11 +322,11 @@ with sync_playwright() as p:
         # TASK start/done must stay deterministic and remain on Tasks view.
         open_project_view(page, qa_project_id, "tasks")
         page.locator("#taskList .task-row").first.wait_for(state="visible", timeout=5000)
-        task_context = page.locator("#taskList [data-task-select]").first
+        task_context = page.locator("#taskList [data-task-open]").first
         task_context.focus()
         page.keyboard.press("Space")
-        assert task_context.get_attribute("aria-pressed") == "true"
-        page.wait_for_function("() => document.activeElement?.hasAttribute('data-task-select')")
+        assert task_context.get_attribute("aria-expanded") == "true"
+        page.wait_for_function("() => document.activeElement?.id === 'taskDetailClose'")
         assert "Task ·" in page.locator("#instructionContext").inner_text()
         start_btn = page.locator("#taskList button[data-task-action='start']").first
         assert start_btn.is_visible()
@@ -434,8 +434,8 @@ with sync_playwright() as p:
         assert blocked_notice.is_visible()
         blocked_notice.click()
         assert page.locator("#view-tasks").evaluate("el => el.classList.contains('active')")
-        assert page.locator(f'[data-task-select="{block_task["id"]}"]').get_attribute("aria-pressed") == "true"
-        page.wait_for_function("id => document.activeElement?.dataset.taskSelect === id", arg=block_task["id"])
+        assert page.locator(f'[data-task-open="{block_task["id"]}"]').get_attribute("aria-expanded") == "true"
+        page.wait_for_function("() => document.activeElement?.id === 'taskDetailClose'")
         step("blocked_notification_focus_pass", task=block_task["title"])
 
         # Ordinary reading/task/notification interaction must not mutate the
@@ -478,7 +478,7 @@ with sync_playwright() as p:
         before_version = api_json(page, f"/projects/{qa_project_id}/architecture")["payload"]["version"]
         page.locator("#notificationBtn").click()
         page.locator('[data-attention-kind="proposal"]').first.click()
-        assert page.locator("#proposalReviewDialog").is_visible()
+        assert page.locator("#workspaceTabReviewPanel").is_visible()
         page.locator("#proposalList .proposal-card").first.wait_for(state="visible", timeout=5000)
         page.wait_for_function("id => document.activeElement?.dataset.proposalSelect === id", arg=proposal["id"])
         proposal_context = page.locator("#proposalList [data-proposal-select]").first
@@ -486,7 +486,7 @@ with sync_playwright() as p:
         page.keyboard.press("Space")
         assert proposal_context.get_attribute("aria-pressed") == "true"
         shot(page, "09_needs_you")
-        page.locator("#proposalList button[data-proposal='accept']").first.click()
+        page.locator("[data-proposal-decision='accept']").first.click()
         wait_ready(page, 10000)
         page.wait_for_timeout(500)
         after_arch = api_json(page, f"/projects/{qa_project_id}/architecture")["payload"]

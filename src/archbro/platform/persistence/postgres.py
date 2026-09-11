@@ -270,6 +270,8 @@ class PostgresProjectRepository:
 
     def save_proposal(self, proposal: ArchitectureChangeProposal) -> None:
         with self._connect() as conn:
+            if not self._lock_project(conn, proposal.project_id):
+                raise KeyError(proposal.project_id)
             self._put_proposal(conn, proposal)
 
     def get_proposal(self, proposal_id: str) -> ArchitectureChangeProposal:
@@ -296,7 +298,7 @@ class PostgresProjectRepository:
         architecture: Architecture,
         tasks: list[Task],
         proposal: ArchitectureChangeProposal,
-    ) -> None:
+    ) -> list[ArchitectureChangeProposal]:
         # Acceptance is one domain transition. Keep architecture, project
         # version, reconciled tasks, and proposal status in the same transaction
         # so a persistence failure cannot expose a half-accepted architecture.
@@ -342,6 +344,8 @@ class PostgresProjectRepository:
             current_proposal = ArchitectureChangeProposal.model_validate_json(proposal_row["data"])
             if current_proposal.status != ProposalStatus.PENDING:
                 raise ValueError("proposal is no longer pending at acceptance commit")
+            if current_proposal.base_architecture_version != expected_architecture_version:
+                raise ValueError("proposal base changed before acceptance commit")
 
             for task_id, expected_updated_at in expected_task_updated_at.items():
                 task_row = conn.execute(
@@ -358,6 +362,36 @@ class PostgresProjectRepository:
             for task in tasks:
                 self._put_task(conn, project_id, task)
             self._put_proposal(conn, proposal)
+
+            resolved_at = datetime.now(timezone.utc)
+            superseded_reason = (
+                f"Superseded by accepted proposal {proposal.id} when accepted architecture "
+                f"advanced to v{architecture.version}."
+            )
+            peer_rows = conn.execute(
+                "SELECT data FROM proposals WHERE project_id=%s AND id<>%s FOR UPDATE",
+                (project_id, proposal.id),
+            ).fetchall()
+            superseded: list[ArchitectureChangeProposal] = []
+            for peer_row in peer_rows:
+                peer = ArchitectureChangeProposal.model_validate_json(peer_row["data"])
+                if (
+                    peer.status != ProposalStatus.PENDING
+                    or peer.base_architecture_version == architecture.version
+                ):
+                    continue
+                terminal = peer.model_copy(
+                    update={
+                        "status": ProposalStatus.SUPERSEDED,
+                        "resolved_at": resolved_at,
+                        "resolution_reason": superseded_reason,
+                        "superseded_by_proposal_id": proposal.id,
+                        "superseded_at_architecture_version": architecture.version,
+                    }
+                )
+                self._put_proposal(conn, terminal)
+                superseded.append(terminal)
+            return superseded
 
     def save_proposal_decision(
         self,
@@ -1073,11 +1107,16 @@ class PostgresProjectRepository:
         return [row["note"] for row in reversed(rows)]
 
     def load_context(self, project_id: str) -> ProjectContext:
+        architecture = self.get_architecture(project_id)
         return ProjectContext(
             project=self.get_project(project_id),
-            architecture=self.get_architecture(project_id),
+            architecture=architecture,
             tasks=self.list_tasks(project_id),
-            pending_proposals=[p for p in self.list_proposals(project_id) if p.status == ProposalStatus.PENDING],
+            pending_proposals=[
+                p for p in self.list_proposals(project_id)
+                if p.status == ProposalStatus.PENDING
+                and p.base_architecture_version == architecture.version
+            ],
             recent_notes=self.list_notes(project_id),
         )
 

@@ -386,7 +386,10 @@ def build_agent_context_manifest(
 
     proposals = []
     for proposal in snapshot.proposals:
-        if proposal.status != ProposalStatus.PENDING:
+        if (
+            proposal.status != ProposalStatus.PENDING
+            or proposal.base_architecture_version != architecture.version
+        ):
             continue
         changed_ids = {
             str(change.get("component_id", "")).strip()

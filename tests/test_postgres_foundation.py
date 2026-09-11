@@ -99,6 +99,7 @@ def test_postgres_repository_implements_archbro_project_state_contract(repo):
     repo.save_task(project.id, task)
     proposal = ArchitectureChangeProposal(
         project_id=project.id,
+        base_architecture_version=1,
         reason="Check review persistence",
         evidence=["QA evidence"],
         observed_change="QA change",

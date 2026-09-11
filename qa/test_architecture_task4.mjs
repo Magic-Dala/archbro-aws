@@ -131,14 +131,14 @@ test('component dependency disclosure separates projected facts from canonical c
 
 async function makeRefreshHarness() {
   const refreshSource=sourceBetween('async function refresh({projectId = state.projectId', 'function startOnboarding()');
-  const state={projectId:'project-a',project:{id:'project-a'},projects:[{id:'project-a'}],onboarding:{active:false},architecture:{version:7},projectContextRequestSerial:0,scopeComponentId:'scope-a'};
+  const state={projectId:'project-a',project:{id:'project-a'},projects:[{id:'project-a'}],onboarding:{active:false},architecture:{version:7},projectContextRequestSerial:0,scopeComponentId:'scope-a',proposalPreviews:new Map(),proposalPreviewSerial:0,currentView:'overview',workspaceTab:'tasks'};
   const resolvers=[]; let invalidations=0, optionalCalls=0;
   const context={
     state,
     navigationGenerationIsCurrent:()=>true,captureNavigationGuard:()=>({}),loadProjectCoreContext:()=>new Promise((resolve,reject)=>resolvers.push({resolve,reject})),
     loadProjectSnapshots:async()=>{},renderWorkspaceHome(){},clearWorkspaceOptionalData(){},clearAgentContextPreview(){},render(){},
     invalidateArchitectureViewCache(){invalidations+=1;},refreshWorkspaceOptionalResources(){optionalCalls+=1;return Promise.resolve([]);},
-    openPersonalWorkspace:async()=>true,toast(){},restoreDisplayedWorkspaceAsync(){},
+    openPersonalWorkspace:async()=>true,toast(){},restoreDisplayedWorkspaceAsync(){},applyWorkspaceTabInvariants(){},
   };
   runInNewContext(`${asyncHelpers}\n${requestHelpers}\n${refreshSource};state.workspaceAsync=makeWorkspaceAsyncState('project-a');const initial=beginWorkspaceContext(state.workspaceAsync,'project-a');bindWorkspaceContextArchitecture(state.workspaceAsync,initial,7);globalThis.refresh=refresh;`,context);
   return {context,state,resolvers,get invalidations(){return invalidations;},get optionalCalls(){return optionalCalls;}};

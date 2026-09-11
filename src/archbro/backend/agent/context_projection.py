@@ -37,7 +37,11 @@ def build_agent_context(
     architecture = repository.get_architecture(project_id)
     tasks = repository.list_tasks(project_id)
     proposals = repository.list_proposals(project_id)
-    pending = [proposal for proposal in proposals if proposal.status == ProposalStatus.PENDING]
+    pending = [
+        proposal for proposal in proposals
+        if proposal.status == ProposalStatus.PENDING
+        and proposal.base_architecture_version == architecture.version
+    ]
     sources = connected_sources or []
 
     counts = Counter(task.status.value for task in tasks)

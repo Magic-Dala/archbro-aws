@@ -211,6 +211,7 @@ def test_task_and_pending_proposal_status_are_projection_only():
             affected_components=["store"],
             impact="Storage implementation may change after approval.",
             recommended_option=ArchitectureOption.ACCEPT_PROPOSED_CHANGE,
+            base_architecture_version=architecture.version,
         )
     ]
     view = project_diagram(architecture, tasks=tasks, proposals=proposals)
@@ -246,6 +247,7 @@ def test_scoped_projection_aggregates_descendant_execution_and_review_health_wit
             affected_components=["db"],
             impact="Data boundary review required.",
             recommended_option=ArchitectureOption.KEEP_CURRENT,
+            base_architecture_version=architecture.version,
         )
     ]
 

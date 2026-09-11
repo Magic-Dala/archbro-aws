@@ -60,8 +60,8 @@ class ProjectRepositoryPort(Protocol):
         architecture: Architecture,
         tasks: list[Task],
         proposal: ArchitectureChangeProposal,
-    ) -> None:
-        """Persist one accepted architecture transition atomically."""
+    ) -> list[ArchitectureChangeProposal]:
+        """Persist one accepted transition and supersede incompatible peers atomically."""
         ...
 
     def save_proposal_decision(

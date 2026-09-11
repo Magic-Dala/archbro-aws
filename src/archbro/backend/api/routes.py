@@ -39,6 +39,7 @@ from archbro.backend.core.contracts import (
     AgentAction,
     AgentActionType,
     Architecture,
+    ArchitectureAcceptancePreview,
     ArchitectureChangeProposal,
     ArchitectureOption,
     Project,
@@ -967,6 +968,18 @@ def build_router(
     async def list_proposals(project_id: str, http_request: Request):
         await authorized_project(http_request, project_id, ProjectPermission.READ)
         return repository.list_proposals(project_id)
+
+    @router.get("/projects/{project_id}/architecture/proposals/{proposal_id}/acceptance-preview")
+    async def preview_proposal_acceptance(
+        project_id: str, proposal_id: str, http_request: Request
+    ) -> ArchitectureAcceptancePreview:
+        await authorized_project(http_request, project_id, ProjectPermission.READ)
+        try:
+            return executor.preview_proposal_acceptance(project_id, proposal_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="proposal not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     @router.post("/projects/{project_id}/interactive-initial-architecture")
     async def submit_interactive_initial_architecture(

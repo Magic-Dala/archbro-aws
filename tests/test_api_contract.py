@@ -312,11 +312,27 @@ def test_minimal_api_contract_end_to_end(dsn):
     proposal = next(p for p in client.get(f"/projects/{project_id}/architecture/proposals").json() if p["id"] == proposal_id)
     assert proposal["status"] == "PENDING"
 
+    preview = client.get(
+        f"/projects/{project_id}/architecture/proposals/{proposal_id}/acceptance-preview"
+    )
+    assert preview.status_code == 200, preview.text
+    preview_body = preview.json()
+    assert preview_body["actionable"] is True
+    assert preview_body["current_architecture_version"] == 1
+    assert preview_body["resulting_architecture_version"] == 2
+    assert preview_body["components_before"] == pending_arch["components"]
+    assert client.get(f"/projects/{project_id}/architecture").json() == pending_arch
+    assert next(
+        p for p in client.get(f"/projects/{project_id}/architecture/proposals").json()
+        if p["id"] == proposal_id
+    )["status"] == "PENDING"
+
     accepted = client.post(f"/projects/{project_id}/architecture/proposals/{proposal_id}/accept")
     assert accepted.status_code == 200
     final_arch = client.get(f"/projects/{project_id}/architecture").json()
     assert final_arch["version"] == 2
     assert any(c["name"] == "Firestore" for c in final_arch["components"])
+    assert final_arch["components"] == preview_body["components_after"]
 
     reconciled_tasks = client.get(f"/projects/{project_id}/tasks").json()
     database_task = next(t for t in reconciled_tasks if t["related_component"] == "database" and t["title"] == "Prepare PostgreSQL persistence")
@@ -352,7 +368,8 @@ def test_web_surface_is_served_from_same_app(dsn):
     assert 'id="projectTree"' in page.text
     assert 'id="notificationBtn"' in page.text
     assert 'id="notificationMenu"' in page.text
-    assert 'id="proposalReviewDialog"' in page.text
+    assert 'id="workspaceTabs"' in page.text
+    assert 'id="workspaceTabReviewPanel"' in page.text
     assert 'id="editProjectBtn"' not in page.text
     assert 'id="deleteProjectBtn"' not in page.text
     assert 'id="editProjectDialog"' in page.text

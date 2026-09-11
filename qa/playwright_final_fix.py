@@ -190,12 +190,14 @@ def proposal(project_id: str, proposal_id: str) -> dict:
         "id": proposal_id,
         "project_id": project_id,
         "status": "PENDING",
+        "base_architecture_version": 1,
         "reason": "Review the agent boundary",
         "observed_change": "A new external provider was requested.",
         "evidence": ["The project goal now names an external provider."],
         "impact": "The accepted architecture boundary would change.",
         "affected_components": [f"{project_id}-experience"],
         "proposed_changes": [{"component_id": f"{project_id}-experience"}],
+        "recommended_option": "ACCEPT_PROPOSED_CHANGE",
     }
 
 
@@ -216,6 +218,9 @@ class FakeBackend:
         self.requests: list[dict[str, str]] = []
         self.context_manifest_requests: list[dict] = []
         self.event_result = "SUCCESS"
+        self.decision_requests: list[dict[str, str]] = []
+        self.drop_next_decision_response = False
+        self.fail_decision_readback = False
 
     def fail_next(self, method: str, path: str) -> None:
         self.fail_once[(method, path)] = self.fail_once.get((method, path), 0) + 1
@@ -501,6 +506,9 @@ class FakeBackend:
             self.json(route, context["tasks"])
             return
         if parts[2:] == ["architecture"] and method == "GET":
+            if self.fail_decision_readback:
+                self.json(route, {"detail": "Deliberate read-back failure"}, 503)
+                return
             self.json(route, context["architecture"])
             return
         if parts[2:] == ["architecture", "diagram"] and method == "GET":
@@ -544,7 +552,79 @@ class FakeBackend:
             self.json(route, payload)
             return
         if parts[2:] == ["architecture", "proposals"] and method == "GET":
+            if self.fail_decision_readback:
+                self.json(route, {"detail": "Deliberate read-back failure"}, 503)
+                return
             self.json(route, context["proposals"])
+            return
+        if (
+            len(parts) == 6
+            and parts[2:4] == ["architecture", "proposals"]
+            and parts[5] == "acceptance-preview"
+            and method == "GET"
+        ):
+            proposal_id = parts[4]
+            candidate = next((item for item in context["proposals"] if item["id"] == proposal_id), None)
+            if not candidate or candidate["status"] != "PENDING" or candidate.get("base_architecture_version") != context["architecture"]["version"]:
+                self.json(route, {"detail": "proposal is not pending for this project"}, 409)
+                return
+            after = copy.deepcopy(context["architecture"])
+            after["version"] += 1
+            self.json(route, {
+                "proposal_id": proposal_id,
+                "proposal_status": "PENDING",
+                "actionable": True,
+                "current_architecture_version": context["architecture"]["version"],
+                "resulting_architecture_version": after["version"],
+                "components_before": context["architecture"]["components"],
+                "components_after": after["components"],
+                "relationships_before": context["architecture"].get("relationships", []),
+                "relationships_after": after.get("relationships", []),
+                "decisions_added": [f"Accepted proposal {proposal_id}"],
+                "task_updates": [],
+                "created_tasks": [],
+                "blocked_task_ids": [],
+                "remapped_tasks": [],
+                "superseded_proposals": [
+                    {
+                        "proposal_id": peer["id"],
+                        "base_architecture_version": peer.get("base_architecture_version"),
+                        "superseded_at_architecture_version": after["version"],
+                        "reason": f"Superseded by accepted proposal {proposal_id}",
+                    }
+                    for peer in context["proposals"]
+                    if peer["id"] != proposal_id and peer["status"] == "PENDING"
+                ],
+                "warnings": [],
+            })
+            return
+        if (
+            len(parts) == 6
+            and parts[2:4] == ["architecture", "proposals"]
+            and parts[5] in {"accept", "reject"}
+            and method == "POST"
+        ):
+            proposal_id, decision = parts[4], parts[5]
+            candidate = next((item for item in context["proposals"] if item["id"] == proposal_id), None)
+            self.decision_requests.append({"proposal_id": proposal_id, "decision": decision})
+            if not candidate or candidate["status"] != "PENDING":
+                self.json(route, {"detail": "proposal is not pending for this project"}, 409)
+                return
+            candidate["status"] = "ACCEPTED" if decision == "accept" else "REJECTED"
+            if decision == "accept":
+                context["architecture"]["version"] += 1
+                context["project"]["architecture_version"] = context["architecture"]["version"]
+                for peer in context["proposals"]:
+                    if peer["id"] != proposal_id and peer["status"] == "PENDING":
+                        peer["status"] = "SUPERSEDED"
+                        peer["resolution_reason"] = f"Superseded by accepted proposal {proposal_id}"
+                        peer["superseded_by_proposal_id"] = proposal_id
+                        peer["superseded_at_architecture_version"] = context["architecture"]["version"]
+            if self.drop_next_decision_response:
+                self.drop_next_decision_response = False
+                route.abort("failed")
+                return
+            self.json(route, candidate)
             return
         if parts[2:] == ["agent-context", "manifest"] and method == "POST":
             body = request.post_data_json
@@ -560,6 +640,11 @@ class FakeBackend:
             return
         if parts[2:] == ["events"] and method == "POST":
             body = request.post_data_json
+            if body.get("type") == "TASK_UPDATED":
+                payload = body.get("payload", {})
+                changed = next((item for item in context["tasks"] if item["id"] == payload.get("task_id")), None)
+                if changed is not None:
+                    changed["status"] = payload.get("status", changed["status"])
             context_request = body.get("payload", {}).get("agent_context_request")
             manifest = None
             if context_request:
@@ -837,7 +922,7 @@ def case_transactional_project_selection(browser: Browser) -> None:
     backend.contexts["alpha"]["tasks"] = [task("alpha", "task-a", "Alpha task", "TODO")]
     backend.contexts["beta"]["tasks"] = [task("beta", "task-b", "Beta task", "TODO")]
     identity = "email:transaction@example.com"
-    backend.fail_next("GET", "/projects/beta/tasks")
+    backend.fail_next("GET", "/projects/beta/workspace-bootstrap")
     context, page, errors = open_page(browser, backend, identity=identity, project_id="alpha")
     with diagnostic_scope(context.close):
         page.locator('[data-project-id="beta"] [data-project-open]').click()
@@ -867,7 +952,7 @@ def case_notifications_and_context(browser: Browser) -> None:
         page.locator("#initialGoalForm button[type='submit']").click()
         page.locator("#refineGoalStage").wait_for(state="visible")
         assert page.locator("#notificationBadge").is_hidden()
-        page.locator("#notificationBtn").click()
+        page.evaluate("() => document.querySelector('#notificationBtn').click()")
         assert "nothing needs" in page.locator("#notificationList").inner_text().lower()
         page.keyboard.press("Escape")
         page.locator("#onboardingBackBtn").click()
@@ -875,14 +960,15 @@ def case_notifications_and_context(browser: Browser) -> None:
         page.locator("#notificationBtn").click()
         page.locator('[data-attention-kind="task"]').click()
         assert page.locator("#view-tasks").evaluate("node => node.classList.contains('active')")
-        task_context = page.locator('[data-task-select="blocked-a"]')
-        assert task_context.get_attribute("aria-pressed") == "true"
-        page.wait_for_function("() => document.activeElement?.dataset.taskSelect === 'blocked-a'")
+        task_context = page.locator('#view-tasks [data-task-open="blocked-a"]')
+        assert task_context.get_attribute("aria-expanded") == "true"
+        assert page.locator("#taskDetailPanel").is_visible()
+        page.wait_for_function("() => document.activeElement?.id === 'taskDetailClose'")
         page.locator("#notificationBtn").click()
         page.locator('[data-attention-kind="proposal"]').click()
-        assert page.locator("#proposalReviewDialog").is_visible()
+        assert page.locator("#workspaceTabReviewPanel").is_visible()
+        assert page.locator("#proposalList [data-proposal-select=\"proposal-a\"]").get_attribute("aria-pressed") == "true"
         page.wait_for_function("() => document.activeElement?.dataset.proposalSelect === 'proposal-a'")
-        page.locator("#proposalReviewDialog [data-close-dialog]").click()
         page.locator("#notificationBtn").click()
         page.locator('[data-attention-kind="task"]').evaluate("button => button.dataset.attentionId = 'missing-task'")
         page.locator('[data-attention-kind="task"]').click()
@@ -911,11 +997,12 @@ def case_keyboard_and_mobile_layers(browser: Browser) -> None:
         task_view = page.locator('[data-project-id="alpha"] [data-project-view="tasks"]')
         task_view.focus()
         page.keyboard.press("Enter")
-        task_context = page.locator('[data-task-select="task-a"]')
+        task_context = page.locator('#view-tasks [data-task-open="task-a"]')
         task_context.focus()
         page.keyboard.press("Space")
-        page.wait_for_function("() => document.querySelector('[data-task-select=\"task-a\"]')?.getAttribute('aria-pressed') === 'true'")
-        assert task_context.get_attribute("aria-pressed") == "true"
+        page.wait_for_function("() => document.querySelector('#view-tasks [data-task-open=\"task-a\"]')?.getAttribute('aria-expanded') === 'true'")
+        assert task_context.get_attribute("aria-expanded") == "true"
+        assert page.locator("#taskDetailPanel").is_visible()
         assert "Keyboard task" in page.locator("#instructionContext").inner_text()
 
         graph_view = page.locator('[data-project-id="alpha"] [data-project-view="architecture"]')
@@ -979,17 +1066,24 @@ def case_task_architecture_navigation(browser: Browser) -> None:
         page.locator('[data-project-id="task-nav"] [data-project-view="tasks"]').click()
         page.locator("#view-tasks").wait_for(state="visible")
 
-        linked_row = page.locator('[data-task-navigate="task-linked"]')
+        linked_row = page.locator('#view-tasks [data-task-open="task-linked"]')
         assert linked_row.count() == 1
-        assert linked_row.get_attribute("tabindex") == "0"
-        assert page.locator('[data-task-navigate="task-unlinked"]').count() == 0
+        unlinked_row = page.locator('#view-tasks [data-task-open="task-unlinked"]')
+        assert unlinked_row.count() == 1
 
-        start_button = linked_row.locator('[data-task-action="start"]')
-        if start_button.count():
-            start_button.dispatch_event("dblclick")
-            assert page.locator("#view-tasks").is_visible()
+        linked_row.click()
+        assert page.locator("#view-tasks").evaluate("node => node.classList.contains('active')")
+        page.locator("#taskDetailPanel").wait_for(state="visible")
+        assert page.locator("#taskDetailTitle").inner_text() == "Open the agent composer architecture"
+        component_open = page.locator("#taskDetailPanel [data-task-component-open]")
+        assert component_open.count() == 1
+        page.locator("#taskDetailClose").click()
+        page.wait_for_function("() => document.querySelector('#taskDetailPanel')?.hidden === true")
 
-        linked_row.dblclick(position={"x": 20, "y": 20})
+        linked_row.click()
+        page.locator("#taskDetailPanel").wait_for(state="visible")
+        component_open = page.locator("#taskDetailPanel [data-task-component-open]")
+        component_open.click()
         page.locator("#view-architecture").wait_for(state="visible")
         target = page.locator('[data-component="task-nav-composer"]')
         target.wait_for(state="visible")
@@ -999,15 +1093,12 @@ def case_task_architecture_navigation(browser: Browser) -> None:
         assert page.locator(".graph-scope-bar strong", has_text="Workspace Experience").is_visible()
 
         page.locator('[data-project-id="task-nav"] [data-project-view="tasks"]').click()
-        linked_row = page.locator('[data-task-navigate="task-linked"]')
+        linked_row = page.locator('#view-tasks [data-task-open="task-linked"]')
         linked_row.focus()
         page.keyboard.press("Enter")
-        page.locator("#view-architecture").wait_for(state="visible")
-        target = page.locator('[data-component="task-nav-composer"]')
-        target.wait_for(state="visible")
-        page.wait_for_function("() => document.querySelector('[data-component=\"task-nav-composer\"]')?.classList.contains('selected')")
-        assert "selected" in (target.get_attribute("class") or "")
-        page.wait_for_function("() => document.activeElement?.dataset.component === 'task-nav-composer'")
+        page.locator("#taskDetailPanel").wait_for(state="visible")
+        assert page.locator("#taskDetailTitle").inner_text() == "Open the agent composer architecture"
+        assert page.locator("#view-tasks").evaluate("node => node.classList.contains('active')")
         assert not errors, errors
 
 
@@ -1658,7 +1749,7 @@ def case_instruction_failure(browser: Browser) -> None:
     context, page, errors = open_page(browser, backend, identity=identity, project_id="alpha")
     with diagnostic_scope(context.close):
         page.locator('[data-project-view="tasks"]').click()
-        page.locator('[data-task-select="task-a"]').click()
+        page.locator('#taskList [data-task-open="task-a"]').click()
         message = "Do not erase this detailed instruction after a transient failure."
         page.locator("#instruction").fill(message)
         page.locator("#instructionForm button[type='submit']").click()
@@ -1701,7 +1792,7 @@ def case_inline_rename_and_account(browser: Browser) -> None:
         page.keyboard.press("Enter")
         page.wait_for_function("() => document.querySelector('[data-project-open]')?.textContent.trim() === 'Renamed Inline'")
 
-        page.locator("#accountBtn").click()
+        page.evaluate("() => document.querySelector('#accountBtn').click()")
         page.locator('[data-account-section="profile"]').click()
         page.locator("#settingsName").fill("Updated Reviewer")
         page.locator("#accountSettingsForm button[type='submit']").click()
@@ -2061,7 +2152,7 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
 
         page.set_viewport_size({"width": 375, "height": 812})
         page.evaluate("() => { const main = document.querySelector('#workspaceMain'); if (main) main.scrollTop = 0; window.scrollTo(0, 0); }")
-        page.locator("#mobileSidebarBtn").click()
+        page.evaluate("() => document.querySelector('#mobileSidebarBtn').click()")
         page.locator("#workspaceSidebar").wait_for(state="visible")
         assert page.locator("#mobileSidebarBtn").get_attribute("aria-expanded") == "true"
         page.wait_for_function("() => Math.abs(document.querySelector('#workspaceSidebar')?.getBoundingClientRect().left || 0) < 1")
@@ -2082,9 +2173,9 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
         page.evaluate("() => { const main = document.querySelector('#workspaceMain'); if (main) main.scrollTop = 0; window.scrollTo(0, 0); }")
         page.locator('[data-project-id="sweep"] [data-project-view="tasks"]').click()
         page.locator("#view-tasks").wait_for(state="visible")
-        blocked_task = page.locator('[data-task-select="task-blocked"]')
+        blocked_task = page.locator('#view-tasks [data-task-open="task-blocked"]')
         blocked_task.click()
-        assert blocked_task.get_attribute("aria-pressed") == "true"
+        assert blocked_task.get_attribute("aria-expanded") == "true"
         capture_surface("desktop_1440_tasks_blocked_selected")
 
         backend.contexts["sweep"]["proposals"] = [proposal("sweep", "proposal-review")]
@@ -2096,9 +2187,8 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
         assert page.locator('[data-attention-kind="proposal"]').is_visible()
         capture_surface("desktop_1440_notifications_attention")
         page.locator('[data-attention-kind="proposal"]').click()
-        page.locator("#proposalReviewDialog").wait_for(state="visible")
+        page.locator("#workspaceTabReviewPanel").wait_for(state="visible")
         capture_surface("desktop_1440_architecture_review_pending")
-        page.locator("#proposalReviewDialog [data-close-dialog]").click()
 
         backend.projects = []
         page.evaluate("() => localStorage.removeItem('archbro-project-id')")
@@ -2143,7 +2233,148 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
         )
 
 
+def case_workspace_review_state_and_outcomes(browser: Browser) -> None:
+    def configured_backend(project_id: str) -> FakeBackend:
+        backend = FakeBackend([project(project_id, "Review State")])
+        backend.contexts[project_id]["tasks"] = [task(project_id, "task-a", "Open task context", "TODO")]
+        backend.contexts[project_id]["proposals"] = [
+            proposal(project_id, "proposal-a"),
+            proposal(project_id, "proposal-b"),
+        ]
+        return backend
+
+    # Mouse acceptance starts from a real task drawer, requires the server preview,
+    # survives a dropped mutation response via read-back, and never sends twice.
+    backend = configured_backend("review-accept")
+    context, page, errors = open_page(
+        browser, backend, identity="email:review-accept@example.com", project_id="review-accept"
+    )
+    with diagnostic_scope(context.close):
+        page.locator('[data-project-id="review-accept"] [data-project-view="tasks"]').click()
+        page.locator('#taskList [data-task-open="task-a"]').click()
+        page.locator("#taskDetailPanel").wait_for(state="visible")
+        assert "Open task context" in page.locator("#instructionContext").inner_text()
+        page.locator("#workspaceTabReview").click()
+        page.locator("#workspaceTabReviewPanel").wait_for(state="visible")
+        assert page.locator("#taskDetailPanel").is_hidden()
+        assert "Proposal" in page.locator("#instructionContext").inner_text()
+        assert "Open task context" not in page.locator("#instructionContext").inner_text()
+        page.locator('[data-preview-version="1"]').wait_for(state="visible")
+        accept = page.locator('[data-proposal-decision="accept"]')
+        assert accept.is_enabled()
+        backend.drop_next_decision_response = True
+        accept.click()
+        page.wait_for_function("() => document.querySelectorAll('.status-pill.SUPERSEDED').length === 1")
+        assert backend.decision_requests == [{"proposal_id": "proposal-a", "decision": "accept"}]
+        assert backend.contexts["review-accept"]["architecture"]["version"] == 2
+        assert [item["status"] for item in backend.contexts["review-accept"]["proposals"]] == ["ACCEPTED", "SUPERSEDED"]
+        accept.click(force=True) if accept.count() and accept.is_visible() else None
+        assert len(backend.decision_requests) == 1
+        assert not errors, errors
+
+    # Keep Current follows the same state transition and sends exactly one request.
+    backend = configured_backend("review-reject")
+    backend.contexts["review-reject"]["proposals"] = [proposal("review-reject", "proposal-a")]
+    context, page, errors = open_page(
+        browser, backend, identity="email:review-reject@example.com", project_id="review-reject"
+    )
+    with diagnostic_scope(context.close):
+        page.locator('[data-project-id="review-reject"] [data-project-view="tasks"]').click()
+        page.locator('#taskList [data-task-open="task-a"]').click()
+        page.locator("#workspaceTabReview").click()
+        page.locator('[data-proposal-decision="reject"]').click()
+        page.wait_for_function("() => document.querySelector('.status-pill.REJECTED')")
+        assert backend.decision_requests == [{"proposal_id": "proposal-a", "decision": "reject"}]
+        assert backend.contexts["review-reject"]["architecture"]["version"] == 1
+        page.locator("#workspaceTabTasks").click()
+        page.locator('#taskList [data-task-open="task-a"]').click()
+        detail_action = page.locator("#taskDetailAction")
+        assert detail_action.inner_text() == "Start task"
+        detail_action.click()
+        page.wait_for_function("() => document.querySelector('#taskDetailAction')?.textContent === 'Mark done'")
+        assert page.locator("#taskDetailPanel").is_visible()
+        detail_action.click()
+        page.wait_for_function("() => document.querySelector('#taskDetailAction')?.textContent === 'Reopen'")
+        detail_action.click()
+        page.wait_for_function("() => document.querySelector('#taskDetailAction')?.textContent === 'Start task'")
+        assert backend.contexts["review-reject"]["tasks"][0]["status"] == "TODO"
+        assert not errors, errors
+
+    # Keyboard semantics and committed URL state survive Back, Forward, and reload.
+    backend = configured_backend("review-route")
+    context, page, errors = open_page(
+        browser, backend, identity="email:review-route@example.com", project_id="review-route"
+    )
+    with diagnostic_scope(context.close):
+        page.locator('[data-project-id="review-route"] [data-project-view="tasks"]').click()
+        page.locator("#workspaceTabTasks").focus()
+        page.keyboard.press("ArrowRight")
+        assert page.locator("#workspaceTabReview").get_attribute("aria-selected") == "true"
+        assert parse_qs(urlsplit(page.url).query)["workspace"] == ["review"]
+        page.go_back(wait_until="networkidle")
+        page.wait_for_function("() => document.querySelector('#workspaceTabTasks')?.getAttribute('aria-selected') === 'true'")
+        assert parse_qs(urlsplit(page.url).query)["workspace"] == ["tasks"]
+        page.go_forward(wait_until="networkidle")
+        page.wait_for_function("() => document.querySelector('#workspaceTabReview')?.getAttribute('aria-selected') === 'true'")
+        page.reload(wait_until="networkidle")
+        assert page.locator("#workspaceTabReviewPanel").is_visible()
+        page.locator("#workspaceTabReview").focus()
+        page.keyboard.press("Home")
+        assert page.locator("#workspaceTabTasks").get_attribute("aria-selected") == "true"
+        page.locator("#workspaceTabReview").focus()
+        page.keyboard.press("Space")
+        assert page.locator("#workspaceTabReview").get_attribute("aria-selected") == "true"
+        assert not errors, errors
+
+    # An unresolvable dropped response remains UNKNOWN and controls stay locked.
+    backend = configured_backend("review-unknown")
+    backend.contexts["review-unknown"]["proposals"] = [proposal("review-unknown", "proposal-a")]
+    context, page, errors = open_page(
+        browser, backend, identity="email:review-unknown@example.com", project_id="review-unknown"
+    )
+    with diagnostic_scope(context.close):
+        page.locator('[data-project-id="review-unknown"] [data-project-view="tasks"]').click()
+        page.locator("#workspaceTabReview").click()
+        page.locator('[data-preview-version="1"]').wait_for(state="visible")
+        backend.drop_next_decision_response = True
+        backend.fail_decision_readback = True
+        page.locator('[data-proposal-decision="accept"]').click()
+        page.locator("#proposalDecisionNotice.unknown").wait_for(state="visible")
+        assert "could not be verified" in page.locator("#proposalDecisionNotice").inner_text()
+        assert page.locator('[data-proposal-decision="accept"]').is_disabled()
+        assert page.locator('[data-proposal-decision="reject"]').is_disabled()
+        page.locator('[data-proposal-decision="accept"]').click(force=True)
+        assert len(backend.decision_requests) == 1
+        assert not errors, errors
+
+    # Escape closes only the visible top layer; a drawer underneath is not consumed.
+    backend = configured_backend("review-escape")
+    context, page, errors = open_page(
+        browser, backend, viewport={"width": 375, "height": 812},
+        identity="email:review-escape@example.com", project_id="review-escape"
+    )
+    with diagnostic_scope(context.close):
+        page.locator("#mobileSidebarBtn").click()
+        page.locator('[data-project-id="review-escape"] [data-project-view="tasks"]').click()
+        page.locator('#taskList [data-task-open="task-a"]').click()
+        page.evaluate("() => document.querySelector('#notificationBtn').click()")
+        page.keyboard.press("Escape")
+        assert page.locator("#notificationMenu").is_hidden()
+        assert page.locator("#taskDetailPanel").is_visible()
+        page.evaluate("() => document.querySelector('#accountBtn').click()")
+        page.keyboard.press("Escape")
+        assert page.locator("#accountMenu").is_hidden()
+        assert page.locator("#taskDetailPanel").is_visible()
+        page.evaluate("() => document.querySelector('#mobileSidebarBtn').click()")
+        page.keyboard.press("Escape")
+        assert page.locator("#taskDetailPanel").is_visible()
+        page.keyboard.press("Escape")
+        assert page.locator("#taskDetailPanel").is_hidden()
+        assert not errors, errors
+
+
 CASES = [
+    ("workspace_review_state_and_outcomes", case_workspace_review_state_and_outcomes),
     ("canvas_committed_navigation", case_canvas_committed_navigation),
     ("autonomous_surface_sweep", case_autonomous_surface_sweep),
     ("landing_authentication_teaser", case_landing_authentication_teaser),
@@ -2264,6 +2495,10 @@ def test_scoped_keyboard_focus_browser() -> None:
 
 def test_task_architecture_navigation_browser() -> None:
     run_case_with_static_server(case_task_architecture_navigation)
+
+
+def test_workspace_review_state_and_outcomes_browser() -> None:
+    run_case_with_static_server(case_workspace_review_state_and_outcomes)
 
 
 def test_autonomous_surface_sweep_browser() -> None:

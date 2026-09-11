@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 
 from archbro.backend.core.contracts import (
     Architecture,
@@ -598,6 +599,12 @@ class ArchitectureAcceptanceReconciler:
                 )
             created_tasks.append(
                 Task(
+                    id=(
+                        "task_acceptance_"
+                        + hashlib.sha256(
+                            f"{proposal.id}|{old_id}|{target_component_id}|{title}".encode("utf-8")
+                        ).hexdigest()[:20]
+                    ),
                     title=title,
                     description=description,
                     status=TaskStatus.TODO,

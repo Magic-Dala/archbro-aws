@@ -345,7 +345,7 @@ async function canvasSwitchHarness(options = {}) {
     canvasDeepLinkApplied:true, canvasDeepLinkFocusPending:false, canvasInspectorOpen:true,
     tracePathRequest:{source_id:'node:api'}, tracePathResult:{status:'FOUND'}, tracePathLoading:false, tracePathError:null, diagramError:null,
     graphTransitionGeneration:0,
-    navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:Boolean(options.initialMode),nodeId:options.initialMode?'api':null,inspectorTab:options.initialMode?'tasks':'overview'}},
+    navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:Boolean(options.initialMode),nodeId:options.initialMode?'api':null,inspectorTab:options.initialMode?'tasks':'overview',workspaceTab:'tasks'}},
   };
   const calls = {push:0,replace:0,clear:0,render:0,load:0,cache:[],toasts:[]};
   const context = {
@@ -513,7 +513,7 @@ test('canvas switch fences an older pending Project Diagram resource load', asyn
     canvasDeepLinkApplied:false, canvasDeepLinkFocusPending:false, canvasInspectorOpen:false,
     tracePathRequest:null, tracePathResult:null, tracePathLoading:false, tracePathError:null,
     graphTransitionGeneration:0,
-    navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:false,nodeId:null,inspectorTab:'overview'}},
+    navigation:{generation:0,initialized:true,committed:{projectId:'project-1',view:'architecture',canvas:false,nodeId:null,inspectorTab:'overview',workspaceTab:'tasks'}},
   };
   const context = {
     state, URL, URLSearchParams, views:{overview:{},tasks:{},architecture:{}}, INSPECTOR_TABS:new Set(['overview']),
