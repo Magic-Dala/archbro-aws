@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -166,6 +167,23 @@ def create_app(
     if goal_timeout <= 0:
         raise ValueError("ARCHBRO_GOAL_REQUEST_TIMEOUT_SECONDS must be greater than zero")
 
+    architecture_model = str(
+        getattr(selected_provider, "system_map_model_id", None)
+        or getattr(selected_provider, "model_id", selected_provider.__class__.__name__)
+    ).strip() or selected_provider.__class__.__name__
+    try:
+        architecture_total_timeout_seconds = float(
+            getattr(selected_provider, "architecture_total_timeout_seconds", 45.0)
+        )
+    except (TypeError, ValueError):
+        architecture_total_timeout_seconds = 45.0
+    if not math.isfinite(architecture_total_timeout_seconds) or architecture_total_timeout_seconds <= 0:
+        architecture_total_timeout_seconds = 45.0
+    architecture_request_timeout_ms = max(
+        60_000,
+        round((architecture_total_timeout_seconds + 15.0) * 1000),
+    )
+
     frontend_dir = Path(web_dir) if web_dir is not None else _project_root() / "frontend" / "web"
     if not frontend_dir.exists():
         raise RuntimeError(f"Archbro frontend directory not found: {frontend_dir}")
@@ -207,6 +225,8 @@ def create_app(
         payload = {
             "auth_mode": auth_mode,
             "firebase": public_firebase_config,
+            "architecture_model": architecture_model,
+            "architecture_request_timeout_ms": architecture_request_timeout_ms,
             "connected_mcp_gateway_configured": manifest["connected_mcp_gateway_configured"],
             "webmcp_surface_version": manifest["surface_version"],
             "webmcp_asset_sha256": manifest["asset_sha256"],

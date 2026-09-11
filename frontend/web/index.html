@@ -219,6 +219,7 @@
                   <div><span class="eyebrow">ARCHITECTURE GENERATION PENDING</span><strong>The Goal is saved, but Architecture v1 has not been created yet</strong><p>This normally happens automatically after Goal confirmation. Retry uses the already saved Goal as the source of truth.</p></div>
                   <button id="generateArchitectureBtn" class="btn primary" type="button">Retry initial architecture</button>
                 </div>
+                <p id="architectureRecoveryHint" class="muted" aria-live="polite">Retry uses the already saved Goal as the source of truth.</p>
                 <div id="architectureProgress" class="architecture-progress hidden" aria-live="polite">
                   <div class="architecture-progress-row"><span class="progress-spinner"></span><strong id="architectureProgressText">Preparing Architecture v1...</strong><span id="architectureElapsed">0s</span></div>
                   <p id="architectureProgressHint">Reading the confirmed Goal and generating a bounded V0 architecture.</p>
@@ -465,7 +466,7 @@
   <script src="/runtime-config.js"></script>
   <script src="/static/prototype.js?v=bd187140bfd50057"></script>
   <script src="/static/firebase-auth-client.js?v=20260901-auth-providers"></script>
-  <script type="module" src="/static/app.js?v=fd530fd3f25d8136"></script>
-  <script type="module" src="/static/archbro-webmcp.js?v=ef5e8f65352bb894"></script>
+  <script type="module" src="/static/app.js?v=aa103f6e3a4b5bb2"></script>
+  <script type="module" src="/static/archbro-webmcp.js?v=6f7c6c73eb0fbf7a"></script>
 </body>
 </html>

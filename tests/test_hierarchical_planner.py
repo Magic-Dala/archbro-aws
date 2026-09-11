@@ -723,6 +723,80 @@ def test_planner_uses_the_provider_client_factory(monkeypatch):
     metadata = provider._current_invocation_metadata()
     assert metadata is not None
     assert metadata["planner_response"]["transport"] == "vertex"
+    assert metadata["planner_response"]["http_timeout_ms"] == 500
+
+
+def test_architecture_http_timeout_never_undercuts_the_model_budget(monkeypatch):
+    provider = _provider()
+    provider.architecture_model_timeout_seconds = 90.0
+
+    monkeypatch.setenv("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS", "10000")
+    assert provider._effective_architecture_http_timeout_ms() == 90_000
+
+    monkeypatch.setenv("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS", "120000")
+    assert provider._effective_architecture_http_timeout_ms() == 120_000
+
+    monkeypatch.setenv("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS", "not-an-integer")
+    with pytest.raises(ValueError, match="must be an integer"):
+        provider._effective_architecture_http_timeout_ms()
+
+    monkeypatch.setenv("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS", "0")
+    with pytest.raises(ValueError, match="greater than zero"):
+        provider._effective_architecture_http_timeout_ms()
+
+
+def test_planner_dispatch_failure_records_effective_deadline_without_model_output(monkeypatch):
+    provider = _provider()
+    provider.architecture_model_timeout_seconds = 90.0
+    provider._begin_invocation_metadata()
+    captured: dict[str, object] = {}
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            captured["model"] = model
+            raise RuntimeError("504 DEADLINE_EXCEEDED: provider deadline")
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+        async def aclose(self):
+            captured["closed"] = True
+
+    class FakeClient:
+        def __init__(self):
+            self.aio = FakeAio()
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            captured["http_timeout_ms"] = http_timeout_ms
+            return FakeClient()
+
+    provider._google_client_factory = FakeFactory()
+    monkeypatch.setenv("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS", "10000")
+
+    with pytest.raises(RuntimeError, match="504 DEADLINE_EXCEEDED"):
+        asyncio.run(
+            provider._invoke_planner_structured(
+                "gemini-3.8-flash",
+                "SYSTEM_MAP deadline fixture",
+                GeminiSystemMapWire,
+            )
+        )
+
+    assert captured["http_timeout_ms"] == 90_000
+    assert captured["closed"] is True
+    metadata = provider._current_invocation_metadata()
+    assert metadata is not None
+    assert metadata["planner_response"] is None
+    dispatch = metadata["planner_dispatch"]
+    assert dispatch["requested_model"] == "gemini-3.8-flash"
+    assert dispatch["http_timeout_ms"] == 90_000
+    assert dispatch["transport"] == "vertex"
+    assert dispatch["error_type"] == "RuntimeError"
+    assert dispatch["latency_ms"] >= 0
 
 
 def test_retryable_503_checkpoint_can_retry_without_relaxing_unknown_timeout_boundary():

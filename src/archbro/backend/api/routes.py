@@ -126,6 +126,59 @@ class PlannerRecoveryRequest(BaseModel):
         return value
 
 
+def _planner_recovery_descriptor(
+    checkpoints: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Expose the next safe recovery decision without leaking prompts or model output."""
+
+    for checkpoint in checkpoints:
+        if not isinstance(checkpoint, dict):
+            continue
+        status = str(checkpoint.get("status") or "UNKNOWN").upper()
+        if status == "COMPLETED":
+            continue
+        plan_id = str(checkpoint.get("plan_id") or "").strip()
+        phase_key = str(checkpoint.get("phase_key") or "").strip()
+        attempt_id = str(checkpoint.get("attempt_id") or "").strip()
+        try:
+            revision = int(checkpoint.get("revision", 0))
+        except (TypeError, ValueError):
+            revision = 0
+        if not plan_id or not phase_key or not attempt_id or revision < 1:
+            continue
+
+        delivery_stage = str(checkpoint.get("delivery_stage") or "PREPARED").upper()
+        provider = checkpoint.get("provider")
+        response_reprocessable = bool(
+            isinstance(provider, dict)
+            and provider.get("response_reprocessable") is True
+            and isinstance(provider.get("raw_model_output"), str)
+            and provider.get("raw_model_output")
+        )
+        if status in {"RETRYABLE", "REPROCESSABLE"}:
+            action: str | None = "RETRY_EVENT"
+        elif delivery_stage == "RESPONSE_RECORDED" and response_reprocessable:
+            action = "REPROCESS_RESPONSE"
+        elif delivery_stage == "PREPARED":
+            action = "RECLAIM_PREPARED"
+        elif delivery_stage == "IN_FLIGHT" or status == "UNKNOWN":
+            action = "AUTHORIZE_NEW_ATTEMPT"
+        else:
+            action = None
+
+        return {
+            "plan_id": plan_id,
+            "phase_key": phase_key,
+            "attempt_id": attempt_id,
+            "revision": revision,
+            "status": status,
+            "delivery_stage": delivery_stage,
+            "action": action,
+            "requires_paid_call_confirmation": action == "AUTHORIZE_NEW_ATTEMPT",
+        }
+    return None
+
+
 class GoalDraftRequest(BaseModel):
     messages: list[GoalConversationMessage] = []
     current_goal: str = ""
@@ -928,12 +981,21 @@ def build_router(
         project = await authorized_project(
             http_request, project_id, ProjectPermission.READ
         )
-        architecture, tasks, proposals, activity = await run_in_threadpool(
+        (
+            architecture,
+            tasks,
+            proposals,
+            activity,
+            latest_runs,
+            planner_checkpoints,
+        ) = await run_in_threadpool(
             lambda: (
                 repository.get_architecture(project_id),
                 repository.list_tasks(project_id),
                 repository.list_proposals(project_id),
                 repository.list_events(project_id, limit=12),
+                repository.list_agent_runs(project_id, limit=1),
+                repository.list_planner_checkpoints(project_id, limit=32),
             )
         )
         return {
@@ -943,6 +1005,14 @@ def build_router(
             "architecture": architecture.model_dump(mode="json"),
             "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
             "activity": [event.model_dump(mode="json") for event in activity],
+            "latest_agent_run": (
+                latest_runs[-1].model_dump(mode="json") if latest_runs else None
+            ),
+            "planner_recovery": (
+                _planner_recovery_descriptor(planner_checkpoints)
+                if architecture.version == 0
+                else None
+            ),
             "resources": {
                 "canvas": {
                     "status": "DEFERRED",

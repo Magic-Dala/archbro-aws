@@ -582,6 +582,33 @@ class PostgresProjectRepository:
         runs = [AgentRunResult.model_validate_json(row["data"]) for row in rows]
         return list(reversed(runs))
 
+    def list_planner_checkpoints(
+        self,
+        project_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, object]]:
+        if limit <= 0:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT data FROM planner_checkpoints
+                WHERE project_id=%s
+                ORDER BY updated_at DESC, plan_id, phase_key
+                LIMIT %s
+                """,
+                (project_id, limit),
+            ).fetchall()
+        checkpoints: list[dict[str, object]] = []
+        for row in rows:
+            value = json.loads(row["data"])
+            if not isinstance(value, dict):
+                raise RuntimeError("planner checkpoint payload must be a JSON object")
+            if value.get("project_id") != project_id:
+                raise RuntimeError("planner checkpoint project identity mismatch")
+            checkpoints.append(value)
+        return checkpoints
+
     def get_planner_checkpoint(self, plan_id: str, phase_key: str) -> dict[str, object] | None:
         with self._connect() as conn:
             row = conn.execute(

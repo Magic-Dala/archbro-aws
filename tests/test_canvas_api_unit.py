@@ -89,6 +89,14 @@ class CanvasRepository:
         self.get_project(project_id)
         return []
 
+    def list_agent_runs(self, project_id: str, limit: int = 100):
+        self.get_project(project_id)
+        return []
+
+    def list_planner_checkpoints(self, project_id: str, limit: int = 100):
+        self.get_project(project_id)
+        return []
+
 
 def make_client() -> TestClient:
     app = FastAPI()

@@ -20,6 +20,13 @@ import {
 } from './review-helpers.js?v=4430a4040cec2ad3';
 
 const prototype = window.ArchbroPrototype;
+const RUNTIME_CONFIG = window.__ARCHBRO_RUNTIME_CONFIG__ || {};
+const configuredArchitectureRequestTimeout = Number(RUNTIME_CONFIG.architecture_request_timeout_ms);
+const ARCHITECTURE_REQUEST_TIMEOUT_MS = (
+  Number.isFinite(configuredArchitectureRequestTimeout) && configuredArchitectureRequestTimeout > 0
+)
+  ? Math.max(60_000, configuredArchitectureRequestTimeout)
+  : 930_000;
 const URL_PARAMS = new URLSearchParams(window.location.search);
 let ARCHITECTURE_CANVAS_MODE = URL_PARAMS.get('canvas') === 'architecture';
 const REQUESTED_PROJECT_ID = String(URL_PARAMS.get('project') || '').trim() || null;
@@ -179,6 +186,7 @@ const state = {
   proposals: [],
   activity: [],
   lastRun: null,
+  plannerRecovery: null,
   agentContextManifest: null,
   agentContextKey: null,
   agentContextLoading: false,
@@ -1174,6 +1182,7 @@ function renderProjectCards() {
 
 function renderWorkspaceHome() {
   state.onboarding.active = false;
+  syncDocumentTitle();
   $('emptyState').classList.add('hidden');
   $('workspace').classList.remove('hidden');
   $('workspaceHome').classList.remove('hidden');
@@ -1211,6 +1220,7 @@ async function openPersonalWorkspace({historyMode = 'push', navigationGuard = nu
   state.graphFocusMode = 'all';
   state.proposals = [];
   state.lastRun = null;
+  state.plannerRecovery = null;
   clearAgentContextPreview();
   state.selectedComponentId = null;
   state.selectedEdgeId = null;
@@ -1704,6 +1714,8 @@ async function loadProjectCoreContext(projectId) {
     architecture: bootstrap.architecture,
     proposals: bootstrap.proposals || [],
     activity: bootstrap.activity || [],
+    lastRun: bootstrap.latest_agent_run || null,
+    plannerRecovery: bootstrap.planner_recovery || null,
     deferredArchitectureResources: bootstrap.resources || {},
   };
 }
@@ -1949,7 +1961,6 @@ async function selectProject(projectId, {
     const nextView = ROUTED_VIEWS.has(view) ? view : (canvas ? 'architecture' : 'overview');
     Object.assign(state, context, {
       projectId,
-      lastRun: null,
       agentContextManifest: null,
       agentContextKey: null,
       agentContextLoading: false,
@@ -2119,6 +2130,7 @@ function startOnboarding() {
 }
 
 function renderOnboarding() {
+  syncDocumentTitle();
   $('emptyState').classList.remove('hidden');
   $('workspace').classList.add('hidden');
   renderProjectTree();
@@ -2198,22 +2210,26 @@ function hasCurrentProject() {
   return Boolean(state.projectId && state.project);
 }
 
+function syncDocumentTitle() {
+  const nextTitle = ARCHITECTURE_CANVAS_MODE
+    && state.currentView === 'architecture'
+    && state.project
+    ? `${state.diagram?.presentation?.title || 'System architecture'} · Archbro`
+    : 'Archbro';
+  if (document.title !== nextTitle) document.title = nextTitle;
+}
+
 function cancelNewProjectNameDialog() {
-  const emptyWorkspace = state.projects.length === 0;
-  if (state.onboarding.stage === 'name' && !hasCurrentProject() && !emptyWorkspace) {
-    $('newProjectNameError').textContent = 'Enter a project name to continue.';
-    $('newProjectName').focus();
-    return;
-  }
-  const returnToProject = state.onboarding.stage === 'name' && !emptyWorkspace;
   $('newProjectNameDialog').close();
-  if (returnToProject) backToCurrentProject();
-  else if (emptyWorkspace && state.onboarding.stage === 'name') renderWorkspaceHome();
-  else if (emptyWorkspace) renderOnboarding();
 }
 
 function handleNewProjectNameDialogClose() {
-  if (state.onboarding.stage === 'name' && !hasCurrentProject() && state.projects.length > 0) setTimeout(() => openNewProjectNameDialog(), 0);
+  if (state.onboarding.stage !== 'name') return;
+  if (state.navigation.onboardingReturn?.projectId && hasCurrentProject()) {
+    void backToCurrentProject();
+    return;
+  }
+  renderWorkspaceHome();
 }
 
 function handleNewProjectNameDialogCancel(event) {
@@ -2698,6 +2714,7 @@ function resetEphemeralSessionState() {
   state.proposalDecisionNotice = null;
   state.notificationTransientMessage = null;
   state.lastRun = null;
+  state.plannerRecovery = null;
   clearAgentContextPreview();
   state.projects = [];
   state.project = null;
@@ -2821,6 +2838,7 @@ function render() {
   $('projectStatus').textContent = formatTaskEnum(state.project.status, 'Active');
   const activeView = views[state.currentView] ? state.currentView : 'overview';
   state.currentView = activeView;
+  syncDocumentTitle();
   $('pageTitle').textContent = views[activeView].title;
   $('pageSubtitle').textContent = views[activeView].subtitle;
 
@@ -2828,6 +2846,7 @@ function render() {
   $('bootstrapPanel').classList.toggle('hidden', !awaiting);
   $('globalAgentDock').classList.toggle('hidden', awaiting);
   $('bootstrapGoal').textContent = projectGoal;
+  syncInitialArchitectureAction();
 
   const ready = state.tasks.filter((task) => task.status === 'TODO' && (task.owner === 'HUMAN' || task.owner === 'UNASSIGNED'));
   const running = state.tasks.filter((task) => task.status === 'IN_PROGRESS');
@@ -4360,7 +4379,7 @@ function renderArchitectureChrome() {
   if ($('graphDecisionTitle')) $('graphDecisionTitle').textContent = codeMode ? 'Repository snapshot' : 'Architecture decisions';
   if ($('graphRiskTitle')) $('graphRiskTitle').textContent = codeMode ? 'Evidence boundary' : 'Risks & assumptions';
   if ($('architectureCanvasBtn')) $('architectureCanvasBtn').textContent = ARCHITECTURE_CANVAS_MODE ? 'Project View' : 'Open Canvas ↗';
-  if (ARCHITECTURE_CANVAS_MODE && state.project) document.title = `${state.diagram?.presentation?.title || 'System architecture'} · Archbro`;
+  syncDocumentTitle();
   if (state.currentView === 'architecture') {
     $('pageTitle').textContent = codeMode ? 'Code Architecture' : 'Living Architecture';
     $('pageSubtitle').textContent = codeMode
@@ -5941,29 +5960,117 @@ function setArchitectureProgress(working, startedAt = 0) {
   if (!wrap || !button) return;
   wrap.classList.toggle('hidden', !working);
   button.disabled = working;
-  button.textContent = working ? 'Generating architecture...' : 'Retry initial architecture';
+  button.textContent = working ? 'Generating architecture...' : initialArchitectureActionState().label;
   clearInterval(setArchitectureProgress.timer);
-  if (!working) return;
+  if (!working) {
+    syncInitialArchitectureAction();
+    return;
+  }
 
   const update = () => {
     const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
     $('architectureElapsed').textContent = `${elapsed}s`;
     if (elapsed < 8) {
       $('architectureProgressText').textContent = 'Reading Goal and shaping the V0 skeleton';
-      $('architectureProgressHint').textContent = '3.7 Flash is reasoning over the confirmed Goal.';
-    } else if (elapsed < 16) {
-      $('architectureProgressText').textContent = 'Trying a bounded fallback if needed';
-      $('architectureProgressHint').textContent = 'A slow model will not block the project indefinitely.';
-    } else if (elapsed < 28) {
-      $('architectureProgressText').textContent = 'Validating components, relationships, and tasks';
-      $('architectureProgressHint').textContent = 'The result must satisfy the machine-readable Architecture contract.';
+      $('architectureProgressHint').textContent = `${architectureModelDisplayName()} is reasoning over the confirmed Goal.`;
+    } else if (elapsed < 30) {
+      $('architectureProgressText').textContent = 'Reasoning within the configured model deadline';
+      $('architectureProgressHint').textContent = 'Archbro will not issue a second paid model call after an ambiguous dispatch.';
     } else {
-      $('architectureProgressText').textContent = 'Finishing within the architecture deadline';
-      $('architectureProgressHint').textContent = 'If no model completes, this run will stop safely with no project-state mutation.';
+      $('architectureProgressText').textContent = 'Validating the architecture result';
+      $('architectureProgressHint').textContent = 'Components, relationships, and tasks must satisfy the machine-readable Architecture contract.';
     }
   };
   update();
   setArchitectureProgress.timer = setInterval(update, 1000);
+}
+
+function architectureModelDisplayName(modelId = RUNTIME_CONFIG.architecture_model) {
+  const normalized = String(modelId || '').trim();
+  if (!normalized) return 'The architecture model';
+  return normalized
+    .split('-')
+    .map((part, index) => (
+      index === 0 && part.toLowerCase() === 'gemini'
+        ? 'Gemini'
+        : (/^\d+(?:\.\d+)?$/.test(part) ? part : `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    ))
+    .join(' ');
+}
+
+function initialArchitectureActionState(recovery = state.plannerRecovery) {
+  switch (recovery?.action) {
+    case 'AUTHORIZE_NEW_ATTEMPT':
+      return {
+        label: 'Authorize new architecture attempt',
+        hint: 'The previous model request has an unknown outcome. This explicit action authorizes one new paid attempt; Archbro will never replay it automatically.',
+      };
+    case 'REPROCESS_RESPONSE':
+      return {
+        label: 'Recover saved architecture response',
+        hint: 'A complete provider response was saved. Recovery reprocesses it locally without another model call.',
+      };
+    case 'RECLAIM_PREPARED':
+      return {
+        label: 'Resume architecture generation',
+        hint: 'The previous attempt stopped before provider dispatch, so it can be reclaimed without duplicating a paid request.',
+      };
+    case 'RETRY_EVENT':
+      return {
+        label: 'Retry initial architecture',
+        hint: 'The durable planner state is ready for a fenced retry using the saved Goal.',
+      };
+    default:
+      if (recovery) {
+        return {
+          label: 'Manual recovery required',
+          hint: 'Archbro cannot safely infer the next planner action. No model request will be sent from this button.',
+          disabled: true,
+        };
+      }
+      return {
+        label: 'Retry initial architecture',
+        hint: 'Retry uses the already saved Goal as the source of truth.',
+      };
+  }
+}
+
+function syncInitialArchitectureAction() {
+  const button = $('generateArchitectureBtn');
+  const hint = $('architectureRecoveryHint');
+  if (!button || !hint) return;
+  const action = initialArchitectureActionState();
+  const working = Boolean(state.architectureProgressRequestId);
+  if (!working) button.textContent = action.label;
+  button.disabled = working || action.disabled === true;
+  hint.textContent = action.hint;
+}
+
+async function recoverInitialArchitectureCheckpoint(projectId, recovery, {signal} = {}) {
+  if (!recovery || recovery.action === 'RETRY_EVENT') return null;
+  if (!recovery.action) throw new Error('This planner checkpoint requires manual recovery.');
+  const requestId = `architecture-recovery:${recovery.attempt_id}:${recovery.revision}`;
+  const checkpoint = await api(
+    `/projects/${encodeURIComponent(projectId)}/planner/checkpoints/${encodeURIComponent(recovery.plan_id)}/${encodeURIComponent(recovery.phase_key)}/recover`,
+    {
+      method: 'POST',
+      signal,
+      body: JSON.stringify({
+        expected_attempt_id: recovery.attempt_id,
+        expected_revision: recovery.revision,
+        action: recovery.action,
+        request_id: requestId,
+      }),
+    },
+  );
+  state.plannerRecovery = {
+    ...recovery,
+    revision: checkpoint.revision,
+    status: checkpoint.status,
+    action: 'RETRY_EVENT',
+    requires_paid_call_confirmation: false,
+  };
+  return checkpoint;
 }
 
 async function generateInitialArchitecture() {
@@ -5978,8 +6085,10 @@ async function generateInitialArchitecture() {
   const startedAt = Date.now();
   const workingRequestId = beginWorkingRequest('', {projectId, architectureStartedAt:startedAt});
   const controller = new AbortController();
-  const clientTimeout = setTimeout(() => controller.abort(), 42000);
+  const clientTimeout = setTimeout(() => controller.abort(), ARCHITECTURE_REQUEST_TIMEOUT_MS);
   try {
+    await recoverInitialArchitectureCheckpoint(projectId, state.plannerRecovery, {signal: controller.signal});
+    if (!committedProjectGuardIsCurrent(guard)) return null;
     const result = await api(`/projects/${projectId}/events`, {
       method: 'POST',
       signal: controller.signal,
@@ -6056,6 +6165,7 @@ function switchView(name, {
   if (workspaceMain) workspaceMain.scrollTop = 0;
   window.scrollTo(0, 0);
   if (name === 'tasks' && restoreScroll) restoreWorkspaceTabScroll(state.workspaceTab);
+  syncDocumentTitle();
   return true;
 }
 
@@ -6910,7 +7020,6 @@ window.ArchBroWebBridge = {
 
   async bootstrapProject({name, goal, architectureSummary, components = [], relationships = [], tasks = [], planningTrace, reasoning} = {}) {
     await ensureAppInitialized();
-    allowActionDispatch('project-create', {authority:'webmcp', feedback:false});
     const projectName = String(name || '').trim();
     const projectGoal = String(goal || '').trim();
     const summary = String(architectureSummary || '').trim();
@@ -7103,7 +7212,6 @@ window.ArchBroWebBridge = {
 
   async createProject({name, goal, description = ''} = {}) {
     await ensureAppInitialized();
-    allowActionDispatch('project-create', {authority:'webmcp', feedback:false});
     const projectName = String(name || '').trim();
     const projectGoal = String(goal || '').trim();
     const projectDescription = String(description || '').trim();
@@ -7176,7 +7284,7 @@ window.ArchBroWebBridge = {
     return webMcpContext();
   },
 
-  async publishCodeArchitectureSnapshot({repository, revision, summary, components, relationships = [], sourceEvidence = []} = {}) {
+  async publishCodeArchitectureSnapshot({repository, revision, summary, components, relationships = [], sourceEvidence = [], signal} = {}) {
     await ensureAppInitialized();
     const capture = captureWebMcpProject();
     const result = await api(`/projects/${capture.projectId}/code-architecture/snapshots`, {
@@ -7189,6 +7297,7 @@ window.ArchBroWebBridge = {
         relationships,
         source_evidence:sourceEvidence,
       }),
+      signal,
     });
     if (webMcpProjectStillCurrent(capture)) {
       state.codeArchitectureRequestSerial += 1;

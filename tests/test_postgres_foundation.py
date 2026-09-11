@@ -86,6 +86,7 @@ def test_postgres_repository_implements_the_full_project_repository_port(repo):
     assert missing == []
     assert {
         "get_planner_checkpoint",
+        "list_planner_checkpoints",
         "put_planner_checkpoint",
         "claim_planner_checkpoint",
     } <= required
@@ -1005,6 +1006,8 @@ def test_postgres_planner_recovery_fences_old_owner_and_replays_idempotently(rep
     assert replay == recovered
     assert recovered["status"] == "RETRYABLE"
     assert recovered["owner_generation"] > owner["owner_generation"]
+    assert repo.list_planner_checkpoints(project.id) == [recovered]
+    assert repo.list_planner_checkpoints(project.id, limit=0) == []
 
     with pytest.raises(RuntimeError, match="revision changed|owner generation changed"):
         repo.put_planner_checkpoint(

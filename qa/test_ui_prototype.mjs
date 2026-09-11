@@ -389,8 +389,36 @@ test('Personal workspace opens the complete project home from an active project'
   assert.match(js, /\$\('workspaceSwitcherBtn'\)\.addEventListener\('click', openPersonalWorkspace\);/);
 });
 
-test('empty workspace cancellation returns home instead of reopening project naming', async () => {
+test('project naming can be cancelled from workspace or returned to an active project', async () => {
   const js = await readFile(new URL('app.js', webRoot), 'utf8');
-  assert.match(js, /function cancelNewProjectNameDialog\(\)[\s\S]*?state\.projects\.length === 0[\s\S]*?renderWorkspaceHome\(\);/);
-  assert.match(js, /function handleNewProjectNameDialogClose\(\)[\s\S]*?state\.projects\.length > 0/);
+  const cancel = js.slice(js.indexOf('function cancelNewProjectNameDialog()'), js.indexOf('function handleNewProjectNameDialogClose()'));
+  const close = js.slice(js.indexOf('function handleNewProjectNameDialogClose()'), js.indexOf('function handleNewProjectNameDialogCancel('));
+  assert.match(cancel, /\$\('newProjectNameDialog'\)\.close\(\);/);
+  assert.doesNotMatch(cancel, /Enter a project name|state\.projects\.length/);
+  assert.match(close, /state\.navigation\.onboardingReturn\?\.projectId/);
+  assert.match(close, /void backToCurrentProject\(\)/);
+  assert.match(close, /renderWorkspaceHome\(\)/);
+  assert.doesNotMatch(close, /openNewProjectNameDialog/);
+});
+
+test('architecture generation uses runtime model identity, bounded recovery, and no stale 3.7 label', async () => {
+  const js = await readFile(new URL('app.js', webRoot), 'utf8');
+  assert.match(js, /RUNTIME_CONFIG\.architecture_model/);
+  assert.match(js, /ARCHITECTURE_REQUEST_TIMEOUT_MS/);
+  assert.match(js, /Authorize new architecture attempt/);
+  assert.match(js, /never replay it automatically/);
+  assert.match(js, /\/planner\/checkpoints\/\$\{encodeURIComponent\(recovery\.plan_id\)\}/);
+  assert.match(js, /action: recovery\.action/);
+  assert.doesNotMatch(js, /3\.7 Flash/);
+  assert.doesNotMatch(js, /Trying a bounded fallback/);
+});
+
+test('document title returns to Archbro outside the architecture canvas', async () => {
+  const js = await readFile(new URL('app.js', webRoot), 'utf8');
+  const title = js.slice(js.indexOf('function syncDocumentTitle()'), js.indexOf('function cancelNewProjectNameDialog()'));
+  assert.match(title, /ARCHITECTURE_CANVAS_MODE/);
+  assert.match(title, /state\.currentView === 'architecture'/);
+  assert.match(title, /: 'Archbro'/);
+  assert.match(js, /function renderWorkspaceHome\(\)[\s\S]*?syncDocumentTitle\(\);/);
+  assert.match(js, /function renderOnboarding\(\)[\s\S]*?syncDocumentTitle\(\);/);
 });

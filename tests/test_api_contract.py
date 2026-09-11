@@ -183,6 +183,20 @@ def test_planner_recovery_api_requires_exact_attempt_revision_and_explicit_actio
     assert inspected.status_code == 200
     assert inspected.json()["attempt_id"] == "attempt-api"
 
+    bootstrap = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert bootstrap.status_code == 200
+    assert bootstrap.json()["latest_agent_run"] is None
+    assert bootstrap.json()["planner_recovery"] == {
+        "plan_id": "plan-api-recovery",
+        "phase_key": "SYSTEM_MAP",
+        "attempt_id": "attempt-api",
+        "revision": checkpoint["revision"],
+        "status": "STARTED",
+        "delivery_stage": "PREPARED",
+        "action": "RECLAIM_PREPARED",
+        "requires_paid_call_confirmation": False,
+    }
+
     recovered = client.post(
         f"/projects/{project['id']}/planner/checkpoints/plan-api-recovery/SYSTEM_MAP/recover",
         json={
@@ -194,6 +208,9 @@ def test_planner_recovery_api_requires_exact_attempt_revision_and_explicit_actio
     )
     assert recovered.status_code == 200
     assert recovered.json()["status"] == "RETRYABLE"
+    retryable_bootstrap = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert retryable_bootstrap.json()["planner_recovery"]["action"] == "RETRY_EVENT"
+    assert retryable_bootstrap.json()["planner_recovery"]["revision"] == recovered.json()["revision"]
 
     stale = client.post(
         f"/projects/{project['id']}/planner/checkpoints/plan-api-recovery/SYSTEM_MAP/recover",
@@ -206,6 +223,59 @@ def test_planner_recovery_api_requires_exact_attempt_revision_and_explicit_actio
     )
     assert stale.status_code == 409
     assert "revision changed" in stale.json()["detail"]
+
+
+def test_workspace_bootstrap_requires_explicit_paid_call_authorization_for_unknown_planner(dsn):
+    repo, client = make_client(dsn)
+    project = client.post(
+        "/projects",
+        json={"name": "Unknown Planner", "goal": "Recover an ambiguous model dispatch safely."},
+    ).json()
+    checkpoint = repo.put_planner_checkpoint(
+        project_id=project["id"],
+        plan_id="plan-api-unknown",
+        phase_key="SYSTEM_MAP",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-api-unknown",
+            "project_id": project["id"],
+            "phase_key": "SYSTEM_MAP",
+            "attempt_id": "attempt-unknown",
+            "delivery_stage": "IN_FLIGHT",
+            "status": "UNKNOWN",
+            "provider": {
+                "requested_model": "gemini-3.8-flash",
+                "http_timeout_ms": 90_000,
+                "raw_model_output": "must never cross the bootstrap boundary",
+            },
+        },
+    )
+
+    response = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert response.status_code == 200
+    recovery = response.json()["planner_recovery"]
+    assert recovery == {
+        "plan_id": "plan-api-unknown",
+        "phase_key": "SYSTEM_MAP",
+        "attempt_id": "attempt-unknown",
+        "revision": checkpoint["revision"],
+        "status": "UNKNOWN",
+        "delivery_stage": "IN_FLIGHT",
+        "action": "AUTHORIZE_NEW_ATTEMPT",
+        "requires_paid_call_confirmation": True,
+    }
+    assert "raw_model_output" not in response.text
+    assert "must never cross" not in response.text
+
+    initialized = repo.get_architecture(project["id"]).model_copy(update={"version": 1})
+    repo.save_architecture(project["id"], initialized)
+    initialized_project = repo.get_project(project["id"]).model_copy(
+        update={"architecture_version": 1}
+    )
+    repo.save_project(initialized_project)
+    initialized_bootstrap = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert initialized_bootstrap.status_code == 200
+    assert initialized_bootstrap.json()["planner_recovery"] is None
 
 
 def test_ask_merges_with_current_goal_instead_of_replacing_it(dsn):

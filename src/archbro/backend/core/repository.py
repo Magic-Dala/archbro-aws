@@ -112,6 +112,14 @@ class ProjectRepositoryPort(Protocol):
     ) -> ProjectEvent | None: ...
     def list_agent_runs(self, project_id: str, limit: int = 100) -> list[AgentRunResult]: ...
 
+    def list_planner_checkpoints(
+        self,
+        project_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return durable initial-architecture checkpoints, newest first."""
+        ...
+
     def get_planner_checkpoint(self, plan_id: str, phase_key: str) -> dict[str, Any] | None:
         """Return one durable initial-architecture planner phase checkpoint."""
         ...

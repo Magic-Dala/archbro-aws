@@ -431,6 +431,9 @@ async function getAgentContext({nodeId, expectedArchitectureVersion, signal} = {
       agent_context_request: agentContextExecutionRequest(manifest),
     };
   }
+  if (expectedArchitectureVersion !== undefined && expectedArchitectureVersion !== null) {
+    throw new Error('expected_architecture_version is only valid when node_id is provided.');
+  }
   const context = await agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/agent-context`, {signal, projectBinding});
   let providerConnections = [];
   try {
@@ -621,25 +624,6 @@ async function getScopedDiagram({scopeComponentId, expectedArchitectureVersion, 
   return agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/architecture/diagram${suffix}`, {signal, projectBinding});
 }
 
-async function publishCodeArchitectureSnapshot({repository, revision, summary, components, relationships, sourceEvidence, signal} = {}) {
-  const projectBinding = activeProjectBinding();
-  const projectId = projectBinding.projectId;
-  const payload = await agentSurfaceApi(`/projects/${encodeURIComponent(projectId)}/code-architecture/snapshots`, {
-    method: 'POST',
-    body: {
-      repository,
-      revision,
-      summary,
-      components,
-      relationships: relationships || [],
-      source_evidence: sourceEvidence,
-    },
-    signal,
-    projectBinding,
-  });
-  return compactCodeArchitectureForTool(payload);
-}
-
 async function getLatestCodeArchitectureSnapshot({signal} = {}) {
   const projectBinding = activeProjectBinding();
   const projectId = projectBinding.projectId;
@@ -757,6 +741,7 @@ function createCoreTools(bridge) {
   requireBridgeMethod(bridge, 'createTask');
   requireBridgeMethod(bridge, 'updateTaskStatus');
   requireBridgeMethod(bridge, 'recordProjectObservation');
+  requireBridgeMethod(bridge, 'publishCodeArchitectureSnapshot');
 
   const tools = [
     {
@@ -788,7 +773,7 @@ function createCoreTools(bridge) {
         type: 'object',
         properties: {
           node_id: {type: 'string', pattern: '^node:.+', description: 'Stable canonical node ID for bounded context. Omit for the existing project-level compact context.'},
-          expected_architecture_version: {type: 'integer', minimum: 1, description: 'Required with node_id; the server fails stale versions closed.'},
+          expected_architecture_version: {type: 'integer', minimum: 1, description: 'Required with node_id and must be omitted without node_id; the server fails stale versions closed.'},
         },
         additionalProperties: false,
       },
@@ -823,7 +808,7 @@ function createCoreTools(bridge) {
       inputSchema: codeArchitectureSnapshotInputSchema(),
       annotations: {readOnlyHint: false, untrustedContentHint: true},
       execute: async ({repository, revision, summary, components, relationships = [], source_evidence}, client = {}) => asToolResult(
-        await publishCodeArchitectureSnapshot({repository, revision, summary, components, relationships, sourceEvidence: source_evidence, signal: client.signal}),
+        compactCodeArchitectureForTool(await bridge.publishCodeArchitectureSnapshot({repository, revision, summary, components, relationships, sourceEvidence: source_evidence, signal: client.signal})),
       ),
     },
     {

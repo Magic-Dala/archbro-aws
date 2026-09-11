@@ -185,6 +185,8 @@ def test_webmcp_manifest_and_ping_have_server_build_identity(dsn, monkeypatch):
     assert runtime_config.headers["cache-control"] == "no-store, max-age=0"
     assert manifest["asset_sha256"] in runtime_config.text
     assert '"webmcp_expected_tool_count": 17' in runtime_config.text
+    assert '"architecture_model": "deterministic-v0"' in runtime_config.text
+    assert '"architecture_request_timeout_ms": 60000' in runtime_config.text
 
     module = client.get("/static/archbro-webmcp.js")
     assert module.headers["cache-control"] == "no-store, max-age=0"

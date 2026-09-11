@@ -35,6 +35,7 @@ const bridge = {
   createTask: noop,
   updateTaskStatus: noop,
   recordProjectObservation: noop,
+  publishCodeArchitectureSnapshot: noop,
 };
 const inventory = globalThis.__createArchBroTools(bridge).map((tool) => ({
   name: tool.name,
@@ -209,6 +210,7 @@ const bridge = {
   createTask: noop,
   updateTaskStatus: noop,
   recordProjectObservation: noop,
+  publishCodeArchitectureSnapshot: noop,
 };
 (async () => {
   const tools = globalThis.__createArchBroTools(bridge);
@@ -221,6 +223,14 @@ const bridge = {
     expected_architecture_version: 7,
   }));
   const boundedRequests = requests.slice(beforeBounded);
+  let unboundedVersionError = '';
+  const beforeInvalidContext = requests.length;
+  try {
+    await contextTool.execute({expected_architecture_version: 999});
+  } catch (error) {
+    unboundedVersionError = String(error.message || error);
+  }
+  const invalidContextRequestCount = requests.length - beforeInvalidContext;
   const statuses = [];
   for (const status of ['FOUND', 'UNREACHABLE', 'LIMIT_REACHED']) {
     pathStatus = status;
@@ -234,7 +244,7 @@ const bridge = {
   } catch (error) {
     staleError = String(error.message || error);
   }
-  process.stdout.write(JSON.stringify({legacy, bounded, boundedRequests, statuses, staleError, requests}));
+  process.stdout.write(JSON.stringify({legacy, bounded, boundedRequests, unboundedVersionError, invalidContextRequestCount, statuses, staleError, requests}));
 })().catch((error) => { console.error(error); process.exit(1); });
 """
     completed = subprocess.run(
@@ -266,6 +276,8 @@ const bridge = {
             "expected_architecture_version": 7,
         },
     }]
+    assert "only valid when node_id is provided" in result["unboundedVersionError"]
+    assert result["invalidContextRequestCount"] == 0
     assert result["statuses"] == ["FOUND", "UNREACHABLE", "LIMIT_REACHED"]
     assert "409:" in result["staleError"]
     assert "stale_architecture_version" in result["staleError"]
@@ -468,6 +480,76 @@ def test_bootstrap_failure_does_not_restore_old_project_over_a_new_selection():
     assert "persistActiveProjectSelection" not in bootstrap_source
 
 
+def test_webmcp_project_creation_has_no_undefined_dispatch_gate():
+    source = APP_MODULE.read_text(encoding="utf-8")
+    assert "allowActionDispatch" not in source
+
+
+def test_webmcp_code_publish_routes_through_ui_bridge_and_compacts_excerpts():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the WebMCP publish bridge check")
+    script = r"""
+const fs = require('fs');
+let source = fs.readFileSync('frontend/web/archbro-webmcp.js', 'utf8')
+  .replace(/^import .*?;\r?\n/, '')
+  .replace(/\bexport\s+/g, '');
+source += '\nglobalThis.__createArchBroTools = createArchBroTools;';
+eval(source);
+const noop = async () => ({});
+const calls = [];
+const bridge = {
+  bootstrapProject: noop,
+  expandArchitectureScope: noop,
+  getDecisionContext: noop,
+  submitAgentRecommendation: noop,
+  createTask: noop,
+  updateTaskStatus: noop,
+  recordProjectObservation: noop,
+  publishCodeArchitectureSnapshot: async (args) => {
+    calls.push(args);
+    return {
+      id: 'snapshot-1',
+      diagram: {
+        nodes: [{id: 'code:ui', sources: [{path: 'src/ui.js', line_start: 1, excerpt: 'private excerpt'}]}],
+        edges: [],
+      },
+    };
+  },
+};
+(async () => {
+  const signal = {tag: 'client-signal'};
+  const tool = globalThis.__createArchBroTools(bridge).find((item) => item.name === 'archbro_publish_code_architecture');
+  const result = JSON.parse(await tool.execute({
+    repository: 'Magic-Dala/archbro',
+    revision: 'a'.repeat(40),
+    summary: 'Synthetic bridge fixture',
+    components: [{id: 'code:ui', name: 'UI', type: 'module', responsibility: 'Render UI', sources: [{path: 'src/ui.js', line_start: 1, excerpt: 'fixture'}]}],
+    relationships: [],
+    source_evidence: [{path: 'src/ui.js', line_start: 1, excerpt: 'fixture'}],
+  }, {signal}));
+  process.stdout.write(JSON.stringify({calls, result}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    completed = subprocess.run(
+        [node, "-e", script],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    result = json.loads(completed.stdout)
+    assert len(result["calls"]) == 1
+    assert result["calls"][0]["repository"] == "Magic-Dala/archbro"
+    assert result["calls"][0]["sourceEvidence"][0]["excerpt"] == "fixture"
+    assert result["calls"][0]["signal"] == {"tag": "client-signal"}
+    assert result["result"]["id"] == "snapshot-1"
+    assert result["result"]["diagram"]["nodes"][0]["sources"] == [
+        {"path": "src/ui.js", "line_start": 1}
+    ]
+
+
 def test_bootstrap_result_resolves_committed_architecture_version_before_success():
     source = APP_MODULE.read_text(encoding="utf-8")
     bootstrap_start = source.index("  async bootstrapProject(")
@@ -511,6 +593,7 @@ const bridge = {
   createTask: noop,
   updateTaskStatus: noop,
   recordProjectObservation: noop,
+  publishCodeArchitectureSnapshot: noop,
   callConnectedMcpTool: async ({arguments: args}) => {
     providerCalls += 1;
     if (args?.q === 'small') return {ok: true};

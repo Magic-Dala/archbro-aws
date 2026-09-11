@@ -553,6 +553,7 @@ class GeminiProvider(ModelProvider):
                 "model_id": self.model_id,
                 "usage": None,
                 "planner_response": None,
+                "planner_dispatch": None,
                 "planner_request_started": False,
                 "planner_phases": [],
             }
@@ -644,6 +645,27 @@ class GeminiProvider(ModelProvider):
         self._api_key = self._google_client_factory.api_key
         # Strands Agent instances are invocation-scoped. Reusing one Agent across HTTP
         # requests raises ConcurrencyException because concurrent invocations are unsupported.
+
+    def _effective_architecture_http_timeout_ms(self) -> int:
+        minimum_ms = max(1, round(self.architecture_model_timeout_seconds * 1000))
+        configured_text = os.getenv("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS", "").strip()
+        if not configured_text:
+            return minimum_ms
+        try:
+            configured_ms = int(configured_text)
+        except ValueError as exc:
+            raise ValueError(
+                "GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS must be an integer"
+            ) from exc
+        if configured_ms <= 0:
+            raise ValueError("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS must be greater than zero")
+        if configured_ms < minimum_ms:
+            logger.warning(
+                "GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS=%s is shorter than the model budget; using %s",
+                configured_ms,
+                minimum_ms,
+            )
+        return max(configured_ms, minimum_ms)
 
     @staticmethod
     def _load_fallback_models(primary_model_id: str) -> tuple[str, ...]:
@@ -1044,26 +1066,26 @@ class GeminiProvider(ModelProvider):
     ):
         from google.genai import types as genai_types
 
-        http_timeout_ms = int(
-            os.getenv(
-                "GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS",
-                str(round(self.architecture_model_timeout_seconds * 1000)),
-            )
-        )
-        if http_timeout_ms <= 0:
-            raise ValueError("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS must be greater than zero")
+        http_timeout_ms = self._effective_architecture_http_timeout_ms()
         client = self._client_factory_for_invocation().create_client(
             http_timeout_ms=http_timeout_ms
         )
         started_at = time.perf_counter()
         invocation = self._current_invocation_metadata()
-        if invocation is not None:
-            self._transition_active_planner_checkpoint(
-                "IN_FLIGHT",
-                provider={"requested_model": model_id},
-            )
-            invocation["planner_request_started"] = True
+        dispatch_metadata = {
+            "requested_model": model_id,
+            "http_timeout_ms": http_timeout_ms,
+            "transport": self._transport_name(),
+            "thinking_level": self.architecture_thinking_level,
+        }
         try:
+            if invocation is not None:
+                self._transition_active_planner_checkpoint(
+                    "IN_FLIGHT",
+                    provider=dispatch_metadata,
+                )
+                invocation["planner_dispatch"] = dict(dispatch_metadata)
+                invocation["planner_request_started"] = True
             response = await client.aio.models.generate_content(
                 model=model_id,
                 contents=prompt,
@@ -1078,6 +1100,16 @@ class GeminiProvider(ModelProvider):
                     ),
                 ),
             )
+        except Exception as exc:
+            if invocation is not None and invocation.get("planner_request_started") is True:
+                dispatch_metadata.update(
+                    {
+                        "latency_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                invocation["planner_dispatch"] = dict(dispatch_metadata)
+            raise
         finally:
             await _close_google_client(client)
 
@@ -1100,6 +1132,7 @@ class GeminiProvider(ModelProvider):
             "latency_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
             "transport": self._transport_name(),
             "thinking_level": self.architecture_thinking_level,
+            "http_timeout_ms": http_timeout_ms,
             "response_reprocessable": finish_reason == "STOP",
         }
         invocation = self._current_invocation_metadata()
@@ -1194,11 +1227,15 @@ class GeminiProvider(ModelProvider):
         phases = [] if metadata is None else list(metadata.get("planner_phases") or [])
         self.last_usage = {
             "schema": "archbro.gemini_initial_planner_usage.v1",
-            "transport": "gateway" if self._base_url else "google",
+            "transport": self._transport_name(),
             "requested_model": self.model_id,
             "thinking_level": self.architecture_thinking_level,
             "plan_id": plan_id,
             "completed": completed,
+            "model_timeout_ms": round(self.architecture_model_timeout_seconds * 1000),
+            "phase_timeout_ms": round(self.architecture_phase_timeout_seconds * 1000),
+            "total_timeout_ms": round(self.architecture_total_timeout_seconds * 1000),
+            "http_timeout_ms": self._effective_architecture_http_timeout_ms(),
             "phases": phases,
         }
 
@@ -1221,6 +1258,9 @@ class GeminiProvider(ModelProvider):
                     "latency_ms",
                     "transport",
                     "thinking_level",
+                    "http_timeout_ms",
+                    "error_type",
+                    "response_reprocessable",
                     "normalization",
                     "output_sha256",
                 )
@@ -1228,6 +1268,10 @@ class GeminiProvider(ModelProvider):
         compact = {
             "phase": checkpoint.get("phase_key"),
             "status": checkpoint.get("status"),
+            "attempt_id": checkpoint.get("attempt_id"),
+            "revision": checkpoint.get("revision"),
+            "owner_generation": checkpoint.get("owner_generation"),
+            "delivery_stage": checkpoint.get("delivery_stage"),
             "requested_model": checkpoint.get("requested_model"),
             "thinking_level": checkpoint.get("thinking_level"),
             "input_sha256": checkpoint.get("input_sha256"),
@@ -1424,7 +1468,12 @@ class GeminiProvider(ModelProvider):
             self._set_planner_usage(plan_id=plan_id, completed=False)
             return result
         except Exception as exc:
-            provider_metadata = None if invocation is None else invocation.get("planner_response")
+            provider_metadata = None
+            if invocation is not None:
+                provider_metadata = (
+                    invocation.get("planner_response")
+                    or invocation.get("planner_dispatch")
+                )
             cursor: BaseException | None = exc
             has_timeout = False
             seen: set[int] = set()
@@ -1448,6 +1497,8 @@ class GeminiProvider(ModelProvider):
                 if repository is not None
                 else started_checkpoint
             ) or started_checkpoint
+            if provider_metadata is None:
+                provider_metadata = checkpoint_base.get("provider")
             delivery_stage = str(checkpoint_base.get("delivery_stage") or "PREPARED")
             retryable = not has_timeout and failed_before_provider and delivery_stage == "PREPARED"
             failure_status = (
@@ -1485,6 +1536,7 @@ class GeminiProvider(ModelProvider):
         invocation = self._current_invocation_metadata()
         if invocation is not None:
             invocation["planner_response"] = None
+            invocation["planner_dispatch"] = None
             invocation["planner_request_started"] = False
         timed_out: list[str] = []
         unavailable: list[str] = []
