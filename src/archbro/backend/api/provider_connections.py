@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from html import escape
@@ -16,6 +17,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from archbro.backend.core.authorization import TrustedPrincipal
+from archbro.backend.core.contracts import ProjectEvent
+from archbro.backend.mcp.agent_tools import (
+    AgentMcpToolSession,
+    repository_evidence_requested,
+)
 from archbro.backend.mcp.provider_gateway import McpConnectionConfig
 from archbro.backend.mcp.provider_oauth import McpOAuthManager, OAuthSetupRequired
 from archbro.backend.mcp.provider_policy import ReadOnlyExternalMcpGateway as ExternalMcpGateway
@@ -73,7 +79,61 @@ class McpToolCallRequest(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
-def build_provider_mcp_router(principal_for: PrincipalFor) -> APIRouter:
+class ProviderMcpRuntimeRegistry:
+    """Own per-principal provider runtimes shared by HTTP and built-in agents."""
+
+    def __init__(self) -> None:
+        self.gateways: dict[str, ExternalMcpGateway] = {}
+        self.oauth_managers: dict[str, McpOAuthManager] = {}
+        self._lock = threading.RLock()
+
+    def runtime_for(
+        self,
+        principal: TrustedPrincipal,
+    ) -> tuple[ExternalMcpGateway, McpOAuthManager]:
+        user_id = principal.user_id
+        with self._lock:
+            gateways = self.gateways
+            oauth_managers = self.oauth_managers
+            gateway = gateways.get(user_id)
+            if gateway is None:
+                gateway = ExternalMcpGateway()
+                gateways[user_id] = gateway
+                oauth_managers[user_id] = McpOAuthManager(gateway)
+            return gateway, oauth_managers[user_id]
+
+    def runtime_for_owner(
+        self,
+        user_id: str,
+    ) -> tuple[ExternalMcpGateway, McpOAuthManager] | None:
+        with self._lock:
+            gateway = self.gateways.get(user_id)
+            manager = self.oauth_managers.get(user_id)
+            if gateway is None or manager is None:
+                return None
+            return gateway, manager
+
+    def agent_tool_session(
+        self,
+        principal: TrustedPrincipal,
+        *,
+        project_id: str,
+        event: ProjectEvent,
+    ) -> AgentMcpToolSession | None:
+        if not repository_evidence_requested(event):
+            return None
+        gateway, _ = self.runtime_for(principal)
+        return AgentMcpToolSession.discover(
+            gateway,
+            project_id=project_id,
+            event=event,
+        )
+
+
+def build_provider_mcp_router(
+    principal_for: PrincipalFor,
+    runtime_registry: ProviderMcpRuntimeRegistry | None = None,
+) -> APIRouter:
     """Human-controlled MCP provider connections scoped to one trusted principal.
 
     This surface is intentionally separate from the project-scoped ConnectedMcpGateway
@@ -82,8 +142,7 @@ def build_provider_mcp_router(principal_for: PrincipalFor) -> APIRouter:
     """
 
     router = APIRouter()
-    gateways: dict[str, ExternalMcpGateway] = {}
-    oauth_managers: dict[str, McpOAuthManager] = {}
+    runtime_registry = runtime_registry or ProviderMcpRuntimeRegistry()
     oauth_state_owners: dict[str, tuple[str, float]] = {}
     oauth_start_attempts: dict[str, list[float]] = {}
 
@@ -149,20 +208,10 @@ def build_provider_mcp_router(principal_for: PrincipalFor) -> APIRouter:
         )
 
     def runtime_for(principal: TrustedPrincipal) -> tuple[ExternalMcpGateway, McpOAuthManager]:
-        user_id = principal.user_id
-        gateway = gateways.get(user_id)
-        if gateway is None:
-            gateway = ExternalMcpGateway()
-            gateways[user_id] = gateway
-            oauth_managers[user_id] = McpOAuthManager(gateway)
-        return gateway, oauth_managers[user_id]
+        return runtime_registry.runtime_for(principal)
 
     def runtime_for_owner(user_id: str) -> tuple[ExternalMcpGateway, McpOAuthManager] | None:
-        gateway = gateways.get(user_id)
-        manager = oauth_managers.get(user_id)
-        if gateway is None or manager is None:
-            return None
-        return gateway, manager
+        return runtime_registry.runtime_for_owner(user_id)
 
     def oauth_redirect_uri(request: Request, provider_id: str) -> str:
         public_base = os.getenv("ARCHBRO_OAUTH_REDIRECT_BASE_URL", "").strip().rstrip("/")

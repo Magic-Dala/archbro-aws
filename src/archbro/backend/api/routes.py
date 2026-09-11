@@ -18,7 +18,10 @@ from archbro.backend.agent.context_manifest import (
 from archbro.backend.agent.node_context import StaleArchitectureVersionError
 from archbro.backend.agent.orchestration import AgentOrchestrator
 from archbro.backend.api.agent_surface import build_agent_surface_router
-from archbro.backend.api.provider_connections import build_provider_mcp_router
+from archbro.backend.api.provider_connections import (
+    ProviderMcpRuntimeRegistry,
+    build_provider_mcp_router,
+)
 from archbro.backend.core.canvas_reading import canvas_reading_views
 from archbro.backend.core.canvas_connection_summaries import canvas_connection_summaries
 from archbro.backend.core.canvas_budget import CanvasComplexityError, CanvasWorkBudget
@@ -33,6 +36,7 @@ from archbro.backend.core.authorization import (
     ProjectAuthorizationError,
     ProjectAuthorizer,
     ProjectPermission,
+    TrustedPrincipal,
     local_development_principal,
 )
 from archbro.backend.core.contracts import (
@@ -401,6 +405,7 @@ def build_router(
     *,
     goal_request_timeout_seconds: float = 30.0,
     principal_provider: PrincipalProvider | None = None,
+    provider_mcp_runtime: ProviderMcpRuntimeRegistry | None = None,
 ) -> APIRouter:
     """Build Jim-owned product/API routes against injected platform dependencies."""
 
@@ -410,6 +415,7 @@ def build_router(
     orchestrator = AgentOrchestrator(repository, provider)
     executor = ActionExecutor(repository)
     authorizer = ProjectAuthorizer()
+    provider_mcp_runtime = provider_mcp_runtime or ProviderMcpRuntimeRegistry()
     router = APIRouter()
     canvas_projection_cache: dict[str, dict[str, Any]] = {}
     canvas_projection_builds: dict[str, asyncio.Task[dict[str, Any]]] = {}
@@ -659,8 +665,9 @@ def build_router(
         http_request: Request,
         project_id: str,
         permission: ProjectPermission,
+        principal: TrustedPrincipal | None = None,
     ) -> Project:
-        principal = await principal_for(http_request)
+        principal = principal or await principal_for(http_request)
         try:
             project = repository.get_project(project_id)
         except KeyError:
@@ -789,7 +796,13 @@ def build_router(
 
     @router.post("/projects/{project_id}/events")
     async def post_event(project_id: str, request: EventRequest, http_request: Request):
-        await authorized_project(http_request, project_id, ProjectPermission.WRITE)
+        principal = await principal_for(http_request)
+        await authorized_project(
+            http_request,
+            project_id,
+            ProjectPermission.WRITE,
+            principal=principal,
+        )
         payload = dict(request.payload)
         context_fields_present = any(
             field in payload
@@ -831,8 +844,16 @@ def build_router(
             occurred_at=request.occurred_at,
             payload=payload,
         )
+        external_tools = None
+        if event.type == ProjectEventType.USER_MESSAGE:
+            external_tools = await run_in_threadpool(
+                provider_mcp_runtime.agent_tool_session,
+                principal,
+                project_id=project_id,
+                event=event,
+            )
         try:
-            return await orchestrator.observe_event(event)
+            return await orchestrator.observe_event(event, external_tools=external_tools)
         except KeyError:
             raise HTTPException(status_code=404, detail="project not found")
         except ObservationInProgressError as exc:
@@ -1215,5 +1236,10 @@ def build_router(
             raise HTTPException(status_code=409, detail=str(exc))
 
     router.include_router(build_agent_surface_router(repository, authorized_project))
-    router.include_router(build_provider_mcp_router(principal_for))
+    router.include_router(
+        build_provider_mcp_router(
+            principal_for,
+            runtime_registry=provider_mcp_runtime,
+        )
+    )
     return router

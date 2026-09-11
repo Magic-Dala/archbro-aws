@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -35,5 +35,27 @@ class ModelProvider(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support goal drafting")
 
     @abstractmethod
-    async def generate(self, *, event: ProjectEvent, context: ProjectContext, system_prompt: str) -> AgentDecision:
+    async def generate(
+        self,
+        *,
+        event: ProjectEvent,
+        context: ProjectContext,
+        system_prompt: str,
+    ) -> AgentDecision:
         raise NotImplementedError
+
+    async def generate_with_external_tools(
+        self,
+        *,
+        event: ProjectEvent,
+        context: ProjectContext,
+        system_prompt: str,
+        external_tools: Any,
+    ) -> AgentDecision:
+        """Optional tool-aware entry point; providers remain backward compatible."""
+
+        return await self.generate(
+            event=event,
+            context=context,
+            system_prompt=system_prompt,
+        )

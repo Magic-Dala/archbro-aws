@@ -10,7 +10,7 @@ from uuid import uuid4
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
@@ -146,6 +146,7 @@ def _compact_context_facts(
     context: ProjectContext,
     *,
     agent_context_manifest: dict[str, object] | None = None,
+    external_tool_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Project durable state into bounded semantic facts for the model."""
 
@@ -166,8 +167,11 @@ def _compact_context_facts(
         # before execution. The manifest already contains bounded project facts;
         # do not append raw Goal/description, full Architecture, or all tasks or
         # the visual context boundary would be cosmetic rather than real.
-        return {"agent_context_manifest": agent_context_manifest}
-    return {
+        compact: dict[str, object] = {"agent_context_manifest": agent_context_manifest}
+        if external_tool_context:
+            compact["connected_external_tools"] = external_tool_context
+        return compact
+    compact = {
         "project": project_facts,
         "architecture": context.architecture.model_dump(mode="json", exclude_none=True),
         "tasks": [
@@ -188,6 +192,9 @@ def _compact_context_facts(
         ],
         "recent_notes": [note[:1000] for note in context.recent_notes[-8:]],
     }
+    if external_tool_context:
+        compact["connected_external_tools"] = external_tool_context
+    return compact
 
 
 def _compact_event_facts(event: ProjectEvent) -> dict[str, object]:
@@ -757,7 +764,7 @@ class GeminiProvider(ModelProvider):
             return factory.transport
         return "gateway" if getattr(self, "_base_url", None) else "google"
 
-    def _build_agent(self, model_id: str):
+    def _build_agent(self, model_id: str, *, tools: list[Any] | None = None):
         from strands import Agent
         from strands.models.gemini import GeminiModel
 
@@ -773,7 +780,10 @@ class GeminiProvider(ModelProvider):
                 model_id=model_id,
                 params={"temperature": 0.1, "max_output_tokens": 4096},
             )
-            agent = Agent(model=model, callback_handler=None)
+            if tools:
+                agent = Agent(model=model, tools=tools, callback_handler=None)
+            else:
+                agent = Agent(model=model, callback_handler=None)
         except Exception:
             try:
                 client.close()
@@ -782,7 +792,9 @@ class GeminiProvider(ModelProvider):
             raise
         return _ManagedStrandsAgent(agent=agent, client=client)
 
-    def _agent_for(self, model_id: str):
+    def _agent_for(self, model_id: str, *, tools: list[Any] | None = None):
+        if tools:
+            return self._build_agent(model_id, tools=tools)
         return self._build_agent(model_id)
 
     @staticmethod
@@ -908,10 +920,24 @@ class GeminiProvider(ModelProvider):
             cache_write_input_tokens=self._usage_int(usage, "cacheWriteInputTokens"),
         )
 
-    async def _invoke(self, model_id: str, prompt: str) -> GeminiDecisionWire:
+    async def _invoke(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        tools: list[Any] | None = None,
+    ) -> GeminiDecisionWire:
         self.last_usage = None
         started_at = time.perf_counter()
-        result = await self._agent_for(model_id).invoke_async(prompt, structured_output_model=GeminiDecisionWire)
+        agent = (
+            self._agent_for(model_id)
+            if not tools
+            else self._agent_for(model_id, tools=tools)
+        )
+        result = await agent.invoke_async(
+            prompt,
+            structured_output_model=GeminiDecisionWire,
+        )
         self._record_usage(model_id, result, started_at)
         if result.structured_output is None:
             raise RuntimeError("Strands returned no structured GeminiDecisionWire")
@@ -1958,7 +1984,43 @@ class GeminiProvider(ModelProvider):
             evaluation=wire.evaluation,
         )
 
-    async def generate(self, *, event: ProjectEvent, context: ProjectContext, system_prompt: str) -> AgentDecision:
+    async def generate(
+        self,
+        *,
+        event: ProjectEvent,
+        context: ProjectContext,
+        system_prompt: str,
+    ) -> AgentDecision:
+        return await self._generate(
+            event=event,
+            context=context,
+            system_prompt=system_prompt,
+            external_tools=None,
+        )
+
+    async def generate_with_external_tools(
+        self,
+        *,
+        event: ProjectEvent,
+        context: ProjectContext,
+        system_prompt: str,
+        external_tools: Any,
+    ) -> AgentDecision:
+        return await self._generate(
+            event=event,
+            context=context,
+            system_prompt=system_prompt,
+            external_tools=external_tools,
+        )
+
+    async def _generate(
+        self,
+        *,
+        event: ProjectEvent,
+        context: ProjectContext,
+        system_prompt: str,
+        external_tools: Any | None,
+    ) -> AgentDecision:
         self._begin_invocation_metadata()
         is_routine_update = event.type == ProjectEventType.TASK_UPDATED
         is_bootstrap = (
@@ -1973,6 +2035,15 @@ class GeminiProvider(ModelProvider):
 
         raw_manifest = event.payload.get("agent_context_manifest")
         agent_context_manifest = raw_manifest if isinstance(raw_manifest, dict) else None
+        external_tool_context: dict[str, object] | None = None
+        tool_prompt = ""
+        agent_tools: list[Any] = []
+        if external_tools is not None:
+            facts = external_tools.context_facts()
+            if isinstance(facts, dict):
+                external_tool_context = facts
+            tool_prompt = str(external_tools.prompt_context()).strip()
+            agent_tools = list(external_tools.strands_tools())
         prompt = (
             system_prompt
             + "\n\nPROJECT CONTEXT (bounded JSON):\n"
@@ -1980,10 +2051,12 @@ class GeminiProvider(ModelProvider):
                 _compact_context_facts(
                     context,
                     agent_context_manifest=agent_context_manifest,
+                    external_tool_context=external_tool_context,
                 )
             )
             + "\n\nOBSERVED EVENT:\n"
             + _compact_json(_compact_event_facts(event))
+            + ("\n\n" + tool_prompt if tool_prompt else "")
         )
         candidate_chain = self.routine_model_chain if is_routine_update else self.model_chain
         per_model_timeout = (
@@ -1999,6 +2072,7 @@ class GeminiProvider(ModelProvider):
         started = time.perf_counter()
         unavailable: list[str] = []
         timed_out: list[str] = []
+        verification_missed: list[str] = []
         last_unavailable: Exception | None = None
 
         for candidate in candidate_chain:
@@ -2007,10 +2081,54 @@ class GeminiProvider(ModelProvider):
                 break
             self.last_model_id = candidate
             try:
+                successful_calls_before = (
+                    int(getattr(external_tools, "successful_call_count", 0))
+                    if external_tools is not None
+                    else 0
+                )
                 wire = await asyncio.wait_for(
-                    self._invoke(candidate, prompt),
+                    (
+                        self._invoke(candidate, prompt)
+                        if not agent_tools
+                        else self._invoke(candidate, prompt, tools=agent_tools)
+                    ),
                     timeout=min(per_model_timeout, remaining),
                 )
+                verification_required = bool(
+                    external_tools is not None
+                    and getattr(external_tools, "requires_successful_call", False)
+                )
+                successful_calls_after = (
+                    int(getattr(external_tools, "successful_call_count", 0))
+                    if external_tools is not None
+                    else 0
+                )
+                if (
+                    verification_required
+                    and successful_calls_after <= successful_calls_before
+                ):
+                    retry_remaining = total_timeout - (time.perf_counter() - started)
+                    if retry_remaining > 0:
+                        retry_prompt = (
+                            prompt
+                            + "\n\nREQUIRED VERIFICATION RETRY:\n"
+                            + "Your previous response did not call GitHub MCP. The user explicitly requested repository verification. "
+                            + "Call at least one supplied GitHub read-only tool now, inspect its returned evidence, then return the structured decision. "
+                            + "NO_ACTION may describe state mutation only; it must not replace the evidence answer in summary."
+                        )
+                        wire = await asyncio.wait_for(
+                            self._invoke(candidate, retry_prompt, tools=agent_tools),
+                            timeout=min(per_model_timeout, retry_remaining),
+                        )
+                        successful_calls_after = int(
+                            getattr(external_tools, "successful_call_count", 0)
+                        )
+                    if successful_calls_after <= successful_calls_before:
+                        verification_missed.append(candidate)
+                        last_unavailable = RuntimeError(
+                            f"{candidate} returned without the required GitHub MCP verification call"
+                        )
+                        continue
                 return self._to_domain_decision(wire, event=event, context=context)
             except TimeoutError as exc:
                 timed_out.append(candidate)
@@ -2027,6 +2145,10 @@ class GeminiProvider(ModelProvider):
             details.append("timed out: " + ", ".join(timed_out))
         if unavailable:
             details.append("503 unavailable: " + ", ".join(unavailable))
+        if verification_missed:
+            details.append(
+                "required GitHub MCP call missing: " + ", ".join(verification_missed)
+            )
         models = ", ".join(candidate_chain)
         reason = "; ".join(details) or "overall reasoning deadline reached"
         raise RuntimeError(
