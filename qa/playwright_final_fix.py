@@ -944,7 +944,7 @@ def case_notifications_and_context(browser: Browser) -> None:
     identity = "email:attention@example.com"
     context, page, errors = open_page(browser, backend, identity=identity, project_id="alpha")
     with diagnostic_scope(context.close):
-        assert page.locator("#needsCount").inner_text() == "2 items"
+        assert page.locator("#needsCount").inner_text() == "2 items need you ↗"
         page.locator("#newProjectBtn").click()
         page.locator("#newProjectName").fill("Temporary context review")
         page.locator("#newProjectNameDialog button[type='submit']").click()
@@ -975,6 +975,52 @@ def case_notifications_and_context(browser: Browser) -> None:
         page.locator("#notificationMenu").wait_for(state="visible")
         assert "no longer available" in page.locator("#notificationList").inner_text().lower()
         page.wait_for_function("() => document.activeElement?.textContent.includes('no longer available')")
+        assert not errors, errors
+
+
+def case_overview_navigation_and_attention(browser: Browser) -> None:
+    backend = FakeBackend([project("overview", "Overview Project")])
+    backend.contexts["overview"]["tasks"] = [
+        task("overview", "task-ready", "Prepare release notes", "TODO"),
+        task("overview", "task-blocked", "Choose deployment provider", "BLOCKED"),
+    ]
+    backend.contexts["overview"]["proposals"] = [proposal("overview", "proposal-overview")]
+    identity = "email:overview@example.com"
+    context, page, errors = open_page(browser, backend, identity=identity, project_id="overview")
+    with diagnostic_scope(context.close):
+        assert page.locator("#view-overview").evaluate("node => node.classList.contains('active')")
+        assert page.locator("#needsCount").inner_text() == "2 items need you ↗"
+        assert page.locator("#readyCount").inner_text() == "1 ready task ↗"
+
+        section_order = page.locator("#view-overview .overview-section").evaluate_all(
+            "nodes => nodes.map(node => [...node.classList].find(name => name.startsWith('overview-') && name !== 'overview-section'))"
+        )
+        assert section_order == [
+            "overview-status",
+            "overview-goal",
+            "overview-review",
+            "overview-architecture",
+            "overview-next-tasks",
+            "overview-activity",
+        ]
+
+        # Remember Review, return to Overview, then prove every task-oriented Overview
+        # shortcut explicitly owns the Tasks tab rather than restoring that memory.
+        page.locator('[data-project-id="overview"] [data-project-view="tasks"]').click()
+        page.locator("#workspaceTabReview").click()
+        assert page.locator("#workspaceTabReview").get_attribute("aria-selected") == "true"
+        page.locator('[data-project-id="overview"] [data-project-view="overview"]').click()
+        page.locator("#view-overview").wait_for(state="visible")
+        history_before = page.evaluate("() => history.length")
+        page.locator("#readySummary").click()
+        page.locator("#workspaceTabTasksPanel").wait_for(state="visible")
+        assert page.locator("#workspaceTabTasks").get_attribute("aria-selected") == "true"
+        assert page.evaluate("() => window.ArchBroWebBridge.getCommittedNavigation().workspace_tab") == "tasks"
+        assert page.evaluate("() => history.length") == history_before + 1
+
+        page.locator('[data-project-id="overview"] [data-project-view="overview"]').click()
+        page.locator("#architectureSummaryButton").click()
+        assert page.locator("#view-architecture").evaluate("node => node.classList.contains('active')")
         assert not errors, errors
 
 
@@ -2181,7 +2227,7 @@ def case_autonomous_surface_sweep(browser: Browser) -> None:
         backend.contexts["sweep"]["proposals"] = [proposal("sweep", "proposal-review")]
         page.reload(wait_until="networkidle")
         page.locator("#workspace").wait_for(state="visible")
-        assert page.locator("#needsCount").inner_text() == "1 item"
+        assert page.locator("#needsCount").inner_text() == "1 item needs you ↗"
         page.locator("#notificationBtn").click()
         page.locator("#notificationMenu").wait_for(state="visible")
         assert page.locator('[data-attention-kind="proposal"]').is_visible()
@@ -2384,6 +2430,7 @@ CASES = [
     ("logout_reset", case_logout_reset),
     ("transactional_project_selection", case_transactional_project_selection),
     ("notifications_and_context", case_notifications_and_context),
+    ("overview_navigation_and_attention", case_overview_navigation_and_attention),
     ("keyboard_and_mobile_layers", case_keyboard_and_mobile_layers),
     ("task_architecture_navigation", case_task_architecture_navigation),
     ("architecture_inspector_disclosure", case_architecture_inspector_disclosure),

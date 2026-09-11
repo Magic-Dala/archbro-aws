@@ -390,8 +390,14 @@ def test_web_surface_is_served_from_same_app(dsn):
     assert "Edit project" in js.text
     assert "Rename project" in js.text
     assert "Delete project" in js.text
-    assert "data-go-card=\"architecture\"" in page.text
-    assert "architecture-entry" in page.text
+    # Overview uses one explicit Architecture action instead of making the
+    # whole section a nested persistent link. This keeps navigation ownership
+    # singular and prevents repeated render wiring from stacking history writes.
+    assert 'id="architectureSummaryButton"' in page.text
+    assert 'data-go="architecture"' in page.text
+    assert 'data-go-card="architecture"' not in page.text
+    assert "overview-architecture" in page.text
+    assert 'id="overviewArchitectureMap"' in page.text
     assert "document.querySelectorAll('[data-go-card]')" in js.text
     assert "if (name === 'architecture') renderGraph();" in js.text
     assert "deleteCurrentProject" in js.text

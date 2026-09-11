@@ -11,12 +11,13 @@ import {
 } from './firebase-auth.js?v=854f576b09bf4d69';
 import {
   bindProposalDecisionControls,
+  formatOverviewAttentionLabel,
   formatTaskEnum,
   isProposalActionable,
   reconcileWorkspaceSelection,
   resolveTaskDependencies,
   taskInstructionContext,
-} from './review-helpers.js?v=854be06a4562dd3b';
+} from './review-helpers.js?v=4430a4040cec2ad3';
 
 const prototype = window.ArchbroPrototype;
 const URL_PARAMS = new URLSearchParams(window.location.search);
@@ -1110,6 +1111,42 @@ function renderArchitectureSnapshot(snapshot) {
   const edges = graph.edges.map((edge) => `<path data-snapshot-edge="${escapeHtml(edge.id)}" d="${graphPathData(edge.points)}"/>`).join('');
   const nodes = graph.nodes.map((node) => `<g class="snapshot-node" data-snapshot-node="${escapeHtml(node.id)}"><rect x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="12"/><text x="${node.x + node.width / 2}" y="${node.y + node.height / 2 + 3}" text-anchor="middle">${escapeHtml(node.label || node.component_id || 'Area')}</text></g>`).join('');
   return `<div class="project-snapshot project-snapshot-architecture" role="img" aria-label="Living Architecture root snapshot version ${escapeHtml(architecture.version)}"><span class="snapshot-label">LIVING ARCHITECTURE · v${escapeHtml(architecture.version)}</span><svg viewBox="0 0 ${graph.width} ${graph.height}" preserveAspectRatio="xMidYMid meet" aria-hidden="true"><g class="snapshot-edges">${edges}</g>${nodes}</svg></div>`;
+}
+
+
+function goalExcerpt(goal = '', maxLength = 180) {
+  const normalized = String(goal || '').replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) return normalized;
+  const clipped = normalized.slice(0, maxLength + 1).replace(/\s+\S*$/, '').trim();
+  return `${clipped || normalized.slice(0, maxLength).trim()}…`;
+}
+
+function overviewArchitectureState({architecture = {}, pending = [], diagram = null, diagramError = '', resource = {}} = {}) {
+  if (Number(architecture.version || 0) < 1 || !architecture.components?.length) {
+    return {key: 'initial', label: 'AWAITING ARCHITECTURE', summaryLabel: 'Architecture pending'};
+  }
+  if (pending.length) return {key: 'review', label: 'NEEDS REVIEW', summaryLabel: 'Needs review'};
+  if (resource.status === 'loading') return {key: 'loading', label: 'LOADING MAP', summaryLabel: 'Loading map'};
+  if (resource.status === 'error' || diagramError) return {key: 'unavailable', label: 'MAP UNAVAILABLE', summaryLabel: 'Map unavailable'};
+  if (!diagram?.nodes?.length) return {key: 'unavailable', label: 'MAP UNAVAILABLE', summaryLabel: 'Map unavailable'};
+  return {key: 'aligned', label: 'ALIGNED', summaryLabel: 'Aligned'};
+}
+
+function renderOverviewArchitectureMap(diagram, architecture, {pending = [], diagramError = '', resource = {}} = {}) {
+  const architectureState = overviewArchitectureState({architecture, pending, diagram, diagramError, resource});
+  if (architectureState.key === 'loading') {
+    return '<div class="overview-map-state" role="status"><strong>Loading the living architecture map…</strong><p>The accepted architecture is ready; its positioned overview is loading.</p></div>';
+  }
+  if (architectureState.key === 'unavailable') {
+    return `<div class="overview-map-state" role="status"><strong>Living architecture map unavailable</strong><p>${escapeHtml(diagramError || 'Open Living Architecture to retry the positioned map.')}</p><button class="link-btn" data-go="architecture" type="button">Open Living Architecture ↗</button></div>`;
+  }
+  if (architectureState.key === 'initial') {
+    return '<div class="overview-map-state"><strong>Living architecture is not available yet.</strong><p>Generate Architecture v1 to see its accepted map.</p></div>';
+  }
+  if (!diagram?.nodes?.length) {
+    return '<div class="overview-map-state"><strong>No map projection is available.</strong><p>Open Living Architecture to inspect the complete system.</p><button class="link-btn" data-go="architecture" type="button">Open Living Architecture ↗</button></div>';
+  }
+  return `<div class="overview-map-render overview-snapshot">${renderArchitectureSnapshot({architecture, rootDiagram: diagram})}</div>`;
 }
 
 function projectCardStatus(project, architecture) {
@@ -2776,42 +2813,78 @@ function render() {
   $('workspaceHome').classList.add('hidden');
   $('workspaceSwitcherBtn').removeAttribute('aria-current');
   renderProjectTree();
+
+  const projectGoal = String(state.project.goal || '').trim();
   $('welcomeTitle').textContent = state.project.name;
-  $('goalText').textContent = state.project.goal;
-  $('projectStatus').textContent = state.project.status;
+  $('overviewGoalExcerpt').textContent = goalExcerpt(projectGoal) || 'No Goal has been supplied.';
+  $('overviewGoalFull').textContent = projectGoal || 'No Goal has been supplied.';
+  $('projectStatus').textContent = formatTaskEnum(state.project.status, 'Active');
   const activeView = views[state.currentView] ? state.currentView : 'overview';
   state.currentView = activeView;
   $('pageTitle').textContent = views[activeView].title;
   $('pageSubtitle').textContent = views[activeView].subtitle;
 
-  const awaiting = state.architecture.version === 0;
+  const awaiting = Number(state.architecture?.version || 0) === 0;
   $('bootstrapPanel').classList.toggle('hidden', !awaiting);
   $('globalAgentDock').classList.toggle('hidden', awaiting);
-  $('bootstrapGoal').textContent = state.project.goal;
+  $('bootstrapGoal').textContent = projectGoal;
 
-  const ready = state.tasks.filter((t) => t.status === 'TODO' && (t.owner === 'HUMAN' || t.owner === 'UNASSIGNED'));
-  const running = state.tasks.filter((t) => t.status === 'IN_PROGRESS');
-  const pending = state.proposals.filter((p) => isProposalActionable(p, state.architecture));
-  const needsYou = prototype.deriveNeedsYou(state.proposals, state.tasks, prototype.currentProfile(localStorage)?.notifications, state.architecture?.version);
+  const ready = state.tasks.filter((task) => task.status === 'TODO' && (task.owner === 'HUMAN' || task.owner === 'UNASSIGNED'));
+  const running = state.tasks.filter((task) => task.status === 'IN_PROGRESS');
+  const pending = state.proposals.filter((proposal) => isProposalActionable(proposal, state.architecture));
+  const needsYou = prototype.deriveNeedsYou(
+    state.proposals,
+    state.tasks,
+    prototype.currentProfile(localStorage)?.notifications,
+    state.architecture?.version,
+  );
 
-  $('readyCount').textContent = `${ready.length} ready task${ready.length === 1 ? '' : 's'}`;
-  $('readySub').textContent = ready[0]?.title || (awaiting ? 'Architecture generation pending' : 'No actionable human task yet');
-  $('runningCount').textContent = `${running.length} in progress`;
-  $('archVersion').textContent = `Version ${state.architecture.version}`;
-  $('archState').textContent = state.architecture.components.length ? 'Machine-readable source of truth' : 'Goal saved; Architecture v1 pending';
-  $('needsCount').textContent = `${needsYou.length} item${needsYou.length === 1 ? '' : 's'}`;
+  $('readyCount').textContent = `${ready.length} ready task${ready.length === 1 ? '' : 's'} ↗`;
+  $('runningCount').textContent = `${running.length} in progress ↗`;
+  $('needsCount').textContent = formatOverviewAttentionLabel(needsYou.length);
+  const needsSummary = $('needsSummary');
+  needsSummary.classList.toggle('hidden', needsYou.length === 0);
+  needsSummary.setAttribute('aria-label', formatOverviewAttentionLabel(needsYou.length).replace(' ↗', ''));
+  needsSummary.onclick = needsYou.length
+    ? () => void openAttentionItem(needsYou[0].kind, needsYou[0].id)
+    : null;
+
   $('graphVersion').textContent = `v${state.diagram?.architectureVersion ?? state.architecture.version}`;
-  $('graphReviewState').textContent = pending.length ? `${pending.length} item${pending.length === 1 ? '' : 's'} need review` : 'Aligned';
-
-  const aligned = state.architecture.components.length && !pending.length;
-  const alignmentFill=$('alignmentFill');
-  alignmentFill.classList.toggle('is-pending', Boolean(state.architecture.components.length && pending.length));
-  alignmentFill.classList.toggle('is-aligned', Boolean(state.architecture.components.length && !pending.length));
-  $('alignmentText').textContent = state.architecture.components.length ? (aligned ? 'Aligned' : 'Review required') : 'Awaiting initial architecture';
+  $('graphReviewState').textContent = pending.length
+    ? `${pending.length} item${pending.length === 1 ? '' : 's'} need review`
+    : 'Aligned';
   $('architectureSummary').textContent = state.architecture.summary || 'No architecture generated yet.';
-  $('overviewMessage').textContent = awaiting ? 'The Goal is saved. Architecture generation needs to complete before normal project updates begin.' : pending.length ? 'One architecture decision needs your review.' : 'The current architecture has no pending approval boundary.';
+  $('overviewMessage').textContent = awaiting
+    ? 'The Goal is saved. Architecture generation needs to complete before normal project updates begin.'
+    : pending.length
+      ? `${pending.length} architecture decision${pending.length === 1 ? '' : 's'} need your review.`
+      : 'The current architecture has no pending approval boundary.';
 
-  document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+  const canvasResource = state.workspaceAsync?.resources?.canvas || {};
+  const architectureState = overviewArchitectureState({
+    architecture: state.architecture,
+    pending,
+    diagram: state.diagram,
+    diagramError: state.diagramError,
+    resource: canvasResource,
+  });
+  $('archVersion').textContent = state.architecture.version
+    ? `${architectureState.summaryLabel} · v${state.architecture.version} ↗`
+    : `${architectureState.summaryLabel} ↗`;
+  const architectureStatePill = $('architectureStatePill');
+  architectureStatePill.textContent = architectureState.label;
+  architectureStatePill.className = `status-pill architecture-state-pill ${architectureState.key}`;
+  $('archVersionLabel').textContent = state.architecture.version
+    ? `Accepted architecture · v${state.architecture.version}`
+    : 'Accepted architecture · pending';
+  $('overviewArchitectureMap').innerHTML = renderOverviewArchitectureMap(state.diagram, state.architecture, {
+    pending,
+    diagramError: state.diagramError,
+    resource: canvasResource,
+  });
+  wireGoButtons();
+
+  document.querySelectorAll('.view').forEach((view) => view.classList.remove('active'));
   $(`view-${activeView}`).classList.add('active');
 
   renderWorkspaceTabs();
@@ -5503,17 +5576,29 @@ function renderRecentActivity() {
   el.innerHTML = events.map((event) => {
     const source = event.payload?.external_source || event.source || 'SYSTEM';
     const summary = event.payload?.summary || event.payload?.message || event.payload?.note || event.type;
-    return `<div class="activity-row"><span class="status-pill">${escapeHtml(source)}</span><div><strong>${escapeHtml(event.type)}</strong><p>${escapeHtml(summary)}</p></div></div>`;
+    const eventTitle = String(event.type || 'Project update')
+      .replace(/[_-]+/g, ' ')
+      .toLowerCase()
+      .replace(/^\w/, (character) => character.toUpperCase());
+    const detailPayload = event.payload && typeof event.payload === 'object'
+      ? JSON.stringify(event.payload, null, 2)
+      : String(event.payload || '');
+    return `<article class="activity-row"><div class="activity-row-summary"><strong>${escapeHtml(eventTitle)}</strong><p>${escapeHtml(source)} · ${escapeHtml(goalExcerpt(summary, 96))}</p></div><details class="activity-details"><summary>View details <span aria-hidden="true">＋</span></summary><div class="activity-detail-body"><p>${escapeHtml(summary)}</p>${detailPayload ? `<pre>${escapeHtml(detailPayload)}</pre>` : ''}</div></details></article>`;
   }).join('');
 }
 
 function renderLastRun() {
+  const el = $('lastRun');
+  if (!el) return;
   if (!state.lastRun) {
-    $('lastRun').innerHTML = '<p class="muted">No event processed in this browser session.</p>';
+    el.innerHTML = '';
     return;
   }
   const ok = state.lastRun.result === 'SUCCESS';
-  $('lastRun').innerHTML = `<p><strong>${escapeHtml(state.lastRun.summary)}</strong></p><p class="muted">${escapeHtml(state.lastRun.provider)} · ${escapeHtml(state.lastRun.model)} · ${state.lastRun.actions.length} action${state.lastRun.actions.length === 1 ? '' : 's'} · ${ok ? 'SUCCESS' : 'ERROR'}</p>${state.lastRun.error ? `<p class="muted">${escapeHtml(state.lastRun.error)}</p>` : ''}`;
+  const actions = Array.isArray(state.lastRun.actions) ? state.lastRun.actions : [];
+  const details = JSON.stringify(state.lastRun, null, 2);
+  const summary = state.lastRun.summary || state.lastRun.error || 'Latest agent result';
+  el.innerHTML = `<article class="activity-row activity-last-run"><div class="activity-row-summary"><strong>${escapeHtml(goalExcerpt(summary, 96))}</strong><p>${escapeHtml(state.lastRun.provider || 'Agent')} · Latest result</p></div><details class="activity-details"><summary>View result <span aria-hidden="true">＋</span></summary><div class="activity-detail-body"><p class="muted">${ok ? 'SUCCESS' : 'ERROR'} · ${actions.length} action${actions.length === 1 ? '' : 's'} · ${escapeHtml(state.lastRun.model || 'deterministic')}</p>${state.lastRun.error ? `<p class="activity-error">${escapeHtml(state.lastRun.error)}</p>` : ''}<pre>${escapeHtml(details)}</pre></div></details></article>`;
 }
 
 function renderGlobalAgentReply() {
@@ -5974,19 +6059,27 @@ function switchView(name, {
   return true;
 }
 
+function goTargetOptions(element, viewName) {
+  const workspaceTab = element?.dataset?.workspaceTabTarget;
+  if (viewName === 'tasks' && workspaceTabNames.includes(workspaceTab)) return {workspaceTab};
+  return {};
+}
+
 function wireGoButtons() {
-  document.querySelectorAll('[data-go]').forEach((btn) => btn.onclick = () => switchView(btn.dataset.go));
+  document.querySelectorAll('[data-go]').forEach((button) => {
+    button.onclick = () => switchView(button.dataset.go, goTargetOptions(button, button.dataset.go));
+  });
   document.querySelectorAll('[data-go-card]').forEach((card) => {
-    const open = () => switchView(card.dataset.goCard);
-    card.addEventListener('click', (event) => {
+    const open = () => switchView(card.dataset.goCard, goTargetOptions(card, card.dataset.goCard));
+    card.onclick = (event) => {
       if (event.target.closest('button,a,input,textarea,select')) return;
       open();
-    });
-    card.addEventListener('keydown', (event) => {
+    };
+    card.onkeydown = (event) => {
       if (event.key !== 'Enter' && event.key !== ' ') return;
       event.preventDefault();
       open();
-    });
+    };
   });
 }
 

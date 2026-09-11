@@ -20,6 +20,14 @@ export function formatTaskEnum(value, fallback = 'Not provided') {
   return token.toLowerCase().replace(/(^|_)([a-z])/g, (_match, prefix, letter) => `${prefix ? ' ' : ''}${letter.toUpperCase()}`);
 }
 
+export function formatOverviewAttentionLabel(count) {
+  const numeric = Number(count);
+  const normalized = Number.isFinite(numeric) ? Math.max(0, Math.trunc(numeric)) : 0;
+  const item = normalized === 1 ? 'item' : 'items';
+  const verb = normalized === 1 ? 'needs' : 'need';
+  return `${normalized} ${item} ${verb} you ↗`;
+}
+
 export function resolveTaskDependencies(task = {}, tasks = []) {
   const byId = new Map((Array.isArray(tasks) ? tasks : []).map((item) => [String(item?.id || ''), item]));
   return (Array.isArray(task.dependencies) ? task.dependencies : []).map((rawId) => {
