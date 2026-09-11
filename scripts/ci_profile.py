@@ -71,6 +71,7 @@ PYTEST_PATTERNS = {
         "tests/test_diagram_*.py",
         "tests/test_drift_*.py",
         "tests/test_gemini_fallback.py",
+        "tests/test_google_genai_client.py",
         "tests/test_hierarchical_planner.py",
         "tests/test_initial_relationship_reconciliation.py",
         "tests/test_observation_trace.py",

@@ -27,6 +27,20 @@ from conftest import requires_database
 pytestmark = requires_database
 
 
+def _live_gemini_configured() -> bool:
+    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        return True
+    use_vertex_ai = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower()
+    return (
+        use_vertex_ai in {"1", "true", "yes", "on"}
+        and bool(os.getenv("GOOGLE_CLOUD_PROJECT", "").strip())
+    )
+
+
+LIVE_GEMINI_CONFIGURED = _live_gemini_configured()
+LIVE_GEMINI_SKIP_REASON = "Gemini API key or Vertex AI ADC configuration not set"
+
+
 
 class _CountingGeminiProvider(GeminiProvider):
     def __init__(self, *args, **kwargs):
@@ -49,7 +63,7 @@ def _github_change(summary: str, commit_sha: str) -> dict:
     }
 
 
-@pytest.mark.skipif(not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")), reason="Gemini API key not set")
+@pytest.mark.skipif(not LIVE_GEMINI_CONFIGURED, reason=LIVE_GEMINI_SKIP_REASON)
 def test_real_gemini_goal_and_ask_merge_to_architecture_flow(dsn):
     provider = GeminiProvider(model_id=os.getenv("GEMINI_TEST_MODEL", "gemini-3.5-flash-lite"))
     current_goal = (
@@ -102,7 +116,7 @@ def test_real_gemini_goal_and_ask_merge_to_architecture_flow(dsn):
     assert repo.list_proposals(project.id) == []
 
 
-@pytest.mark.skipif(not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")), reason="Gemini API key not set")
+@pytest.mark.skipif(not LIVE_GEMINI_CONFIGURED, reason=LIVE_GEMINI_SKIP_REASON)
 def test_real_gemini_drift_evaluation_proposes_without_mutating_accepted_architecture(dsn):
     repo = PostgresProjectRepository(dsn)
     project = Project(
@@ -147,7 +161,7 @@ def test_real_gemini_drift_evaluation_proposes_without_mutating_accepted_archite
     assert repo.get_architecture(project.id).find_component("database").name == "PostgreSQL"
 
 
-@pytest.mark.skipif(not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")), reason="Gemini API key not set")
+@pytest.mark.skipif(not LIVE_GEMINI_CONFIGURED, reason=LIVE_GEMINI_SKIP_REASON)
 def test_real_gemini_m5_acceptance_reconciles_architecture_and_execution_tasks(dsn):
     repo = PostgresProjectRepository(dsn)
     project = Project(
@@ -226,7 +240,7 @@ def test_real_gemini_m5_acceptance_reconciles_architecture_and_execution_tasks(d
     assert migration_tasks[0].acceptance_criteria
 
 
-@pytest.mark.skipif(not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")), reason="Gemini API key not set")
+@pytest.mark.skipif(not LIVE_GEMINI_CONFIGURED, reason=LIVE_GEMINI_SKIP_REASON)
 def test_real_gemini_m5_rejection_preserves_accepted_architecture_and_tasks(dsn):
     repo = PostgresProjectRepository(dsn)
     project = Project(
@@ -287,7 +301,7 @@ def test_real_gemini_m5_rejection_preserves_accepted_architecture_and_tasks(dsn)
     assert len(repo.list_tasks(project.id)) == 1
 
 
-@pytest.mark.skipif(not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")), reason="Gemini API key not set")
+@pytest.mark.skipif(not LIVE_GEMINI_CONFIGURED, reason=LIVE_GEMINI_SKIP_REASON)
 def test_real_gemini_aligned_external_observation_is_durable_without_architecture_churn(dsn):
     repo = PostgresProjectRepository(dsn)
     project = Project(
@@ -336,7 +350,7 @@ def test_real_gemini_aligned_external_observation_is_durable_without_architectur
     assert runs[0].event_id == repo.list_events(project.id)[0].id
 
 
-@pytest.mark.skipif(not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")), reason="Gemini API key not set")
+@pytest.mark.skipif(not LIVE_GEMINI_CONFIGURED, reason=LIVE_GEMINI_SKIP_REASON)
 def test_real_gemini_external_drift_links_real_evidence_and_replays_exactly_once(dsn):
     repo = PostgresProjectRepository(dsn)
     project = Project(
@@ -397,7 +411,7 @@ def test_real_gemini_external_drift_links_real_evidence_and_replays_exactly_once
     assert len(repo.list_proposals(project.id)) == 1
 
 
-@pytest.mark.skipif(not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")), reason="Gemini API key not set")
+@pytest.mark.skipif(not LIVE_GEMINI_CONFIGURED, reason=LIVE_GEMINI_SKIP_REASON)
 def test_real_gemini_untrusted_external_instruction_does_not_override_project_state(dsn):
     repo = PostgresProjectRepository(dsn)
     project = Project(

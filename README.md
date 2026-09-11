@@ -180,9 +180,14 @@ After starting Uvicorn on port `8011`, use the normal local product surface. Ena
 `.env` is loaded automatically.
 
 ```env
-GEMINI_API_KEY=...
+# Vertex AI with Application Default Credentials:
+GOOGLE_GENAI_USE_VERTEXAI=true
+GOOGLE_CLOUD_PROJECT=your-google-cloud-project
+GOOGLE_CLOUD_LOCATION=global
+GEMINI_API_KEY=
+GOOGLE_API_KEY=
 GEMINI_MODEL=gemini-3.8-flash
-# Optional custom Gemini-compatible gateway:
+# Optional Developer-API-compatible gateway (Vertex AI must be false):
 # GEMINI_BASE_URL=http://127.0.0.1:8080/gemini
 # GEMINI_API_KEY=...
 # Optional measured planner override, otherwise GEMINI_MODEL is used:
@@ -197,6 +202,15 @@ ARCHBRO_FIREBASE_AUTH_DOMAIN=
 ARCHBRO_FIREBASE_APP_ID=
 ARCHBRO_GOAL_REQUEST_TIMEOUT_SECONDS=30
 ```
+
+With Vertex AI enabled, both the built-in Strands Agent and the hierarchical
+architecture planner receive invocation-scoped, preconfigured Google Gen AI
+clients backed by ADC. On GCE, grant the attached runtime service account
+`roles/aiplatform.user`; do not download a service-account key or set
+`GOOGLE_APPLICATION_CREDENTIALS`. For local ADC use `gcloud auth
+application-default login`. To retain Developer API or gateway mode, set
+`GOOGLE_GENAI_USE_VERTEXAI=false` and configure one of `GEMINI_API_KEY` or
+`GOOGLE_API_KEY`.
 
 For deterministic WebMCP acceptance without built-in model calls:
 

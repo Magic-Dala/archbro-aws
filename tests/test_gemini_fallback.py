@@ -136,6 +136,7 @@ def test_temporary_unavailable_classifier_accepts_installed_google_genai_server_
 
 
 def test_provider_uses_custom_gateway_transport_when_configured(monkeypatch):
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
     monkeypatch.setenv("GEMINI_BASE_URL", "http://127.0.0.1:8080/gemini/")
     monkeypatch.setenv("GEMINI_API_KEY", "gateway-test-key")
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
@@ -148,8 +149,8 @@ def test_provider_uses_custom_gateway_transport_when_configured(monkeypatch):
 
 
 def test_provider_accepts_existing_google_gemini_base_url_for_gateway(monkeypatch):
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
     monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "http://host.docker.internal:8080/gemini/")
     monkeypatch.setenv("GOOGLE_API_KEY", "existing-gateway-key")
@@ -158,6 +159,124 @@ def test_provider_accepts_existing_google_gemini_base_url_for_gateway(monkeypatc
 
     assert provider._base_url == "http://host.docker.internal:8080/gemini"
     assert provider._api_key == "existing-gateway-key"
+
+
+def test_provider_accepts_vertex_adc_without_an_api_key(monkeypatch):
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "magic-dala")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+    monkeypatch.delenv("GOOGLE_GEMINI_BASE_URL", raising=False)
+
+    provider = GeminiProvider()
+
+    assert provider._api_key is None
+    assert provider._base_url is None
+    assert provider._google_client_factory.use_vertex_ai is True
+    assert provider._transport_name() == "vertex"
+
+
+def test_strands_agent_uses_prebuilt_client_and_closes_it(monkeypatch):
+    import strands
+    import strands.models.gemini as strands_gemini
+
+    captured: dict[str, object] = {}
+
+    class FakeAio:
+        async def aclose(self):
+            captured["closed"] = int(captured.get("closed", 0)) + 1
+
+    class FakeClient:
+        def __init__(self):
+            self.aio = FakeAio()
+
+        def close(self):
+            captured["sync_closed"] = True
+
+    client = FakeClient()
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            captured["http_timeout_ms"] = http_timeout_ms
+            return client
+
+    class FakeGeminiModel:
+        def __init__(self, *, client, model_id, params):
+            captured["client"] = client
+            captured["model_id"] = model_id
+            captured["params"] = params
+
+    class FakeAgent:
+        def __init__(self, *, model, callback_handler):
+            captured["model"] = model
+            captured["callback_handler"] = callback_handler
+
+        async def invoke_async(self, prompt, **kwargs):
+            captured["prompt"] = prompt
+            return "completed"
+
+    monkeypatch.setattr(strands, "Agent", FakeAgent)
+    monkeypatch.setattr(strands_gemini, "GeminiModel", FakeGeminiModel)
+    monkeypatch.setenv("GEMINI_HTTP_TIMEOUT_MS", "4321")
+
+    provider = object.__new__(GeminiProvider)
+    provider._google_client_factory = FakeFactory()
+    managed_agent = provider._build_agent("gemini-test")
+
+    result = asyncio.run(managed_agent.invoke_async("hello"))
+
+    assert result == "completed"
+    assert captured["client"] is client
+    assert captured["model_id"] == "gemini-test"
+    assert captured["http_timeout_ms"] == 4321
+    assert captured["closed"] == 1
+    assert "sync_closed" not in captured
+
+
+def test_client_cleanup_failure_does_not_mask_the_provider_error(monkeypatch):
+    import strands
+    import strands.models.gemini as strands_gemini
+
+    class FakeAio:
+        async def aclose(self):
+            raise RuntimeError("cleanup transport detail")
+
+    class FakeClient:
+        aio = FakeAio()
+
+        def close(self):
+            pass
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            return FakeClient()
+
+    class FakeGeminiModel:
+        def __init__(self, *, client, model_id, params):
+            pass
+
+    class FakeAgent:
+        def __init__(self, *, model, callback_handler):
+            pass
+
+        async def invoke_async(self, prompt, **kwargs):
+            raise RuntimeError("503 UNAVAILABLE: original provider failure")
+
+    monkeypatch.setattr(strands, "Agent", FakeAgent)
+    monkeypatch.setattr(strands_gemini, "GeminiModel", FakeGeminiModel)
+
+    provider = object.__new__(GeminiProvider)
+    provider._google_client_factory = FakeFactory()
+    managed_agent = provider._build_agent("gemini-test")
+
+    with pytest.raises(RuntimeError, match="original provider failure"):
+        asyncio.run(managed_agent.invoke_async("hello"))
 
 
 def test_system_map_model_override_only_affects_system_map_phase():

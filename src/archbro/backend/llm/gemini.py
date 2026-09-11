@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 from uuid import uuid4
@@ -32,9 +33,11 @@ from archbro.backend.core.contracts import (
 from archbro.backend.core.evaluation import DriftEvaluation
 from archbro.backend.core.architecture_validation import validate_architecture_relationship_connectivity
 from archbro.backend.core.repository import ProjectRepositoryPort
+from archbro.backend.llm.google_genai_client import GoogleGenAIClientFactory
 from archbro.backend.llm.provider import GoalConversationMessage, GoalDraft, ModelProvider
 
 load_dotenv()
+logger = logging.getLogger("archbro")
 
 
 DEFAULT_GEMINI_CHAIN = (
@@ -75,6 +78,32 @@ class GeminiUsageTelemetry:
     total_tokens: int | None
     cache_read_input_tokens: int | None
     cache_write_input_tokens: int | None
+
+
+async def _close_google_client(client) -> None:
+    """Best-effort cleanup must never replace the provider's real outcome."""
+
+    try:
+        await client.aio.aclose()
+    except Exception:
+        # Close failures can otherwise mask the model/provider exception that
+        # drives retry and fail-closed classification. Do not log exception text:
+        # an SDK transport error can contain endpoint or credential metadata.
+        logger.warning("Google Gen AI client cleanup failed")
+
+
+class _ManagedStrandsAgent:
+    """Keep one preconfigured Google client alive for one Strands invocation."""
+
+    def __init__(self, *, agent, client) -> None:
+        self._agent = agent
+        self._client = client
+
+    async def invoke_async(self, *args, **kwargs):
+        try:
+            return await self._agent.invoke_async(*args, **kwargs)
+        finally:
+            await _close_google_client(self._client)
 
 
 def _compact_json(value: object) -> str:
@@ -608,17 +637,11 @@ class GeminiProvider(ModelProvider):
             for candidate in (item.strip() for item in bootstrap_fallbacks.split(","))
             if candidate and candidate != self.model_id
         )
-        configured_base_url = (
-            os.getenv("GEMINI_BASE_URL", "").strip()
-            or os.getenv("GOOGLE_GEMINI_BASE_URL", "").strip()
-        )
-        self._base_url = configured_base_url.rstrip("/") or None
-        self._api_key = (
-            os.getenv("GEMINI_API_KEY")
-            or os.getenv("GOOGLE_API_KEY")
-        )
-        if not self._api_key:
-            raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is not set")
+        self._google_client_factory = GoogleGenAIClientFactory.from_env()
+        # Compatibility attributes remain available for existing diagnostics and
+        # object-level unit fixtures. Vertex mode deliberately carries no API key.
+        self._base_url = self._google_client_factory.base_url
+        self._api_key = self._google_client_factory.api_key
         # Strands Agent instances are invocation-scoped. Reusing one Agent across HTTP
         # requests raises ConcurrencyException because concurrent invocations are unsupported.
 
@@ -694,29 +717,48 @@ class GeminiProvider(ModelProvider):
             return self.bootstrap_model_chain
         return (preferred, *(model_id for model_id in self.bootstrap_model_chain if model_id != preferred))
 
+    def _client_factory_for_invocation(self) -> GoogleGenAIClientFactory:
+        factory = getattr(self, "_google_client_factory", None)
+        if factory is None:
+            # Some focused tests construct the provider without __init__. Preserve
+            # their legacy API-key transport while production uses from_env().
+            factory = GoogleGenAIClientFactory.for_developer_api(
+                api_key=getattr(self, "_api_key", None),
+                base_url=getattr(self, "_base_url", None),
+            )
+            self._google_client_factory = factory
+        return factory
+
+    def _transport_name(self) -> str:
+        factory = getattr(self, "_google_client_factory", None)
+        if factory is not None:
+            return factory.transport
+        return "gateway" if getattr(self, "_base_url", None) else "google"
+
     def _build_agent(self, model_id: str):
-        from google.genai import types as genai_types
         from strands import Agent
         from strands.models.gemini import GeminiModel
 
         http_timeout_ms = int(os.getenv("GEMINI_HTTP_TIMEOUT_MS", "12000"))
         if http_timeout_ms <= 0:
             raise ValueError("GEMINI_HTTP_TIMEOUT_MS must be greater than zero")
-        http_options = {
-            "timeout": http_timeout_ms,
-            "retry_options": genai_types.HttpRetryOptions(attempts=1),
-        }
-        if self._base_url:
-            http_options["base_url"] = self._base_url
-        model = GeminiModel(
-            client_args={
-                "api_key": self._api_key,
-                "http_options": genai_types.HttpOptions(**http_options),
-            },
-            model_id=model_id,
-            params={"temperature": 0.1, "max_output_tokens": 4096},
+        client = self._client_factory_for_invocation().create_client(
+            http_timeout_ms=http_timeout_ms
         )
-        return Agent(model=model, callback_handler=None)
+        try:
+            model = GeminiModel(
+                client=client,
+                model_id=model_id,
+                params={"temperature": 0.1, "max_output_tokens": 4096},
+            )
+            agent = Agent(model=model, callback_handler=None)
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+            raise
+        return _ManagedStrandsAgent(agent=agent, client=client)
 
     def _agent_for(self, model_id: str):
         return self._build_agent(model_id)
@@ -835,7 +877,7 @@ class GeminiProvider(ModelProvider):
             return
         self.last_usage = GeminiUsageTelemetry(
             model_id=model_id,
-            transport="gateway" if self._base_url else "google",
+            transport=self._transport_name(),
             latency_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
             input_tokens=self._usage_int(usage, "inputTokens"),
             output_tokens=self._usage_int(usage, "outputTokens"),
@@ -1000,7 +1042,6 @@ class GeminiProvider(ModelProvider):
         expected_scope_id: str | None = None,
         reconcile: bool = False,
     ):
-        from google import genai
         from google.genai import types as genai_types
 
         http_timeout_ms = int(
@@ -1011,15 +1052,8 @@ class GeminiProvider(ModelProvider):
         )
         if http_timeout_ms <= 0:
             raise ValueError("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS must be greater than zero")
-        http_options: dict[str, object] = {
-            "timeout": http_timeout_ms,
-            "retry_options": genai_types.HttpRetryOptions(attempts=1),
-        }
-        if self._base_url:
-            http_options["base_url"] = self._base_url
-        client = genai.Client(
-            api_key=self._api_key,
-            http_options=genai_types.HttpOptions(**http_options),
+        client = self._client_factory_for_invocation().create_client(
+            http_timeout_ms=http_timeout_ms
         )
         started_at = time.perf_counter()
         invocation = self._current_invocation_metadata()
@@ -1045,7 +1079,7 @@ class GeminiProvider(ModelProvider):
                 ),
             )
         finally:
-            await client.aio.aclose()
+            await _close_google_client(client)
 
         candidates = response.candidates or []
         if not candidates:
@@ -1064,7 +1098,7 @@ class GeminiProvider(ModelProvider):
             "response_id": response.response_id,
             "usage": usage,
             "latency_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
-            "transport": "gateway" if self._base_url else "google",
+            "transport": self._transport_name(),
             "thinking_level": self.architecture_thinking_level,
             "response_reprocessable": finish_reason == "STOP",
         }

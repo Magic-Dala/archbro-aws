@@ -1,8 +1,10 @@
 # Infrastructure
 
 What runs where, why it is set up this way, and how to rebuild it. Nothing here
-is a secret: tokens live in `.env` files on the VM (mode 600, root-owned) and in
-Cloudflare, never in this repository.
+is a secret: provider tokens that are still required live in `.env` files on the
+VM (mode 600, root-owned) and in Cloudflare, never in this repository. The
+production Gemini target is Vertex AI through the VM's Application Default
+Credentials instead of a stored API key.
 
 ## Overview
 
@@ -29,12 +31,22 @@ can open a connection to the application except through Cloudflare.
 | Artifact Registry | project deployment-image repository | Deployment images |
 | Workload Identity Pool | `github`, provider `github` | Lets GitHub Actions authenticate without a stored key |
 | Service account | deployment service account | The identity Actions assumes |
+| Runtime service account | attached to `magicdala` | ADC identity for Vertex AI and Firebase verification |
 
 **Deployer roles**, one per thing it actually does:
 
 - `artifactregistry.writer` — push images
 - `compute.osAdminLogin` — SSH to the VM to run the deploy
 - `iam.serviceAccountUser` — required to SSH to a VM that has a service account
+
+**Runtime role**:
+
+- `roles/aiplatform.user` — lets the VM's attached service account call Gemini
+  through Vertex AI without an API key or downloaded credential file
+
+The project must have `aiplatform.googleapis.com` enabled. Do not set
+`GOOGLE_APPLICATION_CREDENTIALS` on the VM; the container reaches the GCE
+metadata server and receives short-lived credentials for the attached identity.
 
 **The OIDC provider is restricted** to `assertion.repository_owner == 'Magic-Dala'`,
 and the service account can only be impersonated by `Magic-Dala/archbro`. Another
@@ -70,6 +82,25 @@ stack is externally reachable too, so it cannot use the deterministic
 `local-demo` principal without collapsing provider OAuth sessions across users.
 Mixed or incomplete configurations are rejected before the app container is
 recreated.
+
+Every deployed stack should use the same keyless Gemini transport:
+
+```env
+GOOGLE_GENAI_USE_VERTEXAI=true
+GOOGLE_CLOUD_PROJECT=magic-dala
+GOOGLE_CLOUD_LOCATION=global
+GEMINI_API_KEY=
+GOOGLE_API_KEY=
+GEMINI_MODEL=gemini-3.8-flash
+```
+
+The shared Google Gen AI client factory applies this identity to both the
+Strands Agent and the hierarchical architecture planner. API-key mode remains
+available for local Developer API or custom-gateway testing, but is not the
+production credential path.
+Merging the source migration alone does not switch a running stack: activate it
+only after the runtime service account has the Vertex role and that stack's
+hand-managed `.env` contains the Vertex settings above.
 
 First-party provider OAuth transient state is process-local. Deployed provider
 OAuth therefore runs as a single application worker. The runtime guard checks
@@ -154,7 +185,9 @@ deploy rather than held on the machine.
 ## Rebuilding from nothing
 
 1. Create the GCE instance; set `enable-oslogin=TRUE`; install Docker and the
-   Compose plugin; `docker network create archbro-edge`
+   Compose plugin; `docker network create archbro-edge`; enable
+   `aiplatform.googleapis.com`; grant the attached runtime service account
+   `roles/aiplatform.user`
 2. Create the Artifact Registry repository and apply the cleanup policy
 3. Create the Workload Identity Pool and OIDC provider, restricted to the
    repository owner; create the deployer service account with the three roles
@@ -164,8 +197,9 @@ deploy rather than held on the machine.
    the VM with the tunnel token in its `.env`
 5. Point each hostname at its tunnel with a proxied CNAME
 6. For dev: create the Access application and policy, and enable One-time PIN
-7. Place `.env` in `/opt/archbro/main` and `/opt/archbro/dev` by hand
-8. Push to `main` or `dev`
+7. Place `.env` in `/opt/archbro/main`, `/opt/archbro/dev`, and
+   `/opt/archbro/dev2` by hand
+8. Push to `main`, `dev`, or `dev2`
 
 ## Firebase
 

@@ -663,6 +663,68 @@ def test_real_planner_transport_builds_schema_disables_sdk_retry_and_parses_resp
     assert http_options.retry_options.attempts == 1
 
 
+def test_planner_uses_the_provider_client_factory(monkeypatch):
+    provider = _provider()
+    provider._begin_invocation_metadata()
+    captured: dict[str, object] = {}
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            output = GeminiSystemMapWire(
+                summary="Factory transport contract",
+                roots=_roots(),
+            ).model_dump_json()
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="STOP",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text=output, thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=None,
+                model_version="gemini-factory-test",
+                response_id="response-factory-1",
+            )
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+        async def aclose(self):
+            captured["closed"] = True
+
+    class FakeClient:
+        def __init__(self):
+            self.aio = FakeAio()
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            captured["http_timeout_ms"] = http_timeout_ms
+            return FakeClient()
+
+    provider._google_client_factory = FakeFactory()
+    monkeypatch.delenv("GEMINI_ARCHITECTURE_HTTP_TIMEOUT_MS", raising=False)
+
+    result = asyncio.run(
+        provider._invoke_planner_structured(
+            "gemini-factory",
+            "SYSTEM_MAP factory test",
+            GeminiSystemMapWire,
+        )
+    )
+
+    assert result.summary == "Factory transport contract"
+    assert captured["http_timeout_ms"] == 500
+    assert captured["closed"] is True
+    metadata = provider._current_invocation_metadata()
+    assert metadata is not None
+    assert metadata["planner_response"]["transport"] == "vertex"
+
+
 def test_retryable_503_checkpoint_can_retry_without_relaxing_unknown_timeout_boundary():
     store = _CheckpointStore()
     provider = _provider()
