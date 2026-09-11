@@ -604,7 +604,8 @@ def test_scope_id_parser_preserves_dotted_server_owned_id():
     assert GeminiProvider._scope_id_from_prompt(prompt) == "api.gateway"
 
 
-def test_real_planner_transport_builds_schema_disables_sdk_retry_and_parses_response(monkeypatch):
+@pytest.mark.parametrize("reconcile", [False, True])
+def test_real_planner_transport_builds_schema_disables_sdk_retry_and_parses_response(monkeypatch, reconcile):
     from google import genai
 
     provider = _provider()
@@ -616,9 +617,9 @@ def test_real_planner_transport_builds_schema_disables_sdk_retry_and_parses_resp
             captured["model"] = model
             captured["contents"] = contents
             captured["config"] = config
-            output = GeminiSystemMapWire(
-                summary="Transport contract",
-                roots=_roots(),
+            output = (
+                GeminiReconcileWire(summary="Transport contract", tasks=[TaskProposal(title="Implement counter")])
+                if reconcile else GeminiSystemMapWire(summary="Transport contract", roots=_roots())
             ).model_dump_json()
             return SimpleNamespace(
                 candidates=[
@@ -650,17 +651,29 @@ def test_real_planner_transport_builds_schema_disables_sdk_retry_and_parses_resp
         provider._invoke_planner_structured(
             "gemini-transport",
             "SYSTEM_MAP transport test",
-            GeminiSystemMapWire,
+            GeminiReconcileWire if reconcile else GeminiSystemMapWire,
         )
     )
 
     assert result.summary == "Transport contract"
     assert captured["model"] == "gemini-transport"
     config = captured["config"]
-    assert config.response_json_schema == GeminiSystemMapWire.model_json_schema()
+    expected_schema = (GeminiReconcileWire if reconcile else GeminiSystemMapWire).model_json_schema()
+    if reconcile:
+        assert expected_schema["properties"]["relationships"].pop("maxItems") == 80
+    assert config.response_json_schema == expected_schema
     assert "$defs" in json.dumps(config.response_json_schema)
     http_options = captured["http_options"]
     assert http_options.retry_options.attempts == 1
+
+
+def test_reconcile_still_rejects_more_than_80_relationships():
+    relationship = {"source": "counter_ui", "target": "counter_state", "relationship_type": "uses"}
+    payload = {"relationships": [relationship] * 80, "tasks": [{"title": "Implement counter"}]}
+    assert len(GeminiReconcileWire.model_validate(payload).relationships) == 80
+    payload["relationships"].append(relationship)
+    with pytest.raises(ValidationError, match="at most 80"):
+        GeminiReconcileWire.model_validate(payload)
 
 
 def test_planner_uses_the_provider_client_factory(monkeypatch):

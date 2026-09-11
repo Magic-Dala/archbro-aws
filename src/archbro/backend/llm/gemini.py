@@ -1066,6 +1066,13 @@ class GeminiProvider(ModelProvider):
     ):
         from google.genai import types as genai_types
 
+        response_schema = output_model.model_json_schema()
+        if output_model is GeminiReconcileWire:
+            # Vertex rejects the reconciliation schema when the large relationship
+            # array bound expands its structured-output grammar. Keep the 80-edge
+            # limit in Pydantic validation after generation, before any mutation.
+            response_schema["properties"]["relationships"].pop("maxItems", None)
+
         http_timeout_ms = self._effective_architecture_http_timeout_ms()
         client = self._client_factory_for_invocation().create_client(
             http_timeout_ms=http_timeout_ms
@@ -1093,7 +1100,7 @@ class GeminiProvider(ModelProvider):
                     temperature=0.1,
                     max_output_tokens=self.architecture_max_output_tokens,
                     response_mime_type="application/json",
-                    response_json_schema=output_model.model_json_schema(),
+                    response_json_schema=response_schema,
                     thinking_config=genai_types.ThinkingConfig(
                         thinking_level=self.architecture_thinking_level,
                         include_thoughts=False,
