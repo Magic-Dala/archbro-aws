@@ -317,10 +317,10 @@ function readNavigationRoute(locationLike = window.location, {useStorageFallback
   return {projectId, explicitProject, view, canvas, nodeId, inspectorTab, workspaceTab};
 }
 
-function beginNavigationTransition(projectId = state.projectId) {
+function beginNavigationTransition(projectId = state.projectId, {invalidateGraph = true} = {}) {
   if (typeof projectRepositoryController !== 'undefined') projectRepositoryController?.close();
   state.navigation.generation += 1;
-  state.graphTransitionGeneration += 1;
+  if (invalidateGraph) state.graphTransitionGeneration += 1;
   // Advancing navigation immediately hides work owned by the previous project.
   // The request itself keeps its token and will retire only that token when it
   // eventually settles, so it cannot clear a newer project's indicator.
@@ -545,7 +545,9 @@ function switchWorkspaceTab(tabName, {
     return true;
   }
   const changed = state.workspaceTab !== tabName;
-  const guard = navigationGuard || (changed ? beginNavigationTransition(state.projectId) : captureNavigationGuard(state.projectId));
+  const guard = navigationGuard || (changed
+    ? beginNavigationTransition(state.projectId, {invalidateGraph:false})
+    : captureNavigationGuard(state.projectId));
   if (!navigationGenerationIsCurrent(guard)) return false;
   rememberWorkspaceTabScroll(state.workspaceTab);
   applyWorkspaceTabInvariants(tabName, {focusedProposalId});
@@ -1412,6 +1414,14 @@ async function commitInlineRename(projectId) {
   }
 }
 
+async function activateProjectView(projectId, view, {historyMode = 'push'} = {}) {
+  if (!projectId || !ROUTED_VIEWS.has(view)) return false;
+  if (projectId !== state.projectId || !state.project) {
+    return selectProject(projectId, {view, historyMode});
+  }
+  return switchView(view, {historyMode});
+}
+
 function wireProjectTree() {
   const cancelInlineRename = (projectId) => {
     state.renamingProjectId = null;
@@ -1422,7 +1432,7 @@ function wireProjectTree() {
     const projectId = node.dataset.projectId;
     node.querySelector('[data-project-toggle]')?.addEventListener('click', () => toggleProjectExpanded(projectId));
     node.querySelector('[data-project-open]')?.addEventListener('click', async () => {
-      if (await selectProject(projectId)) closeMobileSidebar();
+      if (await activateProjectView(projectId, 'overview')) closeMobileSidebar();
     });
     node.querySelector('[data-project-menu]')?.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -1482,8 +1492,7 @@ function wireProjectTree() {
       }
     });
     node.querySelectorAll('[data-project-view]').forEach((button) => button.addEventListener('click', async () => {
-      if (projectId !== state.projectId && !(await selectProject(projectId))) return;
-      switchView(button.dataset.projectView);
+      if (!(await activateProjectView(projectId, button.dataset.projectView))) return;
       closeMobileSidebar();
     }));
   });
@@ -6203,7 +6212,8 @@ function switchView(name, {
 } = {}) {
   if (state.onboarding.active) return false;
   if (!views[name]) return false;
-  const guard = navigationGuard || beginNavigationTransition(state.projectId);
+  const invalidateGraph = state.currentView === 'architecture' && name !== 'architecture';
+  const guard = navigationGuard || beginNavigationTransition(state.projectId, {invalidateGraph});
   if (!navigationGenerationIsCurrent(guard)) return false;
   if (name === 'tasks') {
     const nextWorkspaceTab = workspaceTabNames.includes(workspaceTab) ? workspaceTab : workspaceTabForProject();
@@ -7604,8 +7614,9 @@ window.ArchBroWebBridge = {
   async focusItem({kind, id = null} = {}) {
     webMcpRequireProject();
     if (kind === 'project') {
-      if (id && id !== state.projectId) await selectProject(id);
-      switchView('overview');
+      if (!(await activateProjectView(id || state.projectId, 'overview'))) {
+        throw new Error(`Project could not be focused: ${id || state.projectId}`);
+      }
     } else if (kind === 'task') {
       const task = state.tasks.find((item) => item.id === id);
       if (!task) throw new Error(`Task not found: ${id}`);
