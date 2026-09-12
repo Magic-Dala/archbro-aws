@@ -375,6 +375,62 @@ def test_workspace_bootstrap_exposes_truncated_phase_as_bounded_retry(dsn):
     }
 
 
+def test_workspace_bootstrap_requires_authorization_after_failed_reconcile_repair(dsn):
+    repo, client = make_client(dsn)
+    project = client.post(
+        "/projects",
+        json={
+            "name": "Repair Required Planner",
+            "goal": "Retry only reconciliation after a complete invalid response.",
+        },
+    ).json()
+    checkpoint = repo.put_planner_checkpoint(
+        project_id=project["id"],
+        plan_id="plan-api-repair-required",
+        phase_key="RECONCILE_REPAIR:1",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-api-repair-required",
+            "project_id": project["id"],
+            "phase_key": "RECONCILE_REPAIR:1",
+            "attempt_id": "attempt-repair-required",
+            "delivery_stage": "RESPONSE_RECORDED",
+            "status": "REPAIR_REQUIRED",
+            "validation": {
+                "status": "REPAIR_REQUIRED",
+                "error_type": "ValueError",
+                "message": "RECONCILE left architecture leaves isolated",
+            },
+            "provider": {
+                "requested_model": "gemini-3.8-flash",
+                "finish_reason": "STOP",
+                "provider_response_received": True,
+                "response_reprocessable": True,
+            },
+            "validated_output": {
+                "status": "READY",
+                "summary": "Still disconnected",
+                "relationships": [],
+                "tasks": [{"title": "Build workflow"}],
+            },
+        },
+    )
+
+    response = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert response.status_code == 200
+    assert response.json()["planner_recovery"] == {
+        "plan_id": "plan-api-repair-required",
+        "phase_key": "RECONCILE_REPAIR:1",
+        "attempt_id": "attempt-repair-required",
+        "revision": checkpoint["revision"],
+        "status": "REPAIR_REQUIRED",
+        "delivery_stage": "RESPONSE_RECORDED",
+        "action": "AUTHORIZE_NEW_ATTEMPT",
+        "requires_paid_call_confirmation": True,
+        "known_validation_failure": True,
+    }
+
+
 def test_workspace_bootstrap_migrates_legacy_unknown_429_to_a_safe_new_plan(dsn):
     repo, client = make_client(dsn)
     project = client.post(

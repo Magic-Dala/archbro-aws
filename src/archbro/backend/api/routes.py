@@ -64,6 +64,9 @@ from archbro.backend.core.diagram import (
 from archbro.backend.core.diagram_layout import layout_canvas_diagram, layout_diagram
 from archbro.backend.core.repository import ProjectRepositoryPort
 from archbro.backend.llm.provider import GoalConversationMessage, GoalDraft, ModelProvider
+from archbro.backend.llm.planner_recovery import (
+    is_legacy_explicit_429_checkpoint,
+)
 
 
 CANVAS_PROJECTION_ACTIVE_BUILD_LIMIT = 4
@@ -171,27 +174,15 @@ def _planner_recovery_descriptor(
             isinstance(provider, dict)
             and provider.get("retryable_generation") is True
         )
-        validation = checkpoint.get("validation")
-        validation_message = (
-            str(validation.get("message") or "")
-            if isinstance(validation, dict)
-            else ""
-        )
-        # v4 planner checkpoints predate structured provider-error metadata and
-        # incorrectly stored an explicit Google ClientError 429 as UNKNOWN.
-        # This narrow signature is enough to start the v5 plan without asking
-        # the user to authorize an already-rejected paid request. Ambiguous
-        # timeouts and connection failures retain the manual boundary.
-        legacy_explicit_429 = bool(
-            status == "UNKNOWN"
-            and delivery_stage == "IN_FLIGHT"
-            and isinstance(provider, dict)
-            and provider.get("error_type") == "ClientError"
-            and "429" in validation_message
-            and "RESOURCE_EXHAUSTED" in validation_message.upper()
-        )
+        legacy_explicit_429 = is_legacy_explicit_429_checkpoint(checkpoint)
         if status in {"RETRYABLE", "REPROCESSABLE"}:
             action: str | None = "RETRY_EVENT"
+        elif status == "REPAIR_REQUIRED":
+            action = (
+                "AUTHORIZE_NEW_ATTEMPT"
+                if phase_key.startswith("RECONCILE_REPAIR:")
+                else "RETRY_EVENT"
+            )
         elif legacy_explicit_429:
             action = "START_NEW_PLAN"
         elif delivery_stage == "RESPONSE_RECORDED" and response_reprocessable:
@@ -219,6 +210,8 @@ def _planner_recovery_descriptor(
             descriptor["retryable_provider_error"] = True
         if retryable_generation:
             descriptor["retryable_generation"] = True
+        if status == "REPAIR_REQUIRED":
+            descriptor["known_validation_failure"] = True
         if isinstance(provider, dict):
             http_status_code = provider.get("http_status_code")
             if isinstance(http_status_code, int):

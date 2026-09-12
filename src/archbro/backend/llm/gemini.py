@@ -37,6 +37,9 @@ from archbro.backend.core.evaluation import DriftEvaluation
 from archbro.backend.core.architecture_validation import validate_architecture_relationship_connectivity
 from archbro.backend.core.repository import ProjectRepositoryPort
 from archbro.backend.llm.google_genai_client import GoogleGenAIClientFactory
+from archbro.backend.llm.planner_recovery import (
+    has_ambiguous_paid_call_outcome,
+)
 from archbro.backend.llm.provider import GoalConversationMessage, GoalDraft, ModelProvider
 
 load_dotenv()
@@ -73,6 +76,8 @@ _RETRYABLE_PROVIDER_STATUSES = frozenset(
 _PROTECTED_PROVIDER_HTTP_CODES = frozenset({401, 403})
 _PROTECTED_PROVIDER_STATUSES = frozenset({"PERMISSION_DENIED", "UNAUTHENTICATED"})
 _PLANNER_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
+_CONFIRMED_PROJECT_BRIEF_MARKER = "\n\nCONFIRMED PROJECT BRIEF:\n"
+_PLANNER_PAID_CALL_SAFETY_SCAN_LIMIT = 2_147_483_647
 
 
 class _PlannerSafeRetryError(RuntimeError):
@@ -1456,6 +1461,16 @@ class GeminiProvider(ModelProvider):
             # array bound expands its structured-output grammar. Keep the 80-edge
             # limit in Pydantic validation after generation, before any mutation.
             response_schema["properties"]["relationships"].pop("maxItems", None)
+            # Defaults are convenient for local Python callers, but the provider
+            # schema must require these keys. Otherwise Vertex may return a clean
+            # STOP response with tasks but omit ``relationships`` entirely; Pydantic
+            # then silently supplies [], and deterministic connectivity validation
+            # can only reject the paid response after the fact.
+            required = list(response_schema.get("required") or [])
+            for field in ("relationships", "tasks"):
+                if field not in required:
+                    required.append(field)
+            response_schema["required"] = required
 
         invoke_name = self._planner_invoke_name_for_output_model(output_model)
         generation_config = self._planner_generation_config(
@@ -1872,9 +1887,40 @@ class GeminiProvider(ModelProvider):
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @classmethod
+    def _planner_brief_sha256_from_prompt(cls, prompt: str) -> str | None:
+        """Hash the server-owned Project Brief independently of prompt wording."""
+
+        if _CONFIRMED_PROJECT_BRIEF_MARKER not in prompt:
+            return None
+        raw_brief = prompt.rsplit(_CONFIRMED_PROJECT_BRIEF_MARKER, 1)[1].strip()
+        if not raw_brief:
+            return None
+        try:
+            brief: object = json.loads(raw_brief)
+        except json.JSONDecodeError:
+            brief = raw_brief
+        return cls._planner_payload_sha256(brief)
+
+    @classmethod
+    def _checkpoint_brief_sha256(
+        cls,
+        checkpoint: Mapping[str, object],
+    ) -> str | None:
+        persisted = checkpoint.get("brief_sha256")
+        if isinstance(persisted, str) and persisted:
+            return persisted
+        phase_input = checkpoint.get("input")
+        prompt = phase_input.get("prompt") if isinstance(phase_input, Mapping) else None
+        return (
+            cls._planner_brief_sha256_from_prompt(prompt)
+            if isinstance(prompt, str)
+            else None
+        )
+
     def _planner_plan_id(self, context: ProjectContext) -> str:
         identity = {
-            "planner_contract": "archbro.initial_planner.v5",
+            "planner_contract": "archbro.initial_planner.v6",
             "project_id": context.project.id,
             "brief": _bootstrap_project_facts(context),
             "model_id": self.model_id,
@@ -1952,6 +1998,7 @@ class GeminiProvider(ModelProvider):
                     "provider_response_received",
                     "retryable_provider_error",
                     "retryable_generation",
+                    "known_validation_failure",
                     "http_status_code",
                     "provider_status",
                     "retry_after_seconds",
@@ -2001,6 +2048,7 @@ class GeminiProvider(ModelProvider):
         identity = {
             "phase_key": phase_key,
             "prompt_sha256": prompt_sha256,
+            "brief_sha256": self._planner_brief_sha256_from_prompt(prompt),
             "snapshot_before_sha256": (
                 self._planner_payload_sha256(snapshot_payload)
                 if snapshot_payload is not None
@@ -2014,6 +2062,74 @@ class GeminiProvider(ModelProvider):
             **identity,
             "input_sha256": self._planner_payload_sha256(identity),
         }
+
+    @classmethod
+    def _find_ambiguous_prior_checkpoint(
+        cls,
+        repository: ProjectRepositoryPort,
+        *,
+        project_id: str,
+        current_plan_id: str,
+        phase_key: str | None,
+        identity: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Fence an UNKNOWN paid call even when a release changes plan ids.
+
+        Planner contract and generation-policy changes intentionally produce a
+        new plan id. They must not become a way to bypass an older ambiguous
+        dispatch for the same project brief and logical phase. A user must
+        explicitly authorize that older checkpoint first; an explicit legacy
+        429 is excluded by ``has_ambiguous_paid_call_outcome``.
+        """
+
+        list_checkpoints = getattr(repository, "list_planner_checkpoints", None)
+        if not callable(list_checkpoints):
+            return None
+        try:
+            # This is a paid-call safety fence, not a recent-activity view. A
+            # fixed small page (for example 100 rows) could let an older UNKNOWN
+            # dispatch fall out of view after enough planner revisions and then
+            # be replayed under a new contract. Ask the repository for the full
+            # practical PostgreSQL LIMIT range and fail closed on read errors.
+            candidates = list_checkpoints(
+                project_id,
+                limit=_PLANNER_PAID_CALL_SAFETY_SCAN_LIMIT,
+            )
+        except Exception:
+            logger.warning(
+                "Could not inspect prior planner checkpoints for project=%s phase=%s",
+                project_id,
+                phase_key or "<any>",
+                exc_info=True,
+            )
+            # Failing open here could duplicate an unknown paid request. Treat
+            # repository inspection failure as a hard planner error instead.
+            raise RuntimeError(
+                "could not verify prior planner paid-call state before dispatch"
+            )
+
+        current_brief = identity.get("brief_sha256")
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            if candidate.get("plan_id") == current_plan_id:
+                continue
+            if phase_key is not None and candidate.get("phase_key") != phase_key:
+                continue
+            if not has_ambiguous_paid_call_outcome(candidate):
+                continue
+            candidate_brief = cls._checkpoint_brief_sha256(candidate)
+            if (
+                isinstance(current_brief, str)
+                and isinstance(candidate_brief, str)
+                and candidate_brief != current_brief
+            ):
+                continue
+            # When an old checkpoint predates semantic brief hashes and its
+            # prompt cannot be decoded, fail closed rather than guessing that a
+            # new planner contract makes the ambiguous upstream call irrelevant.
+            return dict(candidate)
+        return None
 
     @staticmethod
     def _find_reusable_completed_checkpoint(
@@ -2029,16 +2145,19 @@ class GeminiProvider(ModelProvider):
         Generation policy is intentionally not part of this compatibility
         match. A previously accepted output remains safe to reuse when the
         exact prompt, accepted input snapshot, target phase, and requested
-        model are unchanged. This lets the v5 planner resume legacy v4 runs at
-        their first unfinished phase instead of paying to regenerate work that
-        was already durably validated.
+        model are unchanged. This lets a newer planner contract resume older
+        validated runs at their first unfinished phase instead of paying to
+        regenerate work that was already durably validated.
         """
 
         list_checkpoints = getattr(repository, "list_planner_checkpoints", None)
         if not callable(list_checkpoints):
             return None
         try:
-            candidates = list_checkpoints(project_id, limit=100)
+            candidates = list_checkpoints(
+                project_id,
+                limit=_PLANNER_PAID_CALL_SAFETY_SCAN_LIMIT,
+            )
         except Exception:
             logger.warning(
                 "Could not inspect legacy planner checkpoints for project=%s phase=%s",
@@ -2110,6 +2229,23 @@ class GeminiProvider(ModelProvider):
         existing = None
         if repository is not None:
             prior_checkpoint = repository.get_planner_checkpoint(plan_id, phase_key)
+            if prior_checkpoint is None:
+                ambiguous_prior = self._find_ambiguous_prior_checkpoint(
+                    repository,
+                    project_id=project_id,
+                    current_plan_id=plan_id,
+                    phase_key=phase_key,
+                    identity=identity,
+                )
+                if ambiguous_prior is not None:
+                    raise RuntimeError(
+                        f"planner phase {phase_key} has an ambiguous paid-call outcome "
+                        "in a prior planner contract; refusing automatic replay until "
+                        "that checkpoint is explicitly authorized; "
+                        f"plan_id={ambiguous_prior.get('plan_id')} "
+                        f"attempt_id={ambiguous_prior.get('attempt_id')} "
+                        f"revision={ambiguous_prior.get('revision')}"
+                    )
             if (
                 isinstance(prior_checkpoint, Mapping)
                 and prior_checkpoint.get("status") == "RETRYABLE"
@@ -2157,12 +2293,31 @@ class GeminiProvider(ModelProvider):
                 raise RuntimeError(
                     f"planner checkpoint identity mismatch for {phase_key}: {', '.join(mismatches)}"
                 )
-            if existing.get("status") == "REPROCESSABLE":
+            if existing.get("status") in {"REPROCESSABLE", "REPAIR_REQUIRED"}:
                 provider = existing.get("provider")
-                raw_output = provider.get("raw_model_output") if isinstance(provider, dict) else None
-                if not isinstance(raw_output, str) or not raw_output:
-                    raise RuntimeError(f"planner phase {phase_key} has no recorded response to reprocess")
-                result = self._parse_recorded_planner_output(invoke_name, prompt, output_model, raw_output)
+                if existing.get("status") == "REPAIR_REQUIRED":
+                    validated_output = existing.get("validated_output")
+                    if not isinstance(validated_output, dict):
+                        raise RuntimeError(
+                            f"planner phase {phase_key} is missing its provider-validated repair input"
+                        )
+                    result = output_model.model_validate(validated_output)
+                else:
+                    raw_output = (
+                        provider.get("raw_model_output")
+                        if isinstance(provider, dict)
+                        else None
+                    )
+                    if not isinstance(raw_output, str) or not raw_output:
+                        raise RuntimeError(
+                            f"planner phase {phase_key} has no recorded response to reprocess"
+                        )
+                    result = self._parse_recorded_planner_output(
+                        invoke_name,
+                        prompt,
+                        output_model,
+                        raw_output,
+                    )
                 snapshot_after = validate(result)
                 completed_checkpoint = {
                     **existing,
@@ -2278,6 +2433,7 @@ class GeminiProvider(ModelProvider):
                 ),
             }
         phase_result_returned = False
+        result = None
         try:
             result = await self._run_planner_phase(
                 invoke_name,
@@ -2356,7 +2512,29 @@ class GeminiProvider(ModelProvider):
                 not phase_result_returned
                 and provider_error.get("retryable_generation") is True
             )
-            if explicit_provider_rejection:
+            semantic_repair_required = bool(
+                phase_result_returned
+                and result is not None
+                and phase_key.startswith("RECONCILE")
+                and not isinstance(exc, ArchitectureNeedsFactError)
+                and delivery_stage == "RESPONSE_RECORDED"
+                and provider_error.get("provider_response_received") is True
+                and provider_error.get("response_reprocessable") is True
+            )
+            if semantic_repair_required:
+                # The upstream request completed and the provider-schema output
+                # was parsed, so this is not an ambiguous paid-call outcome.
+                # Preserve the typed response and let the planner issue at most
+                # one dedicated reconciliation repair call without regenerating
+                # topology phases.
+                retryable = False
+                failure_status = "REPAIR_REQUIRED"
+                if isinstance(provider_metadata, Mapping):
+                    provider_metadata = {
+                        **provider_metadata,
+                        "known_validation_failure": True,
+                    }
+            elif explicit_provider_rejection:
                 # A concrete HTTP/gRPC response proves the provider rejected
                 # the request and produced no model result. 429/408/5xx can be
                 # retried from the same durable phase; explicit permanent 4xx
@@ -2386,6 +2564,7 @@ class GeminiProvider(ModelProvider):
             validation_status = {
                 "UNKNOWN": "UNKNOWN",
                 "RETRYABLE": "RETRYABLE",
+                "REPAIR_REQUIRED": "REPAIR_REQUIRED",
                 "FAILED": "FAIL",
             }[failure_status]
             failed_checkpoint = {
@@ -2399,6 +2578,11 @@ class GeminiProvider(ModelProvider):
                 },
                 "provider": provider_metadata,
             }
+            if semantic_repair_required and result is not None:
+                failed_checkpoint["validated_output"] = result.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                )
             if repository is not None:
                 failed_checkpoint = self._persist_active_planner_checkpoint(failed_checkpoint)
             self._append_planner_phase_usage(failed_checkpoint, replayed_from_checkpoint=False)
@@ -2606,17 +2790,68 @@ class GeminiProvider(ModelProvider):
         system_summary: str,
     ) -> str:
         accepted = [component.model_dump(mode="json") for component in snapshot.components]
+        parent_ids = {
+            component.parent_id
+            for component in snapshot.components
+            if component.parent_id is not None
+        }
+        leaf_ids = [
+            component.id
+            for component in snapshot.components
+            if component.id not in parent_ids
+        ]
         return (
             "RECONCILE phase for ArchBro initial architecture. The topology below is immutable. Do not rename, reparent, replace, or emit topology nodes. "
             "Return only the final concise summary, authored relationships, 1-6 critical implementation tasks, and bounded decisions/assumptions/risks. "
+            "The JSON keys relationships and tasks are mandatory. READY with more than one leaf requires a non-empty relationships array. "
             "Every relationship endpoint and task.related_component must reference an accepted component ID. Do not create containment edges merely to restate hierarchy. "
             "Author enough genuine directed interactions to cover every leaf architecture component and connect the architecture's real end-to-end workflows. "
             "A leaf may be incoming-only when that is truthful (for example a data store), but no leaf may be isolated. Do not invent reciprocal edges merely for coverage. "
             "Use clear relationship directions from caller/producer toward callee/consumer, and avoid duplicate source/target/type relationships. "
             "If concrete missing/contradictory facts make truthful reconciliation impossible, return NEEDS_FACT and no reconciliation output."
             "\n\nSYSTEM MAP SUMMARY:\n" + system_summary
+            + "\n\nLEAF IDS REQUIRING INCIDENT RELATIONSHIPS:\n" + _compact_json(leaf_ids)
             + "\n\nIMMUTABLE TOPOLOGY JSON:\n" + _compact_json(accepted)
-            + "\n\nCONFIRMED PROJECT BRIEF:\n" + _compact_json(_bootstrap_project_facts(context))
+            + _CONFIRMED_PROJECT_BRIEF_MARKER + _compact_json(_bootstrap_project_facts(context))
+        )
+
+    @staticmethod
+    def _reconcile_repair_prompt(
+        *,
+        context: ProjectContext,
+        snapshot: InitialArchitecturePlannerSnapshot,
+        system_summary: str,
+        validation_error: str,
+        previous_output: object,
+    ) -> str:
+        accepted = [
+            component.model_dump(mode="json") for component in snapshot.components
+        ]
+        parent_ids = {
+            component.parent_id
+            for component in snapshot.components
+            if component.parent_id is not None
+        }
+        leaf_ids = [
+            component.id
+            for component in snapshot.components
+            if component.id not in parent_ids
+        ]
+        return (
+            "RECONCILE REPAIR phase for ArchBro initial architecture. A complete prior provider response failed deterministic validation. "
+            "Return a COMPLETE replacement reconciliation, not a patch and not commentary. The immutable topology must not change. "
+            "The JSON keys relationships and tasks are mandatory. Author truthful directed relationships so every listed leaf is incident and all leaves are weakly connected. "
+            "Do not add containment edges, self-links, duplicate source/target/type relationships, invented reciprocal edges, or endpoints outside the accepted IDs. "
+            "Return 1-6 critical implementation tasks and ensure every task.related_component references an accepted component."
+            "\n\nDETERMINISTIC VALIDATION ERROR TO FIX:\n" + validation_error[:1200]
+            + "\n\nPREVIOUS COMPLETE BUT INVALID RECONCILIATION:\n"
+            + _compact_json(previous_output)
+            + "\n\nSYSTEM MAP SUMMARY:\n" + system_summary
+            + "\n\nLEAF IDS REQUIRING INCIDENT RELATIONSHIPS:\n"
+            + _compact_json(leaf_ids)
+            + "\n\nIMMUTABLE TOPOLOGY JSON:\n" + _compact_json(accepted)
+            + _CONFIRMED_PROJECT_BRIEF_MARKER
+            + _compact_json(_bootstrap_project_facts(context))
         )
 
     @staticmethod
@@ -2633,6 +2868,29 @@ class GeminiProvider(ModelProvider):
     ) -> GeminiBootstrapWire:
         global_deadline = time.perf_counter() + self.architecture_total_timeout_seconds
         plan_id = self._planner_plan_id(context)
+        repository = getattr(self, "_checkpoint_repository", None)
+        if repository is not None:
+            ambiguous_prior = self._find_ambiguous_prior_checkpoint(
+                repository,
+                project_id=context.project.id,
+                current_plan_id=plan_id,
+                phase_key=None,
+                identity={
+                    "brief_sha256": self._planner_payload_sha256(
+                        _bootstrap_project_facts(context)
+                    )
+                },
+            )
+            if ambiguous_prior is not None:
+                raise RuntimeError(
+                    "initial architecture has an ambiguous paid-call outcome in a "
+                    "prior planner contract; refusing every new model dispatch until "
+                    "that checkpoint is explicitly authorized; "
+                    f"plan_id={ambiguous_prior.get('plan_id')} "
+                    f"phase_key={ambiguous_prior.get('phase_key')} "
+                    f"attempt_id={ambiguous_prior.get('attempt_id')} "
+                    f"revision={ambiguous_prior.get('revision')}"
+                )
 
         def validate_system_map(wire: GeminiSystemMapWire) -> dict[str, object]:
             self._require_ready(wire)
@@ -2719,22 +2977,64 @@ class GeminiProvider(ModelProvider):
                 raise ValueError("RECONCILE task.related_component must reference accepted topology")
             return self._validate_reconciled_architecture(candidate)
 
-        reconcile = await self._run_checkpointed_planner_phase(
-            plan_id=plan_id,
-            project_id=context.project.id,
-            phase_key="RECONCILE",
-            invoke_name="_invoke_reconcile",
-            prompt=self._reconcile_prompt(
-                event=event,
-                context=context,
-                snapshot=final_snapshot,
-                system_summary=system_map.summary,
-            ),
-            output_model=GeminiReconcileWire,
-            snapshot_before=final_snapshot,
-            global_deadline=global_deadline,
-            validate=validate_reconcile,
+        reconcile_prompt = self._reconcile_prompt(
+            event=event,
+            context=context,
+            snapshot=final_snapshot,
+            system_summary=system_map.summary,
         )
+        try:
+            reconcile = await self._run_checkpointed_planner_phase(
+                plan_id=plan_id,
+                project_id=context.project.id,
+                phase_key="RECONCILE",
+                invoke_name="_invoke_reconcile",
+                prompt=reconcile_prompt,
+                output_model=GeminiReconcileWire,
+                snapshot_before=final_snapshot,
+                global_deadline=global_deadline,
+                validate=validate_reconcile,
+            )
+        except ArchitectureNeedsFactError:
+            raise
+        except Exception as exc:
+            repository = getattr(self, "_checkpoint_repository", None)
+            checkpoint = (
+                repository.get_planner_checkpoint(plan_id, "RECONCILE")
+                if repository is not None
+                else None
+            )
+            if (
+                not isinstance(checkpoint, Mapping)
+                or checkpoint.get("status") != "REPAIR_REQUIRED"
+            ):
+                raise
+            previous_output: object = checkpoint.get("validated_output") or {}
+            if not previous_output:
+                provider = checkpoint.get("provider")
+                raw_output = (
+                    provider.get("raw_model_output")
+                    if isinstance(provider, Mapping)
+                    else None
+                )
+                previous_output = raw_output or "<complete provider response unavailable>"
+            reconcile = await self._run_checkpointed_planner_phase(
+                plan_id=plan_id,
+                project_id=context.project.id,
+                phase_key="RECONCILE_REPAIR:1",
+                invoke_name="_invoke_reconcile",
+                prompt=self._reconcile_repair_prompt(
+                    context=context,
+                    snapshot=final_snapshot,
+                    system_summary=system_map.summary,
+                    validation_error=str(exc),
+                    previous_output=previous_output,
+                ),
+                output_model=GeminiReconcileWire,
+                snapshot_before=final_snapshot,
+                global_deadline=global_deadline,
+                validate=validate_reconcile,
+            )
         architecture = GeminiArchitectureWire(
             version=1,
             summary=reconcile.summary or system_map.summary,

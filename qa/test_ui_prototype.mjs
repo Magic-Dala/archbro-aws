@@ -415,6 +415,9 @@ test('architecture generation uses runtime model identity, bounded recovery, and
   assert.match(js, /reached its current output budget/);
   assert.match(js, /completed phases will not be regenerated/);
   assert.match(js, /retryable_generation/);
+  assert.match(js, /known_validation_failure/);
+  assert.match(js, /provider\.known_validation_failure/);
+  assert.match(js, /Authorize another reconciliation attempt/);
   assert.match(js, /\['RETRY_EVENT', 'START_NEW_PLAN'\]\.includes\(recovery\.action\)/);
   assert.match(js, /\/planner\/checkpoints\/\$\{encodeURIComponent\(recovery\.plan_id\)\}/);
   assert.match(js, /action: recovery\.action/);

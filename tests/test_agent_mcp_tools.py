@@ -232,6 +232,27 @@ def test_repository_evidence_intent_is_conservative_and_honors_opt_out() -> None
     ) is None
     assert gateway.list_tools_calls == 0
 
+    report_status = ProjectEvent(
+        project_id="project_test",
+        type=ProjectEventType.USER_MESSAGE,
+        payload={"message": "Review the report task status and summarize progress."},
+    )
+    assert repository_evidence_requested(report_status) is False
+
+    explicit_repo = ProjectEvent(
+        project_id="project_test",
+        type=ProjectEventType.USER_MESSAGE,
+        payload={"message": "Review the repo status and verify the latest commit."},
+    )
+    assert repository_evidence_requested(explicit_repo) is True
+
+    explicit_pr = ProjectEvent(
+        project_id="project_test",
+        type=ProjectEventType.USER_MESSAGE,
+        payload={"message": "Show PR #70 and summarize the changes."},
+    )
+    assert repository_evidence_requested(explicit_pr) is True
+
     opted_out = ProjectEvent(
         project_id="project_test",
         type=ProjectEventType.USER_MESSAGE,
@@ -274,6 +295,33 @@ def test_session_discovers_bounded_read_only_tools_calls_private_evidence_and_re
         )
     ]
 
+    # Strands invokes dynamically-schema'd **kwargs tools with one additional
+    # ``arguments`` envelope. The adapter must remove that implementation
+    # wrapper before dispatching the provider-native schema.
+    wrapped = tool(
+        arguments={
+            "owner": "Magic-Dala",
+            "repo": "archbro",
+            "path": "docs/README.md",
+            "ref": "refs/heads/dev2",
+        }
+    )
+    assert PRIVATE_MARKER in str(wrapped["external_evidence"])
+    assert gateway.calls[-1] == (
+        "mcp_private",
+        "get_file_contents",
+        {
+            "owner": "Magic-Dala",
+            "repo": "archbro",
+            "path": "docs/README.md",
+            "ref": "refs/heads/dev2",
+        },
+    )
+
+    with pytest.raises(ValueError, match="missing required parameter.*owner"):
+        tool(arguments={"repo": "archbro", "path": "README.md"})
+    assert len(gateway.calls) == 2
+
     session.call(
         "get_file_contents",
         {
@@ -285,8 +333,8 @@ def test_session_discovers_bounded_read_only_tools_calls_private_evidence_and_re
         },
     )
     telemetry = session.telemetry()
-    assert telemetry["successful_call_count"] == 2
-    assert telemetry["dispatched_call_count"] == 2
+    assert telemetry["successful_call_count"] == 3
+    assert telemetry["dispatched_call_count"] == 3
     assert PRIVATE_MARKER not in str(telemetry)
     assert "github_pat_abcdefghijklmnopqrstuvwxyz123456" not in str(telemetry)
     assert "<redacted>" in str(telemetry)

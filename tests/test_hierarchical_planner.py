@@ -490,7 +490,7 @@ def test_explicit_429_is_retryable_in_every_phase_and_resume_starts_at_failure(
     assert phases[failed_index]["status"] == "COMPLETED"
 
 
-def test_new_planner_contract_reuses_compatible_legacy_phases_before_retrying():
+def test_new_planner_contract_fences_legacy_unknown_until_explicit_authorization():
     store = _CheckpointStore()
     context, event = _bootstrap_context()
     legacy = _provider()
@@ -536,24 +536,186 @@ def test_new_planner_contract_reuses_compatible_legacy_phases_before_retrying():
     current._checkpoint_repository = store
     current_calls: list[str] = []
     _wire_provider(current, current_calls)
+    with pytest.raises(RuntimeError, match="ambiguous paid-call outcome"):
+        asyncio.run(
+            current.generate(event=event, context=context, system_prompt="unused")
+        )
+    assert current_calls == []
+
+    current_plan_id = current._planner_plan_id(context)
+    # The cross-contract safety preflight runs before every provider call or
+    # checkpoint migration. An ambiguous paid request therefore cannot be
+    # hidden behind apparently harmless topology work.
+    assert store.get_planner_checkpoint(current_plan_id, "SYSTEM_MAP") is None
+
+    authorized = store.recover_planner_checkpoint(
+        project_id=context.project.id,
+        plan_id="plan_legacy_v4_fixture",
+        phase_key="RECONCILE",
+        expected_attempt_id=legacy_reconcile["attempt_id"],
+        expected_revision=legacy_reconcile["revision"],
+        action="AUTHORIZE_NEW_ATTEMPT",
+        request_id="authorize-cross-contract-reconcile",
+    )
+    assert authorized["status"] == "RETRYABLE"
+
     decision = asyncio.run(
         current.generate(event=event, context=context, system_prompt="unused")
     )
-
     assert _architecture_from_decision(decision).version == 1
     assert current_calls == ["RECONCILE"]
-    phases = current.last_usage["phases"]
-    assert all(phase["replayed_from_checkpoint"] is True for phase in phases[:-1])
-    assert all(
-        phase["validation"].get("cross_plan_checkpoint_reuse") is True
-        for phase in phases[:-1]
-    )
-    current_plan_id = current._planner_plan_id(context)
     imported_system_map = store.get_planner_checkpoint(current_plan_id, "SYSTEM_MAP")
     assert imported_system_map["delivery_stage"] == "MIGRATED_CHECKPOINT"
     assert imported_system_map["migrated_from_plan_id"] == "plan_legacy_v4_fixture"
-    assert phases[-1]["phase"] == "RECONCILE"
-    assert phases[-1]["replayed_from_checkpoint"] is False
+    assert current.last_usage["phases"][-1]["phase"] == "RECONCILE"
+
+
+def test_cross_contract_unknown_fence_is_not_limited_to_recent_100_checkpoints():
+    store = _CheckpointStore()
+    context, event = _bootstrap_context()
+    legacy = _provider()
+    legacy._checkpoint_repository = store
+    legacy._planner_plan_id = MethodType(
+        lambda self, _context: "plan_old_unknown_beyond_page",
+        legacy,
+    )
+    calls: list[str] = []
+    _wire_provider(legacy, calls)
+
+    async def ambiguous_reconcile(self, model_id: str, prompt: str):
+        metadata = self._current_invocation_metadata()
+        assert metadata is not None
+        self._transition_active_planner_checkpoint(
+            "IN_FLIGHT",
+            provider={"requested_model": model_id},
+        )
+        metadata["planner_request_started"] = True
+        metadata["planner_dispatch"] = {"requested_model": model_id}
+        raise TimeoutError("old reconciliation outcome is unknown")
+
+    legacy._invoke_reconcile = MethodType(ambiguous_reconcile, legacy)
+    with pytest.raises(RuntimeError, match="timed out"):
+        asyncio.run(legacy.generate(event=event, context=context, system_prompt="unused"))
+
+    for index in range(110):
+        store.rows[(f"plan_noise_{index}", f"NOISE:{index}")] = {
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": f"plan_noise_{index}",
+            "project_id": context.project.id,
+            "phase_key": f"NOISE:{index}",
+            "attempt_id": f"attempt_noise_{index}",
+            "status": "COMPLETED",
+            "delivery_stage": "RESPONSE_RECORDED",
+            "validation": {"status": "PASS"},
+            "validated_output": {},
+            "revision": 1,
+            "owner_generation": 1,
+        }
+
+    current = _provider()
+    current._checkpoint_repository = store
+    current_calls: list[str] = []
+    _wire_provider(current, current_calls)
+    with pytest.raises(RuntimeError, match="ambiguous paid-call outcome"):
+        asyncio.run(
+            current.generate(event=event, context=context, system_prompt="unused")
+        )
+    assert current_calls == []
+
+
+def test_reconcile_missing_relationships_gets_one_bounded_repair_phase():
+    store = _CheckpointStore()
+    context, event = _bootstrap_context()
+    provider = _provider()
+    provider._checkpoint_repository = store
+    calls: list[str] = []
+    _wire_provider(provider, calls)
+
+    async def reconcile_with_repair(self, model_id: str, prompt: str):
+        is_repair = "RECONCILE REPAIR phase" in prompt
+        calls.append("RECONCILE_REPAIR:1" if is_repair else "RECONCILE")
+        wire = (
+            GeminiReconcileWire(
+                summary="Repaired connected architecture",
+                relationships=[
+                    Relationship(
+                        source="experience_capability",
+                        target="domain_capability",
+                        relationship_type="HTTPS",
+                    ),
+                    Relationship(
+                        source="domain_capability",
+                        target="coordination_capability",
+                        relationship_type="CALLS",
+                    ),
+                    Relationship(
+                        source="coordination_capability",
+                        target="state_capability",
+                        relationship_type="WRITES",
+                    ),
+                ],
+                tasks=[
+                    TaskProposal(
+                        title="Build connected workflow",
+                        related_component="domain_capability",
+                    )
+                ],
+            )
+            if is_repair
+            else GeminiReconcileWire(
+                summary="Complete response that omitted relationships",
+                tasks=[
+                    TaskProposal(
+                        title="Build disconnected workflow",
+                        related_component="domain_capability",
+                    )
+                ],
+            )
+        )
+        metadata = self._current_invocation_metadata()
+        assert metadata is not None
+        provider_metadata = {
+            "requested_model": model_id,
+            "observed_model_version": model_id,
+            "finish_reason": "STOP",
+            "provider_response_received": True,
+            "response_reprocessable": True,
+            "raw_model_output": wire.model_dump_json(),
+        }
+        self._transition_active_planner_checkpoint(
+            "RESPONSE_RECORDED",
+            provider=provider_metadata,
+        )
+        metadata["planner_request_started"] = True
+        metadata["planner_request_in_flight"] = False
+        metadata["planner_response"] = provider_metadata
+        return wire
+
+    provider._invoke_reconcile = MethodType(reconcile_with_repair, provider)
+    decision = asyncio.run(
+        provider.generate(event=event, context=context, system_prompt="unused")
+    )
+
+    architecture = _architecture_from_decision(decision)
+    assert architecture.version == 1
+    assert len(architecture.relationships) == 3
+    assert calls == [
+        "SYSTEM_MAP",
+        "EXPAND_SCOPE:experience",
+        "EXPAND_SCOPE:domain",
+        "EXPAND_SCOPE:coordination",
+        "EXPAND_SCOPE:state",
+        "RECONCILE",
+        "RECONCILE_REPAIR:1",
+    ]
+    plan_id = provider._planner_plan_id(context)
+    initial = store.get_planner_checkpoint(plan_id, "RECONCILE")
+    repaired = store.get_planner_checkpoint(plan_id, "RECONCILE_REPAIR:1")
+    assert initial["status"] == "REPAIR_REQUIRED"
+    assert initial["validation"]["status"] == "REPAIR_REQUIRED"
+    assert initial["validated_output"]["relationships"] == []
+    assert repaired["status"] == "COMPLETED"
+    assert repaired["validation"]["status"] == "PASS"
 
 
 def test_explicit_permanent_provider_rejection_is_failed_not_unknown():
@@ -982,6 +1144,11 @@ def test_real_planner_transport_keeps_sdk_single_attempt_and_uses_phase_budget(m
     expected_schema = (GeminiReconcileWire if reconcile else GeminiSystemMapWire).model_json_schema()
     if reconcile:
         assert expected_schema["properties"]["relationships"].pop("maxItems") == 80
+        required = list(expected_schema.get("required") or [])
+        for field in ("relationships", "tasks"):
+            if field not in required:
+                required.append(field)
+        expected_schema["required"] = required
     assert config.response_json_schema == expected_schema
     assert "$defs" in json.dumps(config.response_json_schema)
     assert config.temperature is None

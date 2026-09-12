@@ -241,10 +241,25 @@ The three phase values are starting budgets. An explicit `MAX_TOKENS` response
 is a known provider result, so Archbro checkpoints that exact phase and doubles
 only its output budget, bounded by the 65,536-token hard ceiling. It never parses
 or accepts a truncated JSON response and never regenerates completed phases.
+Planner-contract upgrades also carry a semantic hash of the confirmed Project
+Brief. A prior `UNKNOWN` dispatch for the same project, phase, and brief remains
+fenced even when a release changes the plan id; a new paid call requires explicit
+human authorization. A complete `RECONCILE` response that fails deterministic
+relationship validation receives one bounded `RECONCILE_REPAIR:1` attempt while
+the accepted topology phases remain checkpointed. If that repair also fails,
+another paid reconciliation attempt requires explicit authorization.
 See `.env.example` for the complete retry timing, queue timeout, and hard output
 ceiling. These values enter the public safe-configuration fingerprint, so a
 deployed runtime reports which reliability policy it is actually using without
 exposing credentials.
+
+The current user's GitHub MCP connection is optional evidence, not a project
+bootstrap dependency. Initial Architecture generation uses only the confirmed
+Goal / Project Brief and never discovers GitHub tools. After bootstrap, the
+built-in Agent exposes the user's approved read-only GitHub tools only when the
+message explicitly asks to inspect repository evidence such as a repo, README,
+branch, commit, pull request, issue, or source file. Ordinary task questions —
+including words such as `report` — do not make a GitHub connection mandatory.
 
 For deterministic WebMCP acceptance without built-in model calls:
 

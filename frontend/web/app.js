@@ -5627,6 +5627,9 @@ function friendlyAgentError(run = state.lastRun) {
     || recovery?.retryable_provider_error === true;
   const retryableGeneration = provider.retryable_generation === true
     || recovery?.retryable_generation === true;
+  if (provider.known_validation_failure === true || recovery?.known_validation_failure === true) {
+    return 'Gemini returned a complete response, but it did not satisfy the Architecture relationship contract. Archbro preserved all completed phases and will retry only reconciliation after explicit authorization when another paid call is required.';
+  }
   const statusCode = provider.http_status_code ?? recovery?.http_status_code;
   const providerStatus = provider.provider_status ?? recovery?.provider_status;
   if (retryableGeneration) {
@@ -6051,6 +6054,12 @@ function initialArchitectureActionState(recovery = state.plannerRecovery) {
         hint: 'Gemini explicitly rejected the unfinished phase before returning a result. The updated planner starts safely from the saved Goal without treating it as an unknown paid outcome.',
       };
     case 'AUTHORIZE_NEW_ATTEMPT':
+      if (recovery?.known_validation_failure) {
+        return {
+          label: 'Authorize another reconciliation attempt',
+          hint: 'The previous response completed but failed deterministic Architecture validation. This authorizes one new paid reconciliation attempt; completed topology phases will not be regenerated.',
+        };
+      }
       return {
         label: 'Authorize new architecture attempt',
         hint: 'The previous model request has an unknown outcome. This explicit action authorizes one new paid attempt; Archbro will never replay it automatically.',

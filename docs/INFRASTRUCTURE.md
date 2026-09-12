@@ -139,6 +139,23 @@ response as `TRUNCATED_RESPONSE`, refuses to parse its partial JSON, and retries
 only that phase with a doubled budget up to the 65,536-token hard ceiling. If the
 request deadline ends first, the larger budget is persisted for the next retry.
 
+Planner v6 prevents a release or generation-policy change from bypassing the
+paid-call fence. Checkpoints persist a semantic hash of the confirmed Project
+Brief, and a prior `UNKNOWN` outcome for the same logical phase blocks dispatch
+under a new plan id until a person explicitly authorizes another attempt. A
+complete reconciliation that parses successfully but fails deterministic graph
+validation is recorded as `REPAIR_REQUIRED`, not `UNKNOWN`. Archbro may issue one
+bounded `RECONCILE_REPAIR:1` call without regenerating SYSTEM_MAP or EXPAND_SCOPE;
+a second repair requires explicit paid-call authorization.
+
+Per-user GitHub MCP remains an optional, request-scoped evidence source for the
+built-in Agent. Initial Architecture generation never performs MCP discovery.
+Post-bootstrap discovery occurs only when the human message explicitly requests
+repository evidence; token-aware intent matching prevents ordinary terms such as
+`report` from being mistaken for `repo`. GitHub provider schemas are forwarded
+flat even when the Strands dynamic-tool adapter supplies an implementation-only
+`arguments` envelope, and required provider fields are validated before dispatch.
+
 First-party provider OAuth transient state is process-local. Deployed provider
 OAuth therefore runs as a single application worker. The runtime guard checks
 `WEB_CONCURRENCY`, `UVICORN_WORKERS`, Uvicorn `--workers N`, and `--workers=N`

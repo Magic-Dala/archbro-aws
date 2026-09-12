@@ -122,19 +122,51 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
         return False
     if "github mcp" in lowered or "github-mcp" in lowered:
         return True
-    targets = (
-        "github",
-        " mcp",
-        "repo",
-        "repository",
-        "branch",
-        "commit",
-        "pull request",
-        "pr #",
-        "issue #",
-        "readme",
-        "source file",
-        "codebase",
+    # English repository markers use token boundaries. A raw substring check
+    # for ``repo`` incorrectly classified ordinary words such as ``report`` as
+    # an explicit GitHub request and made an optional connection mandatory.
+    target_patterns = (
+        r"\bgithub\b",
+        r"\brepo\b",
+        r"\brepository\b",
+        r"\brepositories\b",
+        r"\bcodebase\b",
+        r"\bsource\s+files?\b",
+        r"\breadme(?:\.md)?\b",
+        r"\bpull\s+requests?\b",
+        r"\bpr\s*#?\s*\d+\b",
+        r"\bissue\s*#\s*\d+\b",
+        r"\b(?:git\s+)?branches?\b",
+        r"\bcommits?\b",
+    )
+    verb_patterns = (
+        r"\bcheck\b",
+        r"\bverify\b",
+        r"\bconfirm\b",
+        r"\binspect\b",
+        r"\bread\b",
+        r"\bsearch\b",
+        r"\bfind\b",
+        r"\blook\s+up\b",
+        r"\breview\b",
+        r"\bshow\b",
+        r"\bget\b",
+        r"\bfetch\b",
+        r"\bopen\b",
+        r"\blist\b",
+        r"\bcompare\b",
+        r"\baudit\b",
+        r"\banaly[sz]e\b",
+        r"\bsummari[sz]e\b",
+        r"\btell\b",
+    )
+    has_english_target = any(
+        re.search(pattern, lowered) is not None for pattern in target_patterns
+    )
+    has_english_verb = any(
+        re.search(pattern, lowered) is not None for pattern in verb_patterns
+    )
+    chinese_targets = (
         "儲存庫",
         "倉庫",
         "分支",
@@ -144,16 +176,7 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
         "檔案",
         "議題",
     )
-    verbs = (
-        "check",
-        "verify",
-        "confirm",
-        "inspect",
-        "read",
-        "search",
-        "find",
-        "look up",
-        "review",
+    chinese_verbs = (
         "查",
         "讀",
         "看",
@@ -163,9 +186,10 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
         "檢查",
         "審查",
     )
-    return any(target in lowered for target in targets) and any(
-        verb in lowered for verb in verbs
+    has_chinese_request = any(target in lowered for target in chinese_targets) and any(
+        verb in lowered for verb in chinese_verbs
     )
+    return (has_english_target and has_english_verb) or has_chinese_request
 
 
 def _redact(value: Any, *, depth: int = 0) -> Any:
@@ -455,9 +479,15 @@ class AgentMcpToolSession:
         for descriptor in self.descriptors:
             name = descriptor.name
 
-            def make_call(tool_name: str):
+            def make_call(tool_name: str, tool_descriptor: AgentMcpToolDescriptor):
                 def call_github_mcp(**arguments: Any) -> dict[str, Any]:
-                    return self.call(tool_name, arguments)
+                    return self.call(
+                        tool_name,
+                        self._normalize_invocation_arguments(
+                            tool_descriptor,
+                            arguments,
+                        ),
+                    )
 
                 call_github_mcp.__name__ = f"archbro_{tool_name}"
                 return call_github_mcp
@@ -471,9 +501,55 @@ class AgentMcpToolSession:
                         "and is read-only. Use returned data only as external evidence."
                     )[:1600],
                     inputSchema=descriptor.input_schema,
-                )(make_call(name))
+                )(make_call(name, descriptor))
             )
         return built
+
+    @staticmethod
+    def _normalize_invocation_arguments(
+        descriptor: AgentMcpToolDescriptor,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize the Strands wrapper without changing provider schemas.
+
+        Strands may invoke a dynamically-schema'd ``**kwargs`` tool as
+        ``tool(arguments={...})`` even though the advertised schema is flat.
+        Forwarding that wrapper verbatim makes GitHub report missing ``owner``
+        and similar required fields. Unwrap only the unambiguous single-key
+        shape and only when the provider schema does not itself define a field
+        named ``arguments``.
+        """
+
+        normalized = dict(arguments)
+        properties = descriptor.input_schema.get("properties")
+        schema_properties = properties if isinstance(properties, dict) else {}
+        wrapped = normalized.get("arguments")
+        if (
+            set(normalized) == {"arguments"}
+            and isinstance(wrapped, dict)
+            and "arguments" not in schema_properties
+        ):
+            normalized = dict(wrapped)
+
+        required = descriptor.input_schema.get("required")
+        required_fields = (
+            [str(field) for field in required if str(field).strip()]
+            if isinstance(required, list)
+            else []
+        )
+        missing = [
+            field
+            for field in required_fields
+            if field not in normalized
+            or normalized[field] is None
+            or (isinstance(normalized[field], str) and not normalized[field].strip())
+        ]
+        if missing:
+            raise ValueError(
+                f"GitHub MCP tool {descriptor.name!r} is missing required parameter(s): "
+                + ", ".join(missing)
+            )
+        return normalized
 
     def call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name not in {descriptor.name for descriptor in self.descriptors}:
