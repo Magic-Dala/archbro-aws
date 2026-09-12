@@ -583,6 +583,7 @@ let source = fs.readFileSync('frontend/web/archbro-webmcp.js', 'utf8')
   .replace(/\bexport\s+/g, '');
 source += '\nglobalThis.__createArchBroTools = createArchBroTools;';
 eval(source);
+globalThis.window = {ArchBroWebBridge: {getActiveProjectId: () => 'project-budget'}};
 let providerCalls = 0;
 const noop = async () => ({});
 const bridge = {

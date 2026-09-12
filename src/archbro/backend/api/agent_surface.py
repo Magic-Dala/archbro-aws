@@ -23,6 +23,7 @@ from archbro.backend.agent.node_context import (
     find_architecture_path,
 )
 from archbro.backend.core.authorization import ProjectPermission
+from archbro.backend.core.github_repository import require_matching_repository
 from archbro.backend.core.action_executor import ActionExecutor
 from archbro.backend.core.contracts import (
     AgentAction,
@@ -215,6 +216,13 @@ def build_agent_surface_router(
                 status_code=500,
                 detail="stored Code Architecture snapshot is invalid",
             ) from exc
+        project = repository.get_project(project_id)
+        if event.payload.get('repository_binding_revision', 0) != project.repository_revision:
+            return None
+        try:
+            require_matching_repository(project.source_repository, snapshot_request.repository)
+        except ValueError:
+            return None
         return event, snapshot_request
 
     @router.get("/projects/{project_id}/agent-context")
@@ -446,7 +454,11 @@ def build_agent_surface_router(
         # This is a derived evidence projection, not a canonical architecture write.
         # READ authorization is sufficient because no provider or ArchBro state is mutated.
         await authorized_project(http_request, project_id, ProjectPermission.READ)
-        repository.get_project(project_id)
+        project = repository.get_project(project_id)
+        try:
+            require_matching_repository(project.source_repository, request.repository)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
         architecture = repository.get_architecture(project_id)
         return build_code_architecture_snapshot(project_id, request, architecture=architecture)
 
@@ -457,7 +469,11 @@ def build_agent_surface_router(
         http_request: Request,
     ):
         await authorized_project(http_request, project_id, ProjectPermission.WRITE)
-        repository.get_project(project_id)
+        project = repository.get_project(project_id)
+        try:
+            require_matching_repository(project.source_repository, request.repository)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
         architecture = repository.get_architecture(project_id)
         try:
             snapshot = build_code_architecture_snapshot(
@@ -468,7 +484,7 @@ def build_agent_surface_router(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         canonical_request = request.model_dump_json()
-        digest = hashlib.sha256(f"{project_id}\x1f{canonical_request}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(f"{project_id}\x1f{project.repository_revision}\x1f{canonical_request}".encode("utf-8")).hexdigest()
         event = ProjectEvent(
             id=f"event_code_architecture_{digest[:32]}",
             project_id=project_id,
@@ -477,10 +493,14 @@ def build_agent_surface_router(
             source_event_id=f"code-architecture:{request.repository}@{request.revision}:{digest[:24]}",
             payload={
                 "artifact_type": "CODE_ARCHITECTURE_SNAPSHOT",
+                "repository_binding_revision": project.repository_revision,
                 "request": request.model_dump(mode="json"),
             },
         )
-        repository.save_event(event)
+        try:
+            repository.save_event(event)
+        except ConcurrentStateError:
+            raise HTTPException(409, 'Repository selection changed before snapshot publication; retry') from None
         return {
             **snapshot,
             "derived_artifact_persisted": True,
@@ -625,14 +645,18 @@ def build_agent_surface_router(
     ):
         # Generic external tools may mutate their provider, so use ArchBro WRITE
         # authorization even when a particular provider tool happens to be read-only.
-        await authorized_project(http_request, project_id, ProjectPermission.WRITE)
+        project = await authorized_project(http_request, project_id, ProjectPermission.WRITE)
         try:
+            if project.source_repository and gateway.is_github_server(project_id, server_id):
+                raise HTTPException(409, 'Use the project GitHub tools through your own account for a repository-bound project')
             result = await gateway.call_tool(
                 project_id,
                 server_id,
                 request.tool_name,
                 request.arguments,
             )
+        except HTTPException:
+            raise
         except McpGatewayError as exc:
             raise _gateway_http_error(exc)
         except Exception as exc:

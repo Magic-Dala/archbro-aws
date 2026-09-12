@@ -59,6 +59,9 @@ def build_agent_context(
         f"- id: {project.id}",
         f"- name: {_one_line(project.name, 120)}",
         f"- status: {project.status.value}",
+        f"- github_repository: {project.source_repository.full_name if project.source_repository else '(not selected)'}",
+        f"- github_default_ref: {project.source_repository.branch if project.source_repository and project.source_repository.branch else '(repository default)'}",
+        f"- repository_selection_version: {project.repository_revision}",
         *_goal_lines(project.goal),
         "",
         "## Architecture",
@@ -138,6 +141,8 @@ def build_agent_context(
         "version": "1",
         "format": "markdown",
         "project_id": project.id,
+        "source_repository": project.source_repository.model_dump(mode="json") if project.source_repository else None,
+        "repository_revision": project.repository_revision,
         "architecture_version": architecture.version,
         "task_counts": {
             "todo": counts.get("TODO", 0),

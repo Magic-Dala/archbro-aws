@@ -11,14 +11,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from archbro.backend.core.contracts import Architecture, ArchitectureNodeKind
 from archbro.backend.core.diagram_layout import layout_diagram
+from archbro.backend.core.github_repository import normalize_github_repository as normalize_repository
 
 
 CODE_ARCHITECTURE_SCHEMA = "archbro.code_architecture.v1"
 CODE_DIAGRAM_VERSION = "archbro.code_diagram.v1"
 _FULL_GIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
-_GITHUB_REPOSITORY = re.compile(
-    r"^(?:https://github\.com/)?(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
-)
+
 
 
 class CodeSourceEvidence(BaseModel):
@@ -168,11 +167,7 @@ class CodeArchitectureSnapshotRequest(BaseModel):
     @field_validator("repository")
     @classmethod
     def normalize_github_repository(cls, value: str) -> str:
-        value = value.strip()
-        match = _GITHUB_REPOSITORY.fullmatch(value)
-        if not match:
-            raise ValueError("repository must be owner/repo or an https://github.com/owner/repo URL")
-        return f"{match.group('owner')}/{match.group('repo')}"
+        return normalize_repository(value)
 
     @field_validator("revision")
     @classmethod

@@ -78,6 +78,7 @@ PYTEST_PATTERNS = {
         "tests/test_connector_sync.py",
         "tests/test_pipeline_runner.py",
         "tests/test_project_authorization.py",
+        "tests/test_project_repository_*.py",
         "tests/test_runtime_health.py",
         "tests/test_signal_pipeline.py",
         "tests/test_sync_cursor.py",
@@ -86,6 +87,7 @@ PYTEST_PATTERNS = {
     "persistence": (
         "tests/test_postgres_foundation.py",
         "tests/test_*repository.py",
+        "tests/test_project_repository_*.py",
         "tests/test_secret_cipher.py",
         "tests/test_sqlite_migration.py",
         "tests/test_sync_cursor.py",
@@ -101,6 +103,7 @@ PYTEST_PATTERNS = {
         "tests/test_microsoft_teams_integration.py",
         "tests/test_pipeline_runner.py",
         "tests/test_provider_*.py",
+        "tests/test_project_repository_*.py",
         "tests/test_slack_*.py",
         "tests/test_webmcp_*.py",
     ),

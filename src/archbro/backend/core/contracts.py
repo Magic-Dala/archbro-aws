@@ -246,6 +246,9 @@ class Task(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
+from archbro.backend.core.github_repository import GitHubRepositoryBinding
+
+
 class Project(BaseModel):
     id: str = Field(default_factory=lambda: new_id("project"))
     name: str
@@ -256,6 +259,8 @@ class Project(BaseModel):
     owner_user_id: str | None = None
     team_id: str | None = None
     member_user_ids: list[str] = Field(default_factory=list)
+    source_repository: GitHubRepositoryBinding | None = None
+    repository_revision: int = Field(default=0, ge=0)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 

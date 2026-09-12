@@ -155,7 +155,7 @@ function compactExternalValue(value, key = 'result', depth = 0) {
 
 function rememberExternalResult(raw, {serverId, toolName}) {
   const ref = `webmcp-result:${Date.now().toString(36)}:${++externalResultSequence}`;
-  externalResultCache.set(ref, {raw, serverId, toolName});
+  externalResultCache.set(ref, {raw, serverId, toolName, binding: activeProjectBinding()});
   while (externalResultCache.size > EXTERNAL_RESULT_CACHE_SIZE) {
     externalResultCache.delete(externalResultCache.keys().next().value);
   }
@@ -167,6 +167,11 @@ function readCachedExternalResult({resultRef, serverId, toolName, offset = 0, ma
   if (!cached || cached.serverId !== serverId || cached.toolName !== toolName) {
     throw new Error('Connected MCP result_ref is missing, expired, or belongs to a different tool.');
   }
+  const currentBinding = activeProjectBinding();
+  if (!cached.binding || cached.binding.projectId !== currentBinding.projectId) {
+    throw new Error('Connected MCP result_ref belongs to a different project.');
+  }
+  assertActiveProjectBinding(cached.binding);
   const start = Math.max(0, Number.isFinite(Number(offset)) ? Math.trunc(Number(offset)) : 0);
   const requested = Number.isFinite(Number(maxChars)) ? Math.trunc(Number(maxChars)) : EXTERNAL_RESULT_RECOVERY_CHARS;
   const size = Math.max(1, Math.min(EXTERNAL_RESULT_RECOVERY_MAX_CHARS, requested));
@@ -260,6 +265,7 @@ function activeProjectBinding() {
     return {
       projectId: committedProjectId,
       generation: Number.isInteger(bridgeBinding.generation) ? bridgeBinding.generation : null,
+      repositoryRevision: Number.isInteger(bridgeBinding.repositoryRevision) ? bridgeBinding.repositoryRevision : null,
       source: 'bridge',
     };
   }
@@ -272,6 +278,7 @@ function activeProjectBinding() {
     return {
       projectId: bridgeBinding.projectId.trim(),
       generation: Number.isInteger(bridgeBinding.generation) ? bridgeBinding.generation : null,
+      repositoryRevision: Number.isInteger(bridgeBinding.repositoryRevision) ? bridgeBinding.repositoryRevision : null,
       source: 'bridge',
     };
   }
@@ -305,6 +312,7 @@ function assertActiveProjectBinding(binding) {
     !current
     || current.projectId !== binding.projectId
     || current.generation !== binding.generation
+    || (binding.repositoryRevision != null && current.repositoryRevision !== binding.repositoryRevision)
   ) {
     throw new Error('Active ArchBro project changed while the tool request was being prepared. Retry against the project currently on screen.');
   }
@@ -686,7 +694,10 @@ async function listConnectedMcpTools(bridge, {serverId, signal} = {}) {
   const providerConnection = await providerConnectionById(serverId, {signal});
   assertActiveProjectBinding(projectBinding);
   if (providerConnection) {
-    const result = await agentSurfaceApi(`/mcp/connections/${encodeURIComponent(serverId)}/tools`, {signal, projectBinding});
+    const toolsPath = providerConnection.provider === 'github'
+      ? `/projects/${encodeURIComponent(projectId)}/github/tools`
+      : `/mcp/connections/${encodeURIComponent(serverId)}/tools`;
+    const result = await agentSurfaceApi(toolsPath, {signal, projectBinding});
     return {
       project_id: projectId,
       server_id: serverId,
@@ -702,10 +713,19 @@ async function listConnectedMcpTools(bridge, {serverId, signal} = {}) {
 }
 
 async function callConnectedMcpTool(bridge, {serverId, toolName, arguments: args = {}, resultRef, offset = 0, maxChars = EXTERNAL_RESULT_RECOVERY_CHARS, signal} = {}) {
-  if (resultRef) return readCachedExternalResult({resultRef, serverId, toolName, offset, maxChars});
+  if (resultRef) {
+    const cached = externalResultCache.get(resultRef);
+    if (cached?.binding?.repositoryRevision != null) {
+      const current = await agentSurfaceApi(`/projects/${encodeURIComponent(cached.binding.projectId)}/repository`, {signal, projectBinding: cached.binding});
+      if (current.repository_revision !== cached.binding.repositoryRevision) throw new Error('Repository selection changed; cached evidence is no longer current.');
+    }
+    return readCachedExternalResult({resultRef, serverId, toolName, offset, maxChars});
+  }
 
   if (hasBridgeMethod(bridge, 'callConnectedMcpTool')) {
+    const binding = activeProjectBinding();
     const result = await bridge.callConnectedMcpTool({serverId, toolName, arguments: args, signal});
+    assertActiveProjectBinding(binding);
     return boundedConnectedMcpResult(result, {serverId, toolName});
   }
   const projectBinding = activeProjectBinding();
@@ -713,10 +733,16 @@ async function callConnectedMcpTool(bridge, {serverId, toolName, arguments: args
   const providerConnection = await providerConnectionById(serverId, {signal});
   assertActiveProjectBinding(projectBinding);
   if (providerConnection) {
-    const result = await agentSurfaceApi(
-      `/mcp/connections/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(toolName)}`,
-      {method: 'POST', body: {arguments: args}, signal, projectBinding},
-    );
+    const isGithub = providerConnection.provider === 'github';
+    const callPath = isGithub
+      ? `/projects/${encodeURIComponent(projectId)}/github/tools/${encodeURIComponent(toolName)}`
+      : `/mcp/connections/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(toolName)}`;
+    const body = {arguments: args};
+    if (isGithub) {
+      body.connection_id = serverId;
+      if (projectBinding.repositoryRevision != null) body.expected_repository_revision = projectBinding.repositoryRevision;
+    }
+    const result = await agentSurfaceApi(callPath, {method: 'POST', body, signal, projectBinding});
     return boundedConnectedMcpResult({
       project_id: projectId,
       server_id: serverId,

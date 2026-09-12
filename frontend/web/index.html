@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Archbro</title>
   <link rel="icon" href="/static/archbro-logo.svg?v=35cea50bf08b54c3" />
-  <link rel="stylesheet" href="/static/styles.css?v=34751c591cf05bfe" />
+  <link rel="stylesheet" href="/static/styles.css?v=2fee0739351721cb" />
   <link rel="stylesheet" href="/static/progress.css?v=90e493c3fd6518b1" />
 </head>
 <body>
@@ -323,6 +323,22 @@
     </form>
   </dialog>
 
+  <dialog id="projectRepositoryDialog" class="project-dialog repository-dialog" aria-labelledby="projectRepositoryTitle">
+    <form id="projectRepositoryForm" novalidate>
+      <div class="dialog-head"><div><small>PROJECT CONNECTION</small><h3 id="projectRepositoryTitle">GitHub repository</h3></div><button class="dialog-close" type="button" data-close-dialog="projectRepositoryDialog" aria-label="Close">×</button></div>
+      <p id="projectRepositoryCurrent" class="dialog-hint"></p>
+      <p id="projectRepositoryStatus" class="dialog-hint" role="status"></p>
+      <label>Repository<input id="projectRepositoryName" autocomplete="off" spellcheck="false" placeholder="Search, owner/repo, or GitHub repository URL" /></label>
+      <div class="repository-picker-actions"><button id="projectRepositorySearch" class="btn secondary" type="button">Search repositories</button><button id="projectRepositoryConnect" class="btn secondary" type="button">Connect GitHub</button></div>
+      <div id="projectRepositoryResults" class="repository-options" aria-live="polite"></div>
+      <div id="projectRepositoryPagination" class="repository-picker-actions" hidden><button id="projectRepositoryPrevious" class="btn secondary" type="button">Previous</button><button id="projectRepositoryNext" class="btn secondary" type="button">Next</button></div>
+      <label>Default branch / ref (optional)<input id="projectRepositoryBranch" autocomplete="off" spellcheck="false" placeholder="e.g. dev2 — blank uses the repository default" /></label>
+      <p class="dialog-hint">The selected repository limits GitHub reads in this project. Initial architecture and ordinary task questions do not require GitHub.</p>
+      <p id="projectRepositoryError" class="field-error" role="alert"></p>
+      <div class="dialog-actions"><button id="projectRepositoryRemove" class="btn secondary" type="button">Remove binding</button><button class="btn secondary" type="button" data-close-dialog="projectRepositoryDialog">Cancel</button><button id="projectRepositorySave" class="btn primary" type="submit">Verify and save</button></div>
+    </form>
+  </dialog>
+
   <dialog id="editProjectDialog" class="project-dialog" aria-labelledby="editProjectDialogTitle">
     <form id="editProjectForm" method="dialog">
       <div class="dialog-head"><div><small>PROJECT SETTINGS</small><h3 id="editProjectDialogTitle">Edit project</h3></div><button class="dialog-close" type="button" data-close-dialog="editProjectDialog" aria-label="Close">×</button></div>
@@ -466,7 +482,7 @@
   <script src="/runtime-config.js"></script>
   <script src="/static/prototype.js?v=bd187140bfd50057"></script>
   <script src="/static/firebase-auth-client.js?v=20260901-auth-providers"></script>
-  <script type="module" src="/static/app.js?v=6832401d827f5393"></script>
-  <script type="module" src="/static/archbro-webmcp.js?v=6f7c6c73eb0fbf7a"></script>
+  <script type="module" src="/static/app.js?v=87016396a2d40444"></script>
+  <script type="module" src="/static/archbro-webmcp.js?v=78844908f59573dd"></script>
 </body>
 </html>

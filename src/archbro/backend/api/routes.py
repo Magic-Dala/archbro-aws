@@ -799,7 +799,7 @@ def build_router(
             changes["description"] = (changes["description"] or "").strip()
         updated = project.model_copy(update={**changes, "updated_at": utcnow()})
         repository.save_project(updated)
-        return updated
+        return repository.get_project(project_id)
 
     @router.delete("/projects/{project_id}", status_code=204)
     async def delete_project(project_id: str, http_request: Request):
@@ -850,7 +850,7 @@ def build_router(
     @router.post("/projects/{project_id}/events")
     async def post_event(project_id: str, request: EventRequest, http_request: Request):
         principal = await principal_for(http_request)
-        await authorized_project(
+        project = await authorized_project(
             http_request,
             project_id,
             ProjectPermission.WRITE,
@@ -897,6 +897,12 @@ def build_router(
             occurred_at=request.occurred_at,
             payload=payload,
         )
+        def check_repository_scope():
+            current = repository.get_project(project_id)
+            authorizer.require(principal, current, ProjectPermission.WRITE)
+            if current.repository_revision != project.repository_revision:
+                raise ValueError('Repository selection changed during this request; retry in the current project context')
+
         external_tools = None
         if event.type == ProjectEventType.USER_MESSAGE:
             external_tools = await run_in_threadpool(
@@ -904,6 +910,8 @@ def build_router(
                 principal,
                 project_id=project_id,
                 event=event,
+                repository_scope=project.source_repository,
+                scope_check=check_repository_scope,
             )
         try:
             return await orchestrator.observe_event(event, external_tools=external_tools)
@@ -1288,6 +1296,8 @@ def build_router(
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
+    from archbro.backend.api.project_repository import build_project_repository_router
+    router.include_router(build_project_repository_router(repository, provider_mcp_runtime, authorized_project, principal_for))
     router.include_router(build_agent_surface_router(repository, authorized_project))
     router.include_router(
         build_provider_mcp_router(

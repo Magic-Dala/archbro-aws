@@ -148,6 +148,10 @@ class ConnectedMcpGateway:
             raise McpGatewayConfigurationError("ARCHBRO_MCP_SERVERS_JSON must be a JSON array")
         return cls([_parse_server(item) for item in payload])
 
+    def is_github_server(self, project_id: str, server_id: str) -> bool:
+        server = self._server_for(project_id, server_id)
+        return (urlsplit(server.url).hostname or '').lower() == 'api.githubcopilot.com'
+
     def list_servers(self, project_id: str) -> list[dict[str, Any]]:
         return [
             server.public_dict()

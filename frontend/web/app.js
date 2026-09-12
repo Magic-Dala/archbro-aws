@@ -19,6 +19,9 @@ import {
   taskInstructionContext,
 } from './review-helpers.js?v=4430a4040cec2ad3';
 
+import {createProjectRepositoryController} from './project-repository.js?v=4b7a639010850b3c';
+let projectRepositoryController = null;
+
 const prototype = window.ArchbroPrototype;
 const RUNTIME_CONFIG = window.__ARCHBRO_RUNTIME_CONFIG__ || {};
 const configuredArchitectureRequestTimeout = Number(RUNTIME_CONFIG.architecture_request_timeout_ms);
@@ -315,6 +318,7 @@ function readNavigationRoute(locationLike = window.location, {useStorageFallback
 }
 
 function beginNavigationTransition(projectId = state.projectId) {
+  if (typeof projectRepositoryController !== 'undefined') projectRepositoryController?.close();
   state.navigation.generation += 1;
   state.graphTransitionGeneration += 1;
   // Advancing navigation immediately hides work owned by the previous project.
@@ -1259,7 +1263,7 @@ function renderProjectTree() {
     }
     const children = `<ul id="${escapeHtml(childrenId)}" class="project-children"${expanded ? '' : ' hidden'}><li><button class="${current && state.currentView === 'overview' ? 'active' : ''}" data-project-view="overview"${current && state.currentView === 'overview' ? ' aria-current="page"' : ''}>Project Overview</button></li><li><button class="${current && state.currentView === 'architecture' ? 'active' : ''}" data-project-view="architecture"${current && state.currentView === 'architecture' ? ' aria-current="page"' : ''}>Living Graph</button></li><li><button class="${current && state.currentView === 'tasks' ? 'active' : ''}" data-project-view="tasks"${current && state.currentView === 'tasks' ? ' aria-current="page"' : ''}>Tasks</button></li></ul>`;
     const menu = menuOpen
-      ? `<div id="${escapeHtml(menuId)}" class="project-row-menu" data-project-menu-panel role="menu"><button type="button" role="menuitem" data-project-action="edit">Edit project</button><button type="button" role="menuitem" data-project-action="rename">Rename project</button><button type="button" role="menuitem" data-project-action="delete">Delete project</button></div>`
+      ? `<div id="${escapeHtml(menuId)}" class="project-row-menu" data-project-menu-panel role="menu"><button type="button" role="menuitem" data-project-action="edit">Edit project</button><button type="button" role="menuitem" data-project-action="repository">GitHub repository</button><button type="button" role="menuitem" data-project-action="rename">Rename project</button><button type="button" role="menuitem" data-project-action="delete">Delete project</button></div>`
       : '';
     return `<li class="project-node${current ? ' current' : ''}" data-project-id="${escapeHtml(project.id)}"><div class="project-row"><button class="project-toggle" type="button" data-project-toggle aria-label="${expanded ? 'Collapse' : 'Expand'} ${escapeHtml(project.name)}" aria-expanded="${expanded}" aria-controls="${escapeHtml(childrenId)}">${expanded ? '⌄' : '›'}</button><button class="project-name" type="button" data-project-open aria-pressed="${current}"${current ? ' aria-current="location"' : ''}>${escapeHtml(project.name)}</button><div class="project-menu-wrap"><button class="project-menu-trigger" type="button" data-project-menu aria-label="Project actions for ${escapeHtml(project.name)}" aria-haspopup="menu" aria-expanded="${menuOpen}" aria-controls="${escapeHtml(menuId)}">⋯</button>${menu}</div></div>${children}</li>`;
   }).join('');
@@ -1440,6 +1444,7 @@ function wireProjectTree() {
       if (projectId !== state.projectId && !(await selectProject(projectId))) return;
       const dialogTrigger = projectMenuTrigger(projectId) || menuTrigger;
       if (action === 'edit') openEditProject(dialogTrigger);
+      if (action === 'repository') void projectRepositoryController.open(state.project, dialogTrigger);
       if (action === 'delete') openDeleteProject(dialogTrigger);
     }));
     node.querySelector('[data-project-menu-panel]')?.addEventListener('keydown', (event) => {
@@ -7086,6 +7091,7 @@ window.ArchBroWebBridge = {
     return {
       projectId: committedWebMcpProjectId(),
       generation: workspaceContextGeneration,
+      repositoryRevision: state.project?.repository_revision || 0,
     };
   },
 
@@ -7865,6 +7871,31 @@ $('workspaceHomeNewProjectBtn').addEventListener('click', () => {
 });
 $('mobileSidebarBtn').addEventListener('click', openMobileSidebar);
 $('sidebarBackdrop').addEventListener('click', closeMobileSidebar);
+projectRepositoryController = createProjectRepositoryController({
+  api,
+  getProject: () => state.project,
+  showDialog,
+  async onSaved(projectId, value) {
+    if (state.projectId !== projectId || state.project?.id !== projectId) return;
+    state.project = {...state.project, source_repository: value.source_repository,
+      repository_revision: value.repository_revision};
+    workspaceContextGeneration += 1;
+    state.codeDiagram = null;
+    await loadProjects();
+    if (state.projectId === projectId) await refresh();
+  },
+  onConnect(projectId, trigger) {
+    const guard = captureNavigationGuard(projectId);
+    $('mcpConnectionsDialog').addEventListener('close', () => {
+      if (committedProjectGuardIsCurrent(guard) && state.project?.id === projectId) {
+        void projectRepositoryController.open(state.project, trigger);
+      }
+    }, {once: true});
+    openMcpConnections();
+    selectMcpPreset('github-remote');
+  },
+});
+$('projectRepositoryDialog').addEventListener('click', closeDialogOnBackdrop);
 $('editProjectForm').addEventListener('submit', async (e) => { e.preventDefault(); await saveProjectEdits(); });
 $('deleteProjectForm').addEventListener('submit', async (e) => { e.preventDefault(); await deleteCurrentProject(); });
 document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => $(button.dataset.closeDialog).close()));

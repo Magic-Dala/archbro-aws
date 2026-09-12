@@ -199,7 +199,8 @@ class InMemoryCodeArchitectureRepository:
     def get_project(self, project_id: str):
         if project_id != self.project_id:
             raise KeyError(project_id)
-        return {"id": project_id}
+        from archbro.backend.core.contracts import Project
+        return Project(id=project_id, name="Code test", goal="Inspect code")
 
     def get_architecture(self, project_id: str) -> Architecture:
         self.get_project(project_id)

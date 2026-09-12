@@ -119,6 +119,8 @@ class ProviderMcpRuntimeRegistry:
         *,
         project_id: str,
         event: ProjectEvent,
+        repository_scope=None,
+        scope_check=None,
     ) -> AgentMcpToolSession | None:
         if not repository_evidence_requested(event):
             return None
@@ -127,6 +129,8 @@ class ProviderMcpRuntimeRegistry:
             gateway,
             project_id=project_id,
             event=event,
+            repository_scope=repository_scope,
+            scope_check=scope_check,
         )
 
 
@@ -580,6 +584,8 @@ def build_provider_mcp_router(
     ):
         principal = await provider_principal_for(http_request)
         gateway, _ = runtime_for(principal)
+        if any(c.get('id') == connection_id and c.get('provider') == 'github' for c in gateway.list_connections()):
+            raise HTTPException(status_code=409, detail="GitHub tool calls require a project. Use /projects/{project_id}/github/tools/{tool_name}.")
         try:
             return await asyncio.to_thread(
                 gateway.call_tool,

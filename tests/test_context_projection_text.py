@@ -21,6 +21,8 @@ def test_agent_projection_preserves_goal_lines_and_bounds_without_mutating_sourc
         name="Project",
         goal=goal,
         status=SimpleNamespace(value="ACTIVE"),
+        source_repository=None,
+        repository_revision=0,
     )
     architecture = SimpleNamespace(version=1, summary="Accepted", components=[])
     repository = SimpleNamespace(

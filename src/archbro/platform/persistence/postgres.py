@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg
 from psycopg.rows import dict_row
 
+from archbro.backend.core.contracts import utcnow
 from archbro.backend.core.contracts import (
     AgentContextSnapshot,
     AgentRunResult,
@@ -170,7 +171,12 @@ class PostgresProjectRepository:
         conn.execute(
             f"""
             INSERT INTO projects(id, data) VALUES (%s, %s)
-            ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data, seq=nextval('{_SEQUENCE}')
+            ON CONFLICT (id) DO UPDATE SET
+                data=(EXCLUDED.data::jsonb || jsonb_build_object(
+                    'source_repository', COALESCE(projects.data::jsonb->'source_repository', 'null'::jsonb),
+                    'repository_revision', COALESCE(projects.data::jsonb->'repository_revision', '0'::jsonb)
+                ))::text,
+                seq=nextval('{_SEQUENCE}')
             """,
             (project.id, project.model_dump_json()),
         )
@@ -210,6 +216,27 @@ class PostgresProjectRepository:
     def save_project(self, project: Project) -> None:
         with self._connect() as conn:
             self._put_project(conn, project)
+
+    def set_source_repository(self, project_id: str, binding, *, expected_revision: int,
+                              actor_user_id: str, local_development: bool = False) -> Project:
+        """Change only repository identity, with ownership and revision checked under lock."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT data FROM projects WHERE id=%s FOR UPDATE", (project_id,)).fetchone()
+            if row is None:
+                raise KeyError(project_id)
+            current = Project.model_validate_json(row['data'])
+            if current.owner_user_id != actor_user_id and not (current.owner_user_id is None and local_development):
+                raise PermissionError('Only the project owner may change its repository')
+            if current.repository_revision != expected_revision:
+                raise ConcurrentStateError('Repository selection changed; reload before saving')
+            updated = current.model_copy(update={
+                'source_repository': binding,
+                'repository_revision': current.repository_revision + 1,
+                'updated_at': utcnow(),
+            })
+            conn.execute(f"UPDATE projects SET data=%s, seq=nextval('{_SEQUENCE}') WHERE id=%s",
+                         (updated.model_dump_json(), project_id))
+        return updated
 
     def get_project(self, project_id: str) -> Project:
         with self._connect() as conn:
@@ -419,6 +446,15 @@ class PostgresProjectRepository:
     def save_event(self, event: ProjectEvent) -> None:
         with self._connect() as conn:
             self._lock_project(conn, event.project_id)
+            if event.type == ProjectEventType.CODE_ARCHITECTURE_SNAPSHOT and 'repository_binding_revision' in event.payload:
+                row = conn.execute('SELECT data FROM projects WHERE id=%s', (event.project_id,)).fetchone()
+                if row is None:
+                    raise KeyError(event.project_id)
+                current = Project.model_validate_json(row['data'])
+                if current.repository_revision != event.payload['repository_binding_revision']:
+                    raise ConcurrentStateError('Repository selection changed before snapshot publication')
+                from archbro.backend.core.github_repository import require_matching_repository
+                require_matching_repository(current.source_repository, event.payload['request']['repository'])
             source_key = self._source_key(event)
             source_row = None
             if source_key is not None:

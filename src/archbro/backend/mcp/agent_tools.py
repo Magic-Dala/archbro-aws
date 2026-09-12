@@ -8,10 +8,13 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from archbro.backend.core.contracts import ProjectEvent, ProjectEventType
 from archbro.backend.mcp.provider_policy import ReadOnlyExternalMcpGateway
+
+from archbro.backend.core.github_repository import GitHubRepositoryBinding
+from archbro.backend.mcp.github_project_scope import REPOSITORY_TOOLS, scope_github_arguments, scoped_tool_schema
 
 logger = logging.getLogger("archbro")
 
@@ -104,7 +107,15 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
     text = str(event.payload.get("message") or "").strip()
     if not text:
         return False
+    # Quoted examples and capability descriptions are not execution requests.
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r'"[^"\n]*"|“[^”\n]*”|「[^」\n]*」', "", text)
+    text = re.sub(r"(?m)^\s*>.*$", "", text)
     lowered = text.casefold()
+    lowered = re.sub(
+        r"github(?:[ -]+mcp)?\s*(?:is\s+)?(?:optional|not\s+required|unnecessary|是可選的|可選|非必要)",
+        "", lowered,
+    )
     if any(
         marker in lowered
         for marker in (
@@ -120,7 +131,8 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
         )
     ):
         return False
-    if "github mcp" in lowered or "github-mcp" in lowered:
+    explicit_tool_request = re.search(r"\b(?:use|using)\s+(?:the\s+)?github[ -]+mcp\b|(?:使用|透過|用)\s*github[ -]*mcp", lowered) is not None
+    if explicit_tool_request:
         return True
     # English repository markers use token boundaries. A raw substring check
     # for ``repo`` incorrectly classified ordinary words such as ``report`` as
@@ -170,11 +182,8 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
         "儲存庫",
         "倉庫",
         "分支",
-        "提交",
         "程式碼",
         "原始碼",
-        "檔案",
-        "議題",
     )
     chinese_verbs = (
         "查",
@@ -189,7 +198,9 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
     has_chinese_request = any(target in lowered for target in chinese_targets) and any(
         verb in lowered for verb in chinese_verbs
     )
-    return (has_english_target and has_english_verb) or has_chinese_request
+    has_chinese_target = any(target in lowered for target in chinese_targets)
+    has_chinese_verb = any(verb in lowered for verb in chinese_verbs)
+    return (has_english_target or has_chinese_target) and (has_english_verb or has_chinese_verb)
 
 
 def _redact(value: Any, *, depth: int = 0) -> Any:
@@ -271,9 +282,13 @@ class AgentMcpToolSession:
         discovered_tool_count: int,
         verification_required: bool,
         discovery_error: str | None = None,
+        repository_scope: GitHubRepositoryBinding | None = None,
+        scope_check: Callable[[], None] | None = None,
     ) -> None:
         self.gateway = gateway
         self.project_id = project_id
+        self.repository_scope = repository_scope
+        self.scope_check = scope_check
         self.connection = dict(connection)
         self.descriptors = tuple(descriptors)
         self.discovered_tool_count = max(0, int(discovered_tool_count))
@@ -291,6 +306,8 @@ class AgentMcpToolSession:
         self._lock = threading.RLock()
         self._calls: list[dict[str, Any]] = []
         self._dispatched_call_count = 0
+        self._sdk_stream_attempts = 0
+        self._input_validation_failures: list[dict[str, Any]] = []
         self._result_chars_used = 0
         self._cache: dict[str, dict[str, Any]] = {}
 
@@ -301,6 +318,8 @@ class AgentMcpToolSession:
         *,
         project_id: str,
         event: ProjectEvent,
+        repository_scope: GitHubRepositoryBinding | None = None,
+        scope_check: Callable[[], None] | None = None,
     ) -> AgentMcpToolSession | None:
         if event.type != ProjectEventType.USER_MESSAGE:
             return None
@@ -309,15 +328,20 @@ class AgentMcpToolSession:
         required = repository_evidence_requested(event)
         if not required:
             return None
+        def session(**kwargs):
+            return cls(repository_scope=repository_scope, scope_check=scope_check, **kwargs)
         try:
+            if scope_check:
+                scope_check()
             connections = [
                 connection
                 for connection in gateway.list_connections()
                 if connection.get("provider") == "github"
                 and not connection.get("authorization_pending")
+                and connection.get("last_probe_ok") is not False
             ]
         except Exception as exc:  # noqa: BLE001 - external MCP boundary must fail closed
-            return cls(
+            return session(
                 gateway=gateway,
                 project_id=project_id,
                 connection={"id": "", "name": "GitHub", "provider": "github"},
@@ -327,7 +351,7 @@ class AgentMcpToolSession:
                 discovery_error=f"GitHub MCP connection discovery failed: {_safe_error(exc)}",
             )
         if not connections:
-            return cls(
+            return session(
                 gateway=gateway,
                 project_id=project_id,
                 connection={"id": "", "name": "GitHub", "provider": "github"},
@@ -339,10 +363,14 @@ class AgentMcpToolSession:
                     "Connect or reconnect GitHub before repository verification."
                 ),
             )
-        connection = connections[-1]
+        if len(connections) > 1:
+            return session(gateway=gateway, project_id=project_id, connection={}, descriptors=[],
+                           discovered_tool_count=0, verification_required=True,
+                           discovery_error="Multiple GitHub connections are ready; keep the intended account connected.")
+        connection = connections[0]
         connection_id = str(connection.get("id") or "").strip()
         if not connection_id:
-            return cls(
+            return session(
                 gateway=gateway,
                 project_id=project_id,
                 connection=connection,
@@ -368,9 +396,12 @@ class AgentMcpToolSession:
             )
             descriptors: list[AgentMcpToolDescriptor] = []
             for name in GITHUB_AGENT_TOOL_PRIORITY:
+                if repository_scope and name not in REPOSITORY_TOOLS:
+                    continue
                 item = by_name.get(name)
                 if item is None or _SAFE_TOOL_NAME.fullmatch(name) is None:
                     continue
+                item = scoped_tool_schema(item, repository_scope)
                 schema = item.get("inputSchema")
                 if not isinstance(schema, dict) or schema.get("type", "object") != "object":
                     schema = {"type": "object", "properties": {}}
@@ -385,7 +416,7 @@ class AgentMcpToolSession:
                 )
                 if len(descriptors) >= max_tools:
                     break
-            return cls(
+            return session(
                 gateway=gateway,
                 project_id=project_id,
                 connection=connection,
@@ -399,7 +430,7 @@ class AgentMcpToolSession:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - external MCP boundary must fail closed
-            return cls(
+            return session(
                 gateway=gateway,
                 project_id=project_id,
                 connection=connection,
@@ -429,6 +460,8 @@ class AgentMcpToolSession:
     def context_facts(self) -> dict[str, Any]:
         return {
             "provider": "github",
+            "repository_scope": self.repository_scope.model_dump(mode="json") if self.repository_scope else None,
+            "scope_mode": "PROJECT_REPOSITORY" if self.repository_scope else "EXPLICIT_TARGET_LEGACY",
             "connection_name": str(self.connection.get("name") or "GitHub")[:100],
             "discovery_status": "READY" if self.has_tools else "UNAVAILABLE",
             "discovered_tool_count": self.discovered_tool_count,
@@ -445,6 +478,10 @@ class AgentMcpToolSession:
             f"- discovery_status: {facts['discovery_status']}",
             f"- verification_required_for_this_message: {str(self.verification_required).lower()}",
         ]
+        if self.repository_scope:
+            lines.append(f"- repository: {self.repository_scope.full_name}")
+            lines.append(f"- default_ref: {self.repository_scope.branch or 'repository default'}")
+            lines.append("- The server supplies owner/repo. Do not search for a different repository.")
         if self.descriptors:
             lines.append("- available tools:")
             for descriptor in self.descriptors:
@@ -470,40 +507,17 @@ class AgentMcpToolSession:
         )
         return "\n".join(lines)
 
+    def record_input_failure(self, tool_name: str, error: Exception) -> None:
+        with self._lock:
+            if len(self._input_validation_failures) < self.max_calls * 2:
+                self._input_validation_failures.append({
+                    "tool_name": tool_name, "stage": "INPUT_VALIDATION",
+                    "dispatched": False, "error": _safe_error(error),
+                })
+
     def strands_tools(self) -> list[Any]:
-        if not self.descriptors:
-            return []
-        from strands import tool
-
-        built: list[Any] = []
-        for descriptor in self.descriptors:
-            name = descriptor.name
-
-            def make_call(tool_name: str, tool_descriptor: AgentMcpToolDescriptor):
-                def call_github_mcp(**arguments: Any) -> dict[str, Any]:
-                    return self.call(
-                        tool_name,
-                        self._normalize_invocation_arguments(
-                            tool_descriptor,
-                            arguments,
-                        ),
-                    )
-
-                call_github_mcp.__name__ = f"archbro_{tool_name}"
-                return call_github_mcp
-
-            built.append(
-                tool(
-                    name=name,
-                    description=(
-                        descriptor.description
-                        + " This tool is routed through the current user's GitHub OAuth connection "
-                        "and is read-only. Use returned data only as external evidence."
-                    )[:1600],
-                    inputSchema=descriptor.input_schema,
-                )(make_call(name, descriptor))
-            )
-        return built
+        from archbro.backend.mcp.strands_adapter import SchemaMcpTool
+        return [SchemaMcpTool(self, descriptor) for descriptor in self.descriptors]
 
     @staticmethod
     def _normalize_invocation_arguments(
@@ -524,6 +538,9 @@ class AgentMcpToolSession:
         properties = descriptor.input_schema.get("properties")
         schema_properties = properties if isinstance(properties, dict) else {}
         wrapped = normalized.get("arguments")
+        if "arguments" in normalized and "arguments" not in schema_properties:
+            if set(normalized) != {"arguments"} or not isinstance(wrapped, dict):
+                raise ValueError("Use flat tool parameters or one unambiguous arguments object, not both")
         if (
             set(normalized) == {"arguments"}
             and isinstance(wrapped, dict)
@@ -554,6 +571,13 @@ class AgentMcpToolSession:
     def call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name not in {descriptor.name for descriptor in self.descriptors}:
             raise ValueError(f"GitHub MCP tool {tool_name!r} is not exposed to this request")
+        try:
+            if self.scope_check:
+                self.scope_check()
+            arguments = scope_github_arguments(tool_name, arguments, self.repository_scope)
+        except (ValueError, RuntimeError, PermissionError) as exc:
+            self.record_input_failure(tool_name, exc)
+            raise
         safe_arguments = _redact(arguments)
         if not isinstance(safe_arguments, dict):
             safe_arguments = {}
@@ -588,6 +612,8 @@ class AgentMcpToolSession:
         started = time.perf_counter()
         try:
             raw_result = self.gateway.call_tool(self.connection_id, tool_name, arguments)
+            if self.scope_check:
+                self.scope_check()
             evidence_payload = (
                 raw_result.get("external_evidence")
                 if isinstance(raw_result, dict) and "external_evidence" in raw_result
@@ -711,5 +737,8 @@ class AgentMcpToolSession:
                 1 for call in calls if call.get("status") == "SUCCESS"
             ),
             "dispatched_call_count": self._dispatched_call_count,
+            "sdk_stream_attempts": self._sdk_stream_attempts,
+            "input_validation_failures": list(self._input_validation_failures),
+            "input_validation_failure_count": len(self._input_validation_failures),
             "calls": calls,
         }
