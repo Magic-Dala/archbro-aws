@@ -4,7 +4,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
+import random
+import re
 import time
 from uuid import uuid4
 from collections.abc import Mapping
@@ -63,9 +66,38 @@ DEFAULT_GEMINI_ROUTINE_CHAIN = (
     "gemini-3.8-flash",
 )
 
+_RETRYABLE_PROVIDER_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
+_RETRYABLE_PROVIDER_STATUSES = frozenset(
+    {"ABORTED", "DEADLINE_EXCEEDED", "INTERNAL", "RESOURCE_EXHAUSTED", "UNAVAILABLE"}
+)
+_PROTECTED_PROVIDER_HTTP_CODES = frozenset({401, 403})
+_PROTECTED_PROVIDER_STATUSES = frozenset({"PERMISSION_DENIED", "UNAUTHENTICATED"})
+_PLANNER_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
+
 
 class _PlannerSafeRetryError(RuntimeError):
     """A planner phase failed before any ambiguous provider effect occurred."""
+
+
+@dataclass(frozen=True)
+class _ProviderErrorDisposition:
+    retryable: bool
+    explicit_response: bool
+    http_status_code: int | None = None
+    provider_status: str | None = None
+    retry_after_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class _PlannerGenerationConfig:
+    thinking_level: str
+    max_output_tokens: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "thinking_level": self.thinking_level,
+            "max_output_tokens": self.max_output_tokens,
+        }
 
 
 @dataclass(frozen=True)
@@ -509,6 +541,9 @@ class GeminiProvider(ModelProvider):
         delivery_stage: str,
         *,
         provider: dict[str, object] | None = None,
+        status: str | None = None,
+        validation: dict[str, object] | None = None,
+        checkpoint_updates: Mapping[str, object] | None = None,
     ) -> dict[str, object] | None:
         repository = getattr(self, "_checkpoint_repository", None)
         control = self._planner_checkpoint_control()
@@ -521,6 +556,12 @@ class GeminiProvider(ModelProvider):
         next_checkpoint["delivery_stage"] = delivery_stage
         if provider is not None:
             next_checkpoint["provider"] = provider
+        if status is not None:
+            next_checkpoint["status"] = status
+        if validation is not None:
+            next_checkpoint["validation"] = validation
+        if checkpoint_updates is not None:
+            next_checkpoint.update(checkpoint_updates)
         return self._persist_active_planner_checkpoint(next_checkpoint)
 
     @staticmethod
@@ -562,6 +603,7 @@ class GeminiProvider(ModelProvider):
                 "planner_response": None,
                 "planner_dispatch": None,
                 "planner_request_started": False,
+                "planner_request_in_flight": False,
                 "planner_phases": [],
             }
         )
@@ -622,8 +664,66 @@ class GeminiProvider(ModelProvider):
         self.architecture_model_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_MODEL_TIMEOUT_SECONDS", "90"))
         self.architecture_phase_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_PHASE_TIMEOUT_SECONDS", "120"))
         self.architecture_total_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_TOTAL_TIMEOUT_SECONDS", "900"))
-        self.architecture_max_output_tokens = int(os.getenv("GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS", "65536"))
-        self.architecture_thinking_level = os.getenv("GEMINI_ARCHITECTURE_THINKING_LEVEL", "high").strip().lower()
+        # Keep one hard ceiling for backwards compatibility, then give each
+        # planner phase a budget that matches its bounded schema. A blanket
+        # 65K/high request for every phase creates unnecessary shared-capacity
+        # pressure even when SYSTEM_MAP only needs a few hundred answer tokens.
+        self.architecture_max_output_tokens = int(
+            os.getenv("GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS", "65536")
+        )
+        self.system_map_max_output_tokens = min(
+            self.architecture_max_output_tokens,
+            int(os.getenv("GEMINI_SYSTEM_MAP_MAX_OUTPUT_TOKENS", "4096")),
+        )
+        self.scope_max_output_tokens = min(
+            self.architecture_max_output_tokens,
+            int(os.getenv("GEMINI_SCOPE_MAX_OUTPUT_TOKENS", "8192")),
+        )
+        self.reconcile_max_output_tokens = min(
+            self.architecture_max_output_tokens,
+            int(os.getenv("GEMINI_RECONCILE_MAX_OUTPUT_TOKENS", "16384")),
+        )
+        self.architecture_thinking_level = os.getenv(
+            "GEMINI_ARCHITECTURE_THINKING_LEVEL", "medium"
+        ).strip().lower()
+        self.system_map_thinking_level = os.getenv(
+            "GEMINI_SYSTEM_MAP_THINKING_LEVEL", "low"
+        ).strip().lower()
+        self.scope_thinking_level = os.getenv(
+            "GEMINI_SCOPE_THINKING_LEVEL", "low"
+        ).strip().lower()
+        self.reconcile_thinking_level = os.getenv(
+            "GEMINI_RECONCILE_THINKING_LEVEL", "medium"
+        ).strip().lower()
+
+        # Archbro owns the same-model planner retry loop so only explicit
+        # provider rejections are replayed. The Google SDK remains at one
+        # attempt because its built-in policy also retries ambiguous transport
+        # timeouts/connect failures, which could duplicate a paid request.
+        self.architecture_retry_attempts = int(
+            os.getenv("GEMINI_ARCHITECTURE_RETRY_ATTEMPTS", "5")
+        )
+        self.retry_initial_delay_seconds = float(
+            os.getenv("GEMINI_RETRY_INITIAL_DELAY_SECONDS", "1")
+        )
+        self.retry_max_delay_seconds = float(
+            os.getenv("GEMINI_RETRY_MAX_DELAY_SECONDS", "8")
+        )
+        self.retry_exp_base = float(os.getenv("GEMINI_RETRY_EXP_BASE", "2"))
+        self.retry_jitter = float(os.getenv("GEMINI_RETRY_JITTER", "1"))
+
+        # One provider instance is shared by the application worker. Serialize
+        # expensive bootstrap plans so simultaneous projects do not create a
+        # burst of 4-8 high-cost calls against the same shared Vertex pool.
+        self.architecture_max_concurrency = int(
+            os.getenv("GEMINI_ARCHITECTURE_MAX_CONCURRENCY", "1")
+        )
+        self.architecture_queue_timeout_seconds = float(
+            os.getenv("GEMINI_ARCHITECTURE_QUEUE_TIMEOUT_SECONDS", "120")
+        )
+        self._architecture_admission_semaphore = asyncio.Semaphore(
+            self.architecture_max_concurrency
+        )
         self.system_map_model_id = os.getenv("GEMINI_SYSTEM_MAP_MODEL", "").strip() or None
         if (
             self.interaction_model_timeout_seconds <= 0
@@ -632,10 +732,41 @@ class GeminiProvider(ModelProvider):
             or self.architecture_phase_timeout_seconds <= 0
             or self.architecture_total_timeout_seconds <= 0
             or self.architecture_max_output_tokens <= 0
+            or self.system_map_max_output_tokens <= 0
+            or self.scope_max_output_tokens <= 0
+            or self.reconcile_max_output_tokens <= 0
+            or self.architecture_retry_attempts < 1
+            or self.retry_initial_delay_seconds <= 0
+            or self.retry_max_delay_seconds < self.retry_initial_delay_seconds
+            or self.retry_exp_base < 1
+            or not 0 <= self.retry_jitter <= 1
+            or self.architecture_max_concurrency < 1
+            or self.architecture_queue_timeout_seconds <= 0
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    self.interaction_model_timeout_seconds,
+                    self.interaction_total_timeout_seconds,
+                    self.architecture_model_timeout_seconds,
+                    self.architecture_phase_timeout_seconds,
+                    self.architecture_total_timeout_seconds,
+                    self.retry_initial_delay_seconds,
+                    self.retry_max_delay_seconds,
+                    self.retry_exp_base,
+                    self.retry_jitter,
+                    self.architecture_queue_timeout_seconds,
+                )
+            )
         ):
-            raise ValueError("Gemini architecture timeouts/output budget must be greater than zero")
-        if self.architecture_thinking_level not in {"minimal", "low", "medium", "high"}:
-            raise ValueError("GEMINI_ARCHITECTURE_THINKING_LEVEL must be minimal, low, medium, or high")
+            raise ValueError("Gemini timeouts, retry policy, concurrency, and output budgets are invalid")
+        thinking_levels = {
+            self.architecture_thinking_level,
+            self.system_map_thinking_level,
+            self.scope_thinking_level,
+            self.reconcile_thinking_level,
+        }
+        if not thinking_levels.issubset(_PLANNER_THINKING_LEVELS):
+            raise ValueError("Gemini thinking levels must be minimal, low, medium, or high")
         bootstrap_fallbacks = os.getenv(
             "GEMINI_BOOTSTRAP_FALLBACK_MODELS",
             "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.5-flash",
@@ -673,6 +804,122 @@ class GeminiProvider(ModelProvider):
                 minimum_ms,
             )
         return max(configured_ms, minimum_ms)
+
+    def _planner_retry_policy(self) -> dict[str, object]:
+        return {
+            "attempt_limit": int(getattr(self, "architecture_retry_attempts", 5)),
+            "initial_delay_seconds": float(
+                getattr(self, "retry_initial_delay_seconds", 1.0)
+            ),
+            "max_delay_seconds": float(
+                getattr(self, "retry_max_delay_seconds", 8.0)
+            ),
+            "exp_base": float(getattr(self, "retry_exp_base", 2.0)),
+            "jitter": float(getattr(self, "retry_jitter", 1.0)),
+            "http_status_codes": sorted(_RETRYABLE_PROVIDER_HTTP_CODES),
+        }
+
+    def _planner_retry_delay_seconds(
+        self,
+        *,
+        completed_attempts: int,
+        retry_after_seconds: float | None,
+    ) -> float:
+        if completed_attempts < 1:
+            raise ValueError("completed planner attempts must be at least one")
+        initial_delay = float(getattr(self, "retry_initial_delay_seconds", 1.0))
+        max_delay = float(getattr(self, "retry_max_delay_seconds", 8.0))
+        exp_base = float(getattr(self, "retry_exp_base", 2.0))
+        jitter = float(getattr(self, "retry_jitter", 1.0))
+        try:
+            exponential_delay = initial_delay * (exp_base ** (completed_attempts - 1))
+        except OverflowError:
+            exponential_delay = max_delay
+        capped_delay = min(max_delay, exponential_delay)
+        jitter_floor = capped_delay * (1.0 - jitter)
+        delay = (
+            random.uniform(jitter_floor, capped_delay)
+            if capped_delay > jitter_floor
+            else capped_delay
+        )
+        if retry_after_seconds is not None and math.isfinite(retry_after_seconds):
+            delay = max(delay, min(max_delay, max(0.0, retry_after_seconds)))
+        return min(max_delay, max(0.0, delay))
+
+    async def _sleep_for_planner_retry(self, delay_seconds: float) -> None:
+        await asyncio.sleep(delay_seconds)
+
+    @staticmethod
+    def _next_planner_output_tokens(current: int, ceiling: int) -> int:
+        if current <= 0 or ceiling <= 0:
+            raise ValueError("planner output budgets must be greater than zero")
+        if current >= ceiling:
+            return ceiling
+        return min(ceiling, max(current + 1, current * 2))
+
+    def _planner_generation_config(
+        self,
+        invoke_name: str,
+        *,
+        model_id: str | None = None,
+    ) -> _PlannerGenerationConfig:
+        if invoke_name == "_invoke_system_map":
+            config = _PlannerGenerationConfig(
+                thinking_level=getattr(self, "system_map_thinking_level", "low"),
+                max_output_tokens=int(getattr(self, "system_map_max_output_tokens", 4096)),
+            )
+        elif invoke_name == "_invoke_scope_delta":
+            config = _PlannerGenerationConfig(
+                thinking_level=getattr(self, "scope_thinking_level", "low"),
+                max_output_tokens=int(getattr(self, "scope_max_output_tokens", 8192)),
+            )
+        elif invoke_name == "_invoke_reconcile":
+            config = _PlannerGenerationConfig(
+                thinking_level=getattr(
+                    self,
+                    "reconcile_thinking_level",
+                    getattr(self, "architecture_thinking_level", "medium"),
+                ),
+                max_output_tokens=int(
+                    getattr(self, "reconcile_max_output_tokens", 16384)
+                ),
+            )
+        else:
+            raise ValueError(f"unsupported planner invocation: {invoke_name}")
+
+        if config.thinking_level not in _PLANNER_THINKING_LEVELS:
+            raise ValueError(f"unsupported planner thinking level: {config.thinking_level}")
+        if config.max_output_tokens <= 0:
+            raise ValueError("planner max output tokens must be greater than zero")
+        if (
+            model_id
+            and model_id.strip().lower().startswith("gemini-3.8")
+            and config.thinking_level == "minimal"
+        ):
+            raise ValueError("Gemini 3.8 planner phases require low, medium, or high thinking")
+        return config
+
+    def _planner_generation_policy(self) -> dict[str, dict[str, object]]:
+        return {
+            "hard_output_ceiling": {
+                "max_output_tokens": int(
+                    getattr(self, "architecture_max_output_tokens", 65536)
+                )
+            },
+            "system_map": self._planner_generation_config("_invoke_system_map").as_dict(),
+            "scope": self._planner_generation_config("_invoke_scope_delta").as_dict(),
+            "reconcile": self._planner_generation_config("_invoke_reconcile").as_dict(),
+        }
+
+    @staticmethod
+    def _planner_invoke_name_for_output_model(output_model) -> str:
+        if output_model is GeminiSystemMapWire:
+            return "_invoke_system_map"
+        if output_model is GeminiScopeDeltaWire:
+            return "_invoke_scope_delta"
+        if output_model is GeminiReconcileWire:
+            return "_invoke_reconcile"
+        raise ValueError("unsupported planner output model")
 
     @staticmethod
     def _load_fallback_models(primary_model_id: str) -> tuple[str, ...]:
@@ -798,7 +1045,7 @@ class GeminiProvider(ModelProvider):
         return self._build_agent(model_id)
 
     @staticmethod
-    def _is_temporary_unavailable(exc: BaseException) -> bool:
+    def _provider_error_disposition(exc: BaseException) -> _ProviderErrorDisposition:
         pending: list[BaseException] = [exc]
         seen: set[int] = set()
         chain: list[BaseException] = []
@@ -811,13 +1058,6 @@ class GeminiProvider(ModelProvider):
             for linked in (current.__cause__, current.__context__):
                 if linked is not None and id(linked) not in seen:
                     pending.append(linked)
-
-        protected_names = {"RESOURCE_EXHAUSTED", "UNAUTHENTICATED", "PERMISSION_DENIED"}
-        availability_names = {"UNAVAILABLE"}
-        protected_codes = {401, 403, 429}
-        availability_codes = {503}
-        saw_structured_status = False
-        saw_structured_availability = False
 
         def status_name(value: object) -> str:
             if value is None or callable(value):
@@ -837,6 +1077,56 @@ class GeminiProvider(ModelProvider):
             except (TypeError, ValueError):
                 return None
 
+        structured_codes: list[int] = []
+        structured_statuses: list[str] = []
+        retry_after_seconds: float | None = None
+
+        def parse_retry_delay(value: object) -> float | None:
+            if isinstance(value, bool) or value is None:
+                return None
+            if isinstance(value, (int, float)):
+                seconds = float(value)
+                return seconds if math.isfinite(seconds) and seconds >= 0 else None
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized.endswith("s"):
+                    normalized = normalized[:-1].strip()
+                try:
+                    seconds = float(normalized)
+                except ValueError:
+                    return None
+                return seconds if math.isfinite(seconds) and seconds >= 0 else None
+            if isinstance(value, Mapping):
+                seconds = parse_retry_delay(value.get("seconds")) or 0.0
+                nanos_value = value.get("nanos")
+                try:
+                    nanos = float(nanos_value or 0) / 1_000_000_000
+                except (TypeError, ValueError):
+                    nanos = 0.0
+                combined = seconds + nanos
+                return combined if math.isfinite(combined) and combined >= 0 else None
+            return None
+
+        def find_retry_delay(value: object, *, depth: int = 0) -> float | None:
+            if depth > 5:
+                return None
+            if isinstance(value, Mapping):
+                for key, candidate in value.items():
+                    normalized_key = str(key).replace("_", "").lower()
+                    if normalized_key in {"retryafter", "retrydelay"}:
+                        parsed = parse_retry_delay(candidate)
+                        if parsed is not None:
+                            return parsed
+                    parsed = find_retry_delay(candidate, depth=depth + 1)
+                    if parsed is not None:
+                        return parsed
+            elif isinstance(value, (list, tuple)):
+                for candidate in value:
+                    parsed = find_retry_delay(candidate, depth=depth + 1)
+                    if parsed is not None:
+                        return parsed
+            return None
+
         for item in chain:
             response = getattr(item, "response", None)
             structured_values = (
@@ -844,18 +1134,73 @@ class GeminiProvider(ModelProvider):
                 getattr(item, "status_code", None),
                 getattr(item, "code", None),
                 getattr(response, "status_code", None),
+                getattr(response, "status", None),
             )
             for value in structured_values:
                 if value is None or callable(value):
                     continue
                 name = status_name(value)
                 code = status_code(value)
-                if name or code is not None:
-                    saw_structured_status = True
-                if name in protected_names or code in protected_codes:
-                    return False
-                if name in availability_names or code in availability_codes:
-                    saw_structured_availability = True
+                if code is not None and code not in structured_codes:
+                    structured_codes.append(code)
+                if name and not name.isdigit() and name not in structured_statuses:
+                    structured_statuses.append(name)
+
+            if retry_after_seconds is None:
+                headers = getattr(response, "headers", None)
+                if headers is not None and hasattr(headers, "get"):
+                    retry_after_seconds = parse_retry_delay(
+                        headers.get("retry-after") or headers.get("Retry-After")
+                    )
+            if retry_after_seconds is None:
+                retry_after_seconds = find_retry_delay(getattr(item, "details", None))
+
+        explicit_response = bool(structured_codes or structured_statuses)
+        http_status_code = structured_codes[0] if structured_codes else None
+        provider_status = structured_statuses[0] if structured_statuses else None
+
+        if (
+            any(code in _PROTECTED_PROVIDER_HTTP_CODES for code in structured_codes)
+            or any(
+                status in _PROTECTED_PROVIDER_STATUSES
+                for status in structured_statuses
+            )
+        ):
+            return _ProviderErrorDisposition(
+                retryable=False,
+                explicit_response=explicit_response,
+                http_status_code=http_status_code,
+                provider_status=provider_status,
+                retry_after_seconds=retry_after_seconds,
+            )
+
+        retryable_structured = any(
+            code in _RETRYABLE_PROVIDER_HTTP_CODES or 500 <= code <= 599
+            for code in structured_codes
+        ) or any(
+            status in _RETRYABLE_PROVIDER_STATUSES
+            for status in structured_statuses
+        )
+        if retryable_structured:
+            return _ProviderErrorDisposition(
+                retryable=True,
+                explicit_response=True,
+                http_status_code=http_status_code,
+                provider_status=provider_status,
+                retry_after_seconds=retry_after_seconds,
+            )
+
+        if structured_codes or structured_statuses:
+            # A concrete provider response that is not in the bounded retry set
+            # is permanent for this exact request. It must not become an
+            # ambiguous paid-call boundary merely because dispatch occurred.
+            return _ProviderErrorDisposition(
+                retryable=False,
+                explicit_response=True,
+                http_status_code=http_status_code,
+                provider_status=provider_status,
+                retry_after_seconds=retry_after_seconds,
+            )
 
         def has_explicit_http_code(message: str, code: int) -> bool:
             text = message.strip().lower()
@@ -872,32 +1217,45 @@ class GeminiProvider(ModelProvider):
         messages = [str(item).lower() for item in chain]
         for message in messages:
             if (
-                "resource_exhausted" in message
-                or "resource exhausted" in message
-                or "unauthenticated" in message
+                "unauthenticated" in message
                 or "permission_denied" in message
                 or "permission denied" in message
-                or any(has_explicit_http_code(message, code) for code in protected_codes)
+                or any(
+                    has_explicit_http_code(message, code)
+                    for code in _PROTECTED_PROVIDER_HTTP_CODES
+                )
             ):
-                return False
-
-        # Reliable structured status always wins over message-only heuristics.
-        # Unknown structured statuses fail closed instead of becoming retries.
-        if saw_structured_status:
-            return saw_structured_availability
+                return _ProviderErrorDisposition(False, False)
 
         for message in messages:
-            if has_explicit_http_code(message, 503):
-                return True
-            if "503" in message and ("unavailable" in message or "high demand" in message):
-                return True
+            if (
+                "resource_exhausted" in message
+                or "resource exhausted" in message
+                or "deadline_exceeded" in message
+                or "deadline exceeded" in message
+                or any(
+                    has_explicit_http_code(message, code)
+                    for code in _RETRYABLE_PROVIDER_HTTP_CODES
+                )
+                or re.search(r"(?:http|status(?:_code)?|status code)\s*[=:]?\s*5\d\d", message)
+            ):
+                # Message-only classification is useful for model fallback in
+                # wrappers and tests, but it is not sufficient proof that the
+                # provider returned a response. Checkpoint recovery therefore
+                # still treats a post-dispatch message-only failure as UNKNOWN.
+                return _ProviderErrorDisposition(True, False)
             if (
                 "temporarily unavailable" in message
                 or "service unavailable" in message
                 or "upstream unavailable" in message
+                or "high demand" in message
             ):
-                return True
-        return False
+                return _ProviderErrorDisposition(True, False)
+        return _ProviderErrorDisposition(False, False)
+
+    @staticmethod
+    def _is_temporary_unavailable(exc: BaseException) -> bool:
+        return GeminiProvider._provider_error_disposition(exc).retryable
 
     @staticmethod
     def _usage_int(usage: Mapping[str, object], key: str) -> int | None:
@@ -1099,101 +1457,373 @@ class GeminiProvider(ModelProvider):
             # limit in Pydantic validation after generation, before any mutation.
             response_schema["properties"]["relationships"].pop("maxItems", None)
 
+        invoke_name = self._planner_invoke_name_for_output_model(output_model)
+        generation_config = self._planner_generation_config(
+            invoke_name,
+            model_id=model_id,
+        )
+        output_ceiling = int(
+            getattr(
+                self,
+                "architecture_max_output_tokens",
+                generation_config.max_output_tokens,
+            )
+        )
+        if output_ceiling < generation_config.max_output_tokens:
+            raise ValueError("planner output ceiling is below the phase output budget")
+        checkpoint_control = self._planner_checkpoint_control()
+        resume_output_tokens = (
+            checkpoint_control.get("resume_max_output_tokens")
+            if checkpoint_control is not None
+            else None
+        )
+        if isinstance(resume_output_tokens, bool):
+            resume_output_tokens = None
+        try:
+            resume_output_tokens = (
+                int(resume_output_tokens)
+                if resume_output_tokens is not None
+                else generation_config.max_output_tokens
+            )
+        except (TypeError, ValueError):
+            resume_output_tokens = generation_config.max_output_tokens
+        current_max_output_tokens = min(
+            output_ceiling,
+            max(generation_config.max_output_tokens, resume_output_tokens),
+        )
         http_timeout_ms = self._effective_architecture_http_timeout_ms()
+        retry_policy = self._planner_retry_policy()
+        attempt_limit = int(retry_policy["attempt_limit"])
+        # The SDK is deliberately fixed at one attempt. It also retries
+        # transport exceptions, where the provider may already have accepted
+        # or billed the request. Only this loop may replay a planner request,
+        # and only after a concrete retryable provider response.
         client = self._client_factory_for_invocation().create_client(
             http_timeout_ms=http_timeout_ms
         )
         started_at = time.perf_counter()
         invocation = self._current_invocation_metadata()
-        dispatch_metadata = {
-            "requested_model": model_id,
-            "http_timeout_ms": http_timeout_ms,
-            "transport": self._transport_name(),
-            "thinking_level": self.architecture_thinking_level,
-        }
+        provider_attempts: list[dict[str, object]] = []
+        provider_rejections: list[dict[str, object]] = []
+        retry_delays_seconds: list[float] = []
         try:
-            if invocation is not None:
-                self._transition_active_planner_checkpoint(
-                    "IN_FLIGHT",
-                    provider=dispatch_metadata,
-                )
-                invocation["planner_dispatch"] = dict(dispatch_metadata)
-                invocation["planner_request_started"] = True
-            response = await client.aio.models.generate_content(
-                model=model_id,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=self.architecture_max_output_tokens,
-                    response_mime_type="application/json",
-                    response_json_schema=response_schema,
-                    thinking_config=genai_types.ThinkingConfig(
-                        thinking_level=self.architecture_thinking_level,
-                        include_thoughts=False,
-                    ),
-                ),
-            )
-        except Exception as exc:
-            if invocation is not None and invocation.get("planner_request_started") is True:
-                dispatch_metadata.update(
-                    {
-                        "latency_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
+            for provider_attempt in range(1, attempt_limit + 1):
+                attempt_started_at = time.perf_counter()
+                dispatch_metadata: dict[str, object] = {
+                    "requested_model": model_id,
+                    "http_timeout_ms": http_timeout_ms,
+                    "transport": self._transport_name(),
+                    "thinking_level": generation_config.thinking_level,
+                    "max_output_tokens": current_max_output_tokens,
+                    "output_token_ceiling": output_ceiling,
+                    "sdk_retry_attempt_limit": 1,
+                    "retry_attempt_limit": attempt_limit,
+                    "provider_attempt_limit": attempt_limit,
+                    "provider_attempt_count": provider_attempt,
+                    "provider_attempts": list(provider_attempts),
+                    "provider_rejections": list(provider_rejections),
+                    "retry_delays_seconds": list(retry_delays_seconds),
+                    "provider_response_received": False,
+                    "retryable_provider_error": False,
+                    "retryable_generation": False,
+                }
+                if invocation is not None:
+                    invocation["planner_response"] = None
+                    invocation["planner_dispatch"] = dict(dispatch_metadata)
+                    self._transition_active_planner_checkpoint(
+                        "IN_FLIGHT",
+                        provider=dict(dispatch_metadata),
+                        status="STARTED",
+                        validation={"status": "PENDING"},
+                    )
+                    invocation["planner_request_started"] = True
+                    invocation["planner_request_in_flight"] = True
+                try:
+                    response = await client.aio.models.generate_content(
+                        model=model_id,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            max_output_tokens=current_max_output_tokens,
+                            response_mime_type="application/json",
+                            response_json_schema=response_schema,
+                            thinking_config=genai_types.ThinkingConfig(
+                                thinking_level=generation_config.thinking_level,
+                                include_thoughts=False,
+                            ),
+                        ),
+                    )
+                    if invocation is not None:
+                        invocation["planner_request_in_flight"] = False
+                except Exception as exc:
+                    disposition = self._provider_error_disposition(exc)
+                    if invocation is not None:
+                        invocation["planner_request_in_flight"] = False
+                    rejection: dict[str, object] = {
+                        "attempt": provider_attempt,
+                        "outcome": (
+                            "PROVIDER_REJECTED"
+                            if disposition.explicit_response
+                            else "AMBIGUOUS_TRANSPORT_FAILURE"
+                        ),
+                        "max_output_tokens": current_max_output_tokens,
                         "error_type": type(exc).__name__,
+                        "http_status_code": disposition.http_status_code,
+                        "provider_status": disposition.provider_status,
+                        "retry_after_seconds": disposition.retry_after_seconds,
+                        "explicit_response": disposition.explicit_response,
+                        "retryable": disposition.retryable,
+                        "latency_ms": max(
+                            0,
+                            round((time.perf_counter() - attempt_started_at) * 1000),
+                        ),
+                    }
+                    provider_attempts.append(rejection)
+                    if disposition.explicit_response:
+                        provider_rejections.append(rejection)
+                    dispatch_metadata.update(
+                        {
+                            "provider_attempts": list(provider_attempts),
+                            "provider_rejections": list(provider_rejections),
+                            "latency_ms": max(
+                                0,
+                                round((time.perf_counter() - started_at) * 1000),
+                            ),
+                            "error_type": type(exc).__name__,
+                            "provider_response_received": disposition.explicit_response,
+                            "retryable_provider_error": disposition.retryable,
+                            "http_status_code": disposition.http_status_code,
+                            "provider_status": disposition.provider_status,
+                            "retry_after_seconds": disposition.retry_after_seconds,
+                        }
+                    )
+                    if invocation is not None:
+                        invocation["planner_dispatch"] = dict(dispatch_metadata)
+                        if disposition.explicit_response:
+                            self._transition_active_planner_checkpoint(
+                                "PROVIDER_REJECTED",
+                                provider=dict(dispatch_metadata),
+                                status=(
+                                    "RETRYABLE" if disposition.retryable else "FAILED"
+                                ),
+                                validation={
+                                    "status": (
+                                        "RETRYABLE" if disposition.retryable else "FAIL"
+                                    ),
+                                    "error_type": type(exc).__name__,
+                                    "message": str(exc),
+                                },
+                            )
+                    can_retry = bool(
+                        disposition.explicit_response
+                        and disposition.retryable
+                        and provider_attempt < attempt_limit
+                    )
+                    if not can_retry:
+                        raise
+                    delay_seconds = self._planner_retry_delay_seconds(
+                        completed_attempts=provider_attempt,
+                        retry_after_seconds=disposition.retry_after_seconds,
+                    )
+                    retry_delays_seconds.append(delay_seconds)
+                    dispatch_metadata["retry_delays_seconds"] = list(
+                        retry_delays_seconds
+                    )
+                    if invocation is not None:
+                        invocation["planner_dispatch"] = dict(dispatch_metadata)
+                        self._transition_active_planner_checkpoint(
+                            "PROVIDER_REJECTED",
+                            provider=dict(dispatch_metadata),
+                            status="RETRYABLE",
+                            validation={
+                                "status": "RETRYABLE",
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        )
+                    await self._sleep_for_planner_retry(delay_seconds)
+
+                    continue
+
+                candidates = response.candidates or []
+                if not candidates:
+                    provider_attempts.append(
+                        {
+                            "attempt": provider_attempt,
+                            "outcome": "NO_CANDIDATES",
+                            "max_output_tokens": current_max_output_tokens,
+                            "latency_ms": max(
+                                0,
+                                round(
+                                    (time.perf_counter() - attempt_started_at) * 1000
+                                ),
+                            ),
+                        }
+                    )
+                    response_metadata = {
+                        **dispatch_metadata,
+                        "observed_model_version": getattr(
+                            response, "model_version", None
+                        ),
+                        "response_id": getattr(response, "response_id", None),
+                        "finish_reason": None,
+                        "provider_attempts": list(provider_attempts),
+                        "provider_attempt_count": provider_attempt,
+                        "provider_response_received": True,
+                        "response_reprocessable": False,
+                        "latency_ms": max(
+                            0,
+                            round((time.perf_counter() - started_at) * 1000),
+                        ),
+                    }
+                    if invocation is not None:
+                        invocation["planner_response"] = response_metadata
+                    self._transition_active_planner_checkpoint(
+                        "RESPONSE_RECORDED",
+                        provider=response_metadata,
+                    )
+                    raise RuntimeError("Gemini planner returned no candidates")
+
+                candidate = candidates[0]
+                finish_reason = self._finish_reason_text(candidate.finish_reason)
+                usage = (
+                    response.usage_metadata.model_dump(
+                        mode="json", by_alias=True, exclude_none=True
+                    )
+                    if response.usage_metadata is not None
+                    else None
+                )
+                parts = (
+                    candidate.content.parts
+                    if candidate.content and candidate.content.parts
+                    else []
+                )
+                output = "".join(
+                    part.text or "" for part in parts if not part.thought
+                )
+                provider_attempts.append(
+                    {
+                        "attempt": provider_attempt,
+                        "outcome": (
+                            "COMPLETED"
+                            if finish_reason == "STOP"
+                            else (
+                                "TRUNCATED"
+                                if finish_reason == "MAX_TOKENS"
+                                else "STOPPED"
+                            )
+                        ),
+                        "finish_reason": finish_reason,
+                        "max_output_tokens": current_max_output_tokens,
+                        "latency_ms": max(
+                            0,
+                            round((time.perf_counter() - attempt_started_at) * 1000),
+                        ),
                     }
                 )
-                invocation["planner_dispatch"] = dict(dispatch_metadata)
-            raise
+                response_metadata: dict[str, object] = {
+                    **dispatch_metadata,
+                    "observed_model_version": response.model_version,
+                    "finish_reason": finish_reason,
+                    "response_id": response.response_id,
+                    "usage": usage,
+                    "latency_ms": max(
+                        0, round((time.perf_counter() - started_at) * 1000)
+                    ),
+                    "max_output_tokens": current_max_output_tokens,
+                    "provider_attempt_count": provider_attempt,
+                    "provider_attempts": list(provider_attempts),
+                    "provider_rejections": list(provider_rejections),
+                    "retry_delays_seconds": list(retry_delays_seconds),
+                    "provider_response_received": True,
+                    "retryable_provider_error": False,
+                    "retryable_generation": False,
+                    "response_reprocessable": finish_reason == "STOP",
+                    "raw_model_output": output,
+                }
+                if invocation is not None:
+                    invocation["planner_response"] = response_metadata
+
+                if finish_reason == "MAX_TOKENS":
+                    next_output_tokens = self._next_planner_output_tokens(
+                        current_max_output_tokens,
+                        output_ceiling,
+                    )
+                    can_expand = next_output_tokens > current_max_output_tokens
+                    response_metadata.update(
+                        {
+                            "truncated_response": True,
+                            "retryable_generation": can_expand,
+                            "next_max_output_tokens": (
+                                next_output_tokens if can_expand else None
+                            ),
+                        }
+                    )
+                    self._transition_active_planner_checkpoint(
+                        "TRUNCATED_RESPONSE",
+                        provider=response_metadata,
+                        status="RETRYABLE" if can_expand else "FAILED",
+                        validation={
+                            "status": "RETRYABLE" if can_expand else "FAIL",
+                            "error_type": "MAX_TOKENS",
+                            "message": (
+                                "Planner response reached the phase output budget; "
+                                "retry with a larger bounded budget."
+                                if can_expand
+                                else "Planner response reached the configured hard output ceiling."
+                            ),
+                        },
+                        checkpoint_updates=(
+                            {"resume_max_output_tokens": next_output_tokens}
+                            if can_expand
+                            else {}
+                        ),
+                    )
+                    if (
+                        can_expand
+                        and provider_attempt < attempt_limit
+                    ):
+                        current_max_output_tokens = next_output_tokens
+                        continue
+                    if can_expand:
+                        raise RuntimeError(
+                            "Gemini planner reached its current output budget; "
+                            "the saved phase will resume with a larger bounded budget."
+                        )
+                    raise RuntimeError(
+                        "Gemini planner reached the configured hard output token ceiling."
+                    )
+
+                self._transition_active_planner_checkpoint(
+                    "RESPONSE_RECORDED",
+                    provider=response_metadata,
+                )
+                if finish_reason != "STOP":
+                    raise RuntimeError(
+                        "Gemini planner generation did not finish cleanly: "
+                        f"{finish_reason or 'UNKNOWN'}"
+                    )
+
+                normalized, format_normalization = self._strip_json_fence(output)
+                payload, normalizations = self._normalize_planner_payload(
+                    normalized,
+                    expected_scope_id=expected_scope_id,
+                    reconcile=reconcile,
+                )
+                if format_normalization:
+                    normalizations.insert(0, {"operation": format_normalization})
+                response_metadata["normalization"] = normalizations or None
+                response_metadata["model_output"] = normalized
+                response_metadata["output_sha256"] = hashlib.sha256(
+                    normalized.encode("utf-8")
+                ).hexdigest()
+                response_metadata["normalized_payload_sha256"] = (
+                    self._planner_payload_sha256(payload)
+                )
+                return output_model.model_validate(payload)
+
+            raise RuntimeError("Gemini planner exhausted its bounded attempt budget")
         finally:
             await _close_google_client(client)
-
-        candidates = response.candidates or []
-        if not candidates:
-            raise RuntimeError("Gemini planner returned no candidates")
-        candidate = candidates[0]
-        finish_reason = self._finish_reason_text(candidate.finish_reason)
-        usage = (
-            response.usage_metadata.model_dump(mode="json", by_alias=True, exclude_none=True)
-            if response.usage_metadata is not None
-            else None
-        )
-        response_metadata = {
-            "requested_model": model_id,
-            "observed_model_version": response.model_version,
-            "finish_reason": finish_reason,
-            "response_id": response.response_id,
-            "usage": usage,
-            "latency_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
-            "transport": self._transport_name(),
-            "thinking_level": self.architecture_thinking_level,
-            "http_timeout_ms": http_timeout_ms,
-            "response_reprocessable": finish_reason == "STOP",
-        }
-        invocation = self._current_invocation_metadata()
-        if invocation is not None:
-            invocation["planner_response"] = response_metadata
-
-        parts = candidate.content.parts if candidate.content and candidate.content.parts else []
-        output = "".join(part.text or "" for part in parts if not part.thought)
-        response_metadata["raw_model_output"] = output
-        self._transition_active_planner_checkpoint(
-            "RESPONSE_RECORDED",
-            provider=response_metadata,
-        )
-        normalized, format_normalization = self._strip_json_fence(output)
-        payload, normalizations = self._normalize_planner_payload(
-            normalized,
-            expected_scope_id=expected_scope_id,
-            reconcile=reconcile,
-        )
-        if format_normalization:
-            normalizations.insert(0, {"operation": format_normalization})
-        response_metadata["normalization"] = normalizations or None
-        response_metadata["model_output"] = normalized
-        response_metadata["output_sha256"] = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        response_metadata["normalized_payload_sha256"] = self._planner_payload_sha256(payload)
-        if finish_reason != "STOP":
-            raise RuntimeError(f"Gemini planner generation did not finish cleanly: {finish_reason or 'UNKNOWN'}")
-        return output_model.model_validate(payload)
 
     async def _invoke_system_map(self, model_id: str, prompt: str) -> GeminiSystemMapWire:
         return await self._invoke_planner_structured(model_id, prompt, GeminiSystemMapWire)
@@ -1244,14 +1874,13 @@ class GeminiProvider(ModelProvider):
 
     def _planner_plan_id(self, context: ProjectContext) -> str:
         identity = {
-            "planner_contract": "archbro.initial_planner.v4",
+            "planner_contract": "archbro.initial_planner.v5",
             "project_id": context.project.id,
             "brief": _bootstrap_project_facts(context),
             "model_id": self.model_id,
             "system_map_model_id": self.system_map_model_id,
             "bootstrap_model_chain": self.bootstrap_model_chain,
-            "thinking_level": self.architecture_thinking_level,
-            "max_output_tokens": self.architecture_max_output_tokens,
+            "generation_policy": self._planner_generation_policy(),
         }
         return "plan_" + self._planner_payload_sha256(identity)[:32]
 
@@ -1263,6 +1892,24 @@ class GeminiProvider(ModelProvider):
             "transport": self._transport_name(),
             "requested_model": self.model_id,
             "thinking_level": self.architecture_thinking_level,
+            "generation_policy": self._planner_generation_policy(),
+            "retry_policy": self._planner_retry_policy(),
+            "admission": {
+                "max_concurrency": int(
+                    getattr(self, "architecture_max_concurrency", 1)
+                ),
+                "queue_timeout_ms": round(
+                    float(
+                        getattr(self, "architecture_queue_timeout_seconds", 120.0)
+                    )
+                    * 1000
+                ),
+                "wait_ms": (
+                    None
+                    if metadata is None
+                    else metadata.get("planner_admission_wait_ms")
+                ),
+            },
             "plan_id": plan_id,
             "completed": completed,
             "model_timeout_ms": round(self.architecture_model_timeout_seconds * 1000),
@@ -1291,8 +1938,25 @@ class GeminiProvider(ModelProvider):
                     "latency_ms",
                     "transport",
                     "thinking_level",
+                    "max_output_tokens",
+                    "output_token_ceiling",
                     "http_timeout_ms",
+                    "sdk_retry_attempt_limit",
+                    "retry_attempt_limit",
+                    "provider_attempt_limit",
+                    "provider_attempt_count",
+                    "provider_attempts",
+                    "provider_rejections",
+                    "retry_delays_seconds",
                     "error_type",
+                    "provider_response_received",
+                    "retryable_provider_error",
+                    "retryable_generation",
+                    "http_status_code",
+                    "provider_status",
+                    "retry_after_seconds",
+                    "truncated_response",
+                    "next_max_output_tokens",
                     "response_reprocessable",
                     "normalization",
                     "output_sha256",
@@ -1330,6 +1994,10 @@ class GeminiProvider(ModelProvider):
         snapshot_payload = self._planner_snapshot_payload(snapshot_before)
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         requested_model = self._planner_model_chain(invoke_name)[0]
+        generation_config = self._planner_generation_config(
+            invoke_name,
+            model_id=requested_model,
+        )
         identity = {
             "phase_key": phase_key,
             "prompt_sha256": prompt_sha256,
@@ -1339,13 +2007,69 @@ class GeminiProvider(ModelProvider):
                 else None
             ),
             "requested_model": requested_model,
-            "thinking_level": self.architecture_thinking_level,
-            "max_output_tokens": self.architecture_max_output_tokens,
+            "thinking_level": generation_config.thinking_level,
+            "max_output_tokens": generation_config.max_output_tokens,
         }
         return {
             **identity,
             "input_sha256": self._planner_payload_sha256(identity),
         }
+
+    @staticmethod
+    def _find_reusable_completed_checkpoint(
+        repository: ProjectRepositoryPort,
+        *,
+        project_id: str,
+        current_plan_id: str,
+        phase_key: str,
+        identity: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Find a validated phase from an older compatible planner contract.
+
+        Generation policy is intentionally not part of this compatibility
+        match. A previously accepted output remains safe to reuse when the
+        exact prompt, accepted input snapshot, target phase, and requested
+        model are unchanged. This lets the v5 planner resume legacy v4 runs at
+        their first unfinished phase instead of paying to regenerate work that
+        was already durably validated.
+        """
+
+        list_checkpoints = getattr(repository, "list_planner_checkpoints", None)
+        if not callable(list_checkpoints):
+            return None
+        try:
+            candidates = list_checkpoints(project_id, limit=100)
+        except Exception:
+            logger.warning(
+                "Could not inspect legacy planner checkpoints for project=%s phase=%s",
+                project_id,
+                phase_key,
+                exc_info=True,
+            )
+            return None
+
+        compatibility_fields = (
+            "phase_key",
+            "prompt_sha256",
+            "snapshot_before_sha256",
+            "requested_model",
+        )
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            if candidate.get("plan_id") == current_plan_id:
+                continue
+            if candidate.get("status") != "COMPLETED":
+                continue
+            validation = candidate.get("validation")
+            if not isinstance(validation, Mapping) or validation.get("status") != "PASS":
+                continue
+            if any(candidate.get(field) != identity.get(field) for field in compatibility_fields):
+                continue
+            if not isinstance(candidate.get("validated_output"), dict):
+                continue
+            return dict(candidate)
+        return None
 
     async def _run_checkpointed_planner_phase(
         self,
@@ -1385,6 +2109,29 @@ class GeminiProvider(ModelProvider):
         claimed = True
         existing = None
         if repository is not None:
+            prior_checkpoint = repository.get_planner_checkpoint(plan_id, phase_key)
+            if (
+                isinstance(prior_checkpoint, Mapping)
+                and prior_checkpoint.get("status") == "RETRYABLE"
+            ):
+                resume_max_output_tokens = prior_checkpoint.get(
+                    "resume_max_output_tokens"
+                )
+                if (
+                    isinstance(resume_max_output_tokens, int)
+                    and not isinstance(resume_max_output_tokens, bool)
+                    and resume_max_output_tokens > 0
+                ):
+                    started_checkpoint["resume_max_output_tokens"] = min(
+                        resume_max_output_tokens,
+                        int(
+                            getattr(
+                                self,
+                                "architecture_max_output_tokens",
+                                resume_max_output_tokens,
+                            )
+                        ),
+                    )
             claimed, existing = repository.claim_planner_checkpoint(
                 project_id=project_id,
                 plan_id=plan_id,
@@ -1428,6 +2175,7 @@ class GeminiProvider(ModelProvider):
                         else None
                     ),
                 }
+                completed_checkpoint.pop("resume_max_output_tokens", None)
                 if repository is not None:
                     completed_checkpoint = repository.put_planner_checkpoint(
                         project_id=project_id,
@@ -1456,10 +2204,68 @@ class GeminiProvider(ModelProvider):
             self._set_planner_usage(plan_id=plan_id, completed=False)
             return result
 
+        if claimed and repository is not None:
+            reusable = self._find_reusable_completed_checkpoint(
+                repository,
+                project_id=project_id,
+                current_plan_id=plan_id,
+                phase_key=phase_key,
+                identity=identity,
+            )
+            if reusable is not None:
+                try:
+                    result = output_model.model_validate(reusable["validated_output"])
+                    snapshot_after = validate(result)
+                except Exception:
+                    logger.warning(
+                        "Rejected incompatible legacy planner checkpoint project=%s phase=%s source_plan=%s",
+                        project_id,
+                        phase_key,
+                        reusable.get("plan_id"),
+                        exc_info=True,
+                    )
+                else:
+                    completed_checkpoint = {
+                        **started_checkpoint,
+                        "status": "COMPLETED",
+                        "delivery_stage": "MIGRATED_CHECKPOINT",
+                        "validation": {
+                            "status": "PASS",
+                            "cross_plan_checkpoint_reuse": True,
+                        },
+                        "provider": reusable.get("provider"),
+                        "validated_output": result.model_dump(mode="json", exclude_none=True),
+                        "snapshot_after_sha256": (
+                            self._planner_payload_sha256(snapshot_after)
+                            if snapshot_after is not None
+                            else None
+                        ),
+                        "migrated_from_plan_id": reusable.get("plan_id"),
+                        "migrated_from_attempt_id": reusable.get("attempt_id"),
+                    }
+                    completed_checkpoint.pop("resume_max_output_tokens", None)
+                    completed_checkpoint = repository.put_planner_checkpoint(
+                        project_id=project_id,
+                        plan_id=plan_id,
+                        phase_key=phase_key,
+                        data=completed_checkpoint,
+                        expected_revision=int(started_checkpoint.get("revision", 0)),
+                        expected_owner_generation=int(
+                            started_checkpoint.get("owner_generation", 0)
+                        ),
+                    )
+                    self._append_planner_phase_usage(
+                        completed_checkpoint,
+                        replayed_from_checkpoint=True,
+                    )
+                    self._set_planner_usage(plan_id=plan_id, completed=False)
+                    return result
+
         invocation = self._current_invocation_metadata()
         if invocation is not None:
             invocation["planner_response"] = None
             invocation["planner_request_started"] = False
+            invocation["planner_request_in_flight"] = False
             invocation["planner_checkpoint_control"] = {
                 "project_id": project_id,
                 "plan_id": plan_id,
@@ -1467,6 +2273,9 @@ class GeminiProvider(ModelProvider):
                 "attempt_id": started_checkpoint.get("attempt_id"),
                 "revision": int(started_checkpoint.get("revision", 0)),
                 "owner_generation": int(started_checkpoint.get("owner_generation", 0)),
+                "resume_max_output_tokens": started_checkpoint.get(
+                    "resume_max_output_tokens"
+                ),
             }
         phase_result_returned = False
         try:
@@ -1495,6 +2304,7 @@ class GeminiProvider(ModelProvider):
                     else None
                 ),
             }
+            completed_checkpoint.pop("resume_max_output_tokens", None)
             if repository is not None:
                 completed_checkpoint = self._persist_active_planner_checkpoint(completed_checkpoint)
             self._append_planner_phase_usage(completed_checkpoint, replayed_from_checkpoint=False)
@@ -1509,13 +2319,14 @@ class GeminiProvider(ModelProvider):
                 )
             cursor: BaseException | None = exc
             has_timeout = False
-            seen: set[int] = set()
-            while cursor is not None and id(cursor) not in seen:
-                seen.add(id(cursor))
-                if isinstance(cursor, TimeoutError):
-                    has_timeout = True
-                    break
-                cursor = cursor.__cause__ or cursor.__context__
+            if not isinstance(exc, _PlannerSafeRetryError):
+                seen: set[int] = set()
+                while cursor is not None and id(cursor) not in seen:
+                    seen.add(id(cursor))
+                    if isinstance(cursor, TimeoutError):
+                        has_timeout = True
+                        break
+                    cursor = cursor.__cause__ or cursor.__context__
             provider_request_started = bool(
                 invocation is not None
                 and invocation.get("planner_request_started") is True
@@ -1533,17 +2344,56 @@ class GeminiProvider(ModelProvider):
             if provider_metadata is None:
                 provider_metadata = checkpoint_base.get("provider")
             delivery_stage = str(checkpoint_base.get("delivery_stage") or "PREPARED")
-            retryable = not has_timeout and failed_before_provider and delivery_stage == "PREPARED"
-            failure_status = (
-                "UNKNOWN"
-                if has_timeout or delivery_stage == "IN_FLIGHT"
-                else ("RETRYABLE" if retryable else "FAILED")
+            provider_error = (
+                provider_metadata if isinstance(provider_metadata, Mapping) else {}
             )
+            explicit_provider_rejection = bool(
+                not phase_result_returned
+                and provider_error.get("error_type")
+                and provider_error.get("provider_response_received") is True
+            )
+            retryable_generation = bool(
+                not phase_result_returned
+                and provider_error.get("retryable_generation") is True
+            )
+            if explicit_provider_rejection:
+                # A concrete HTTP/gRPC response proves the provider rejected
+                # the request and produced no model result. 429/408/5xx can be
+                # retried from the same durable phase; explicit permanent 4xx
+                # failures are FAILED, not an unknown paid-call outcome.
+                delivery_stage = "PROVIDER_REJECTED"
+                retryable = bool(
+                    provider_error.get("retryable_provider_error") is True
+                )
+                failure_status = "RETRYABLE" if retryable else "FAILED"
+            elif retryable_generation:
+                # MAX_TOKENS is a complete, explicit provider result rather
+                # than an ambiguous transport outcome. Resume this exact phase
+                # with the persisted larger output budget.
+                retryable = True
+                failure_status = "RETRYABLE"
+            else:
+                retryable = bool(
+                    not has_timeout
+                    and failed_before_provider
+                    and delivery_stage == "PREPARED"
+                )
+                failure_status = (
+                    "UNKNOWN"
+                    if has_timeout or delivery_stage == "IN_FLIGHT"
+                    else ("RETRYABLE" if retryable else "FAILED")
+                )
+            validation_status = {
+                "UNKNOWN": "UNKNOWN",
+                "RETRYABLE": "RETRYABLE",
+                "FAILED": "FAIL",
+            }[failure_status]
             failed_checkpoint = {
                 **checkpoint_base,
                 "status": failure_status,
+                "delivery_stage": delivery_stage,
                 "validation": {
-                    "status": "UNKNOWN" if failure_status == "UNKNOWN" else ("RETRYABLE" if retryable else "FAIL"),
+                    "status": validation_status,
                     "error_type": type(exc).__name__,
                     "message": str(exc),
                 },
@@ -1571,8 +2421,9 @@ class GeminiProvider(ModelProvider):
             invocation["planner_response"] = None
             invocation["planner_dispatch"] = None
             invocation["planner_request_started"] = False
+            invocation["planner_request_in_flight"] = False
         timed_out: list[str] = []
-        unavailable: list[str] = []
+        retryable_failures: list[str] = []
         last_unavailable: Exception | None = None
         invoke = getattr(self, invoke_name)
 
@@ -1580,6 +2431,11 @@ class GeminiProvider(ModelProvider):
             remaining = min(phase_deadline, global_deadline) - time.perf_counter()
             if remaining <= 0:
                 break
+            if invocation is not None:
+                invocation["planner_response"] = None
+                invocation["planner_dispatch"] = None
+                invocation["planner_request_started"] = False
+                invocation["planner_request_in_flight"] = False
             self.last_model_id = candidate
             try:
                 return await asyncio.wait_for(
@@ -1587,13 +2443,29 @@ class GeminiProvider(ModelProvider):
                     timeout=min(self.architecture_model_timeout_seconds, remaining),
                 )
             except TimeoutError as exc:
-                timed_out.append(candidate)
+                dispatch = (
+                    invocation.get("planner_dispatch")
+                    if invocation is not None
+                    else None
+                )
+                waiting_after_explicit_rejection = bool(
+                    invocation is not None
+                    and invocation.get("planner_request_started") is True
+                    and invocation.get("planner_request_in_flight") is False
+                    and isinstance(dispatch, Mapping)
+                    and dispatch.get("provider_response_received") is True
+                    and dispatch.get("retryable_provider_error") is True
+                )
                 last_unavailable = exc
-                # A provider-side timeout is an unknown-effect boundary: the
-                # upstream may have completed or billed the request after the
-                # client stopped waiting. Never issue a fallback paid call in
-                # the same phase after that ambiguity; the durable checkpoint
-                # is marked UNKNOWN by the caller and requires explicit review.
+                if waiting_after_explicit_rejection:
+                    retryable_failures.append(
+                        f"{candidate} (retry deadline after explicit provider rejection)"
+                    )
+                else:
+                    timed_out.append(candidate)
+                # Timeout while a provider request is active is an unknown-effect
+                # boundary. Timeout during a bounded backoff after a concrete
+                # rejection is safe to resume from the same durable phase.
                 break
             except Exception as exc:
                 # Once a provider response exists, parsing/schema/semantic
@@ -1603,30 +2475,47 @@ class GeminiProvider(ModelProvider):
                 # status code such as 503.
                 if invocation is not None and invocation.get("planner_response") is not None:
                     raise
-                if not self._is_temporary_unavailable(exc):
+                disposition = self._provider_error_disposition(exc)
+                if not disposition.retryable:
                     raise
-                unavailable.append(candidate)
+                reason = (
+                    str(disposition.http_status_code)
+                    if disposition.http_status_code is not None
+                    else disposition.provider_status or "temporary provider error"
+                )
+                retryable_failures.append(f"{candidate} ({reason})")
                 last_unavailable = exc
-                # Once this phase crossed the dispatch boundary, a transport
-                # failure is an unknown-effect result. A lease/retryable HTTP
-                # classification does not prove the provider did not receive
-                # or bill the request, so never fall through to another model.
                 if invocation is not None and invocation.get("planner_request_started") is True:
-                    break
+                    if not disposition.explicit_response:
+                        # No structured provider response exists, so the
+                        # dispatch outcome remains ambiguous and must retain the
+                        # explicit authorization boundary.
+                        break
+                    if (
+                        disposition.http_status_code == 429
+                        or disposition.provider_status == "RESOURCE_EXHAUSTED"
+                    ):
+                        # Same-model explicit-response backoff has already
+                        # been exhausted. Do not multiply a shared-capacity burst across the
+                        # fallback chain; persist RETRYABLE and resume only this
+                        # phase on the next event.
+                        break
 
         details: list[str] = []
         if timed_out:
             details.append("timed out: " + ", ".join(timed_out))
-        if unavailable:
-            details.append("503 unavailable: " + ", ".join(unavailable))
+        if retryable_failures:
+            details.append(
+                "retryable provider error: " + ", ".join(retryable_failures)
+            )
         reason = "; ".join(details) or "phase/global reasoning deadline reached"
         message = (
             f"Gemini planner phase {invoke_name} could not complete ({reason}). "
             "No project state was changed; retry the event."
         )
-        if unavailable and not timed_out:
+        if retryable_failures and not timed_out:
             raise _PlannerSafeRetryError(message) from last_unavailable
-        if not unavailable and not timed_out:
+        if not retryable_failures and not timed_out:
             # The phase/global deadline can expire before the first provider
             # request starts. Persisting FAILED would poison a request that is
             # known to have had no paid/provider side effect.
@@ -1882,6 +2771,61 @@ class GeminiProvider(ModelProvider):
         )
         return AgentDecision(summary=wire.summary, actions=actions, architecture_review_required=False)
 
+    def _get_architecture_admission_semaphore(self) -> asyncio.Semaphore:
+        semaphore = getattr(self, "_architecture_admission_semaphore", None)
+        if not isinstance(semaphore, asyncio.Semaphore):
+            semaphore = asyncio.Semaphore(
+                int(getattr(self, "architecture_max_concurrency", 1))
+            )
+            self._architecture_admission_semaphore = semaphore
+        return semaphore
+
+    async def _plan_initial_architecture_with_admission(
+        self,
+        *,
+        event: ProjectEvent,
+        context: ProjectContext,
+    ) -> GeminiBootstrapWire:
+        semaphore = self._get_architecture_admission_semaphore()
+        queue_timeout = float(
+            getattr(self, "architecture_queue_timeout_seconds", 120.0)
+        )
+        queue_started = time.perf_counter()
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=queue_timeout)
+        except TimeoutError as exc:
+            wait_ms = max(0, round((time.perf_counter() - queue_started) * 1000))
+            metadata = self._current_invocation_metadata()
+            if metadata is not None:
+                metadata["planner_admission_wait_ms"] = wait_ms
+            self.last_usage = {
+                "schema": "archbro.gemini_initial_planner_usage.v1",
+                "transport": self._transport_name(),
+                "requested_model": self.model_id,
+                "completed": False,
+                "admission": {
+                    "status": "TIMEOUT",
+                    "max_concurrency": int(
+                        getattr(self, "architecture_max_concurrency", 1)
+                    ),
+                    "queue_timeout_ms": round(queue_timeout * 1000),
+                    "wait_ms": wait_ms,
+                },
+                "phases": [],
+            }
+            raise _PlannerSafeRetryError(
+                "Initial architecture generation is busy. No provider request was sent; retry shortly."
+            ) from exc
+
+        wait_ms = max(0, round((time.perf_counter() - queue_started) * 1000))
+        metadata = self._current_invocation_metadata()
+        if metadata is not None:
+            metadata["planner_admission_wait_ms"] = wait_ms
+        try:
+            return await self._plan_initial_architecture(event=event, context=context)
+        finally:
+            semaphore.release()
+
     async def draft_goal(
         self,
         *,
@@ -1939,16 +2883,22 @@ class GeminiProvider(ModelProvider):
                 last_unavailable = exc
                 continue
             except Exception as exc:
-                if not self._is_temporary_unavailable(exc):
+                disposition = self._provider_error_disposition(exc)
+                if not disposition.retryable:
                     raise
-                unavailable.append(candidate)
+                retry_reason = (
+                    str(disposition.http_status_code)
+                    if disposition.http_status_code is not None
+                    else disposition.provider_status or "temporary provider error"
+                )
+                unavailable.append(f"{candidate} ({retry_reason})")
                 last_unavailable = exc
 
         details: list[str] = []
         if timed_out:
             details.append("timed out: " + ", ".join(timed_out))
         if unavailable:
-            details.append("503 unavailable: " + ", ".join(unavailable))
+            details.append("retryable provider error: " + ", ".join(unavailable))
         reason = "; ".join(details) or "no model completed"
         raise RuntimeError(
             f"Goal drafting could not complete within the provider deadline ({reason}). "
@@ -2030,7 +2980,10 @@ class GeminiProvider(ModelProvider):
         )
 
         if is_bootstrap:
-            wire = await self._plan_initial_architecture(event=event, context=context)
+            wire = await self._plan_initial_architecture_with_admission(
+                event=event,
+                context=context,
+            )
             return self._bootstrap_to_domain_decision(wire)
 
         raw_manifest = event.payload.get("agent_context_manifest")
@@ -2135,16 +3088,22 @@ class GeminiProvider(ModelProvider):
                 last_unavailable = exc
                 continue
             except Exception as exc:
-                if not self._is_temporary_unavailable(exc):
+                disposition = self._provider_error_disposition(exc)
+                if not disposition.retryable:
                     raise
-                unavailable.append(candidate)
+                retry_reason = (
+                    str(disposition.http_status_code)
+                    if disposition.http_status_code is not None
+                    else disposition.provider_status or "temporary provider error"
+                )
+                unavailable.append(f"{candidate} ({retry_reason})")
                 last_unavailable = exc
 
         details: list[str] = []
         if timed_out:
             details.append("timed out: " + ", ".join(timed_out))
         if unavailable:
-            details.append("503 unavailable: " + ", ".join(unavailable))
+            details.append("retryable provider error: " + ", ".join(unavailable))
         if verification_missed:
             details.append(
                 "required GitHub MCP call missing: " + ", ".join(verification_missed)

@@ -278,6 +278,195 @@ def test_workspace_bootstrap_requires_explicit_paid_call_authorization_for_unkno
     assert initialized_bootstrap.json()["planner_recovery"] is None
 
 
+def test_workspace_bootstrap_exposes_explicit_429_as_retryable_without_paid_confirmation(dsn):
+    repo, client = make_client(dsn)
+    project = client.post(
+        "/projects",
+        json={"name": "Retryable Planner", "goal": "Resume only the rejected planner phase."},
+    ).json()
+    checkpoint = repo.put_planner_checkpoint(
+        project_id=project["id"],
+        plan_id="plan-api-retryable-429",
+        phase_key="RECONCILE",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-api-retryable-429",
+            "project_id": project["id"],
+            "phase_key": "RECONCILE",
+            "attempt_id": "attempt-retryable-429",
+            "delivery_stage": "PROVIDER_REJECTED",
+            "status": "RETRYABLE",
+            "provider": {
+                "requested_model": "gemini-3.8-flash",
+                "error_type": "ClientError",
+                "provider_response_received": True,
+                "retryable_provider_error": True,
+                "http_status_code": 429,
+                "provider_status": "RESOURCE_EXHAUSTED",
+                "retry_after_seconds": 2.0,
+            },
+        },
+    )
+
+    response = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert response.status_code == 200
+    assert response.json()["planner_recovery"] == {
+        "plan_id": "plan-api-retryable-429",
+        "phase_key": "RECONCILE",
+        "attempt_id": "attempt-retryable-429",
+        "revision": checkpoint["revision"],
+        "status": "RETRYABLE",
+        "delivery_stage": "PROVIDER_REJECTED",
+        "action": "RETRY_EVENT",
+        "requires_paid_call_confirmation": False,
+        "retryable_provider_error": True,
+        "http_status_code": 429,
+        "provider_status": "RESOURCE_EXHAUSTED",
+        "retry_after_seconds": 2.0,
+    }
+
+
+def test_workspace_bootstrap_exposes_truncated_phase_as_bounded_retry(dsn):
+    repo, client = make_client(dsn)
+    project = client.post(
+        "/projects",
+        json={
+            "name": "Output Budget Planner",
+            "goal": "Resume a truncated reconciliation without regenerating completed phases.",
+        },
+    ).json()
+    checkpoint = repo.put_planner_checkpoint(
+        project_id=project["id"],
+        plan_id="plan-api-output-budget",
+        phase_key="RECONCILE",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-api-output-budget",
+            "project_id": project["id"],
+            "phase_key": "RECONCILE",
+            "attempt_id": "attempt-output-budget",
+            "delivery_stage": "TRUNCATED_RESPONSE",
+            "status": "RETRYABLE",
+            "resume_max_output_tokens": 32768,
+            "provider": {
+                "requested_model": "gemini-3.8-flash",
+                "finish_reason": "MAX_TOKENS",
+                "provider_response_received": True,
+                "truncated_response": True,
+                "retryable_generation": True,
+                "next_max_output_tokens": 32768,
+            },
+        },
+    )
+
+    response = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert response.status_code == 200
+    assert response.json()["planner_recovery"] == {
+        "plan_id": "plan-api-output-budget",
+        "phase_key": "RECONCILE",
+        "attempt_id": "attempt-output-budget",
+        "revision": checkpoint["revision"],
+        "status": "RETRYABLE",
+        "delivery_stage": "TRUNCATED_RESPONSE",
+        "action": "RETRY_EVENT",
+        "requires_paid_call_confirmation": False,
+        "retryable_generation": True,
+        "next_max_output_tokens": 32768,
+    }
+
+
+def test_workspace_bootstrap_migrates_legacy_unknown_429_to_a_safe_new_plan(dsn):
+    repo, client = make_client(dsn)
+    project = client.post(
+        "/projects",
+        json={"name": "Legacy 429 Planner", "goal": "Recover a v4 quota rejection safely."},
+    ).json()
+    checkpoint = repo.put_planner_checkpoint(
+        project_id=project["id"],
+        plan_id="plan-api-legacy-429",
+        phase_key="RECONCILE",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-api-legacy-429",
+            "project_id": project["id"],
+            "phase_key": "RECONCILE",
+            "attempt_id": "attempt-legacy-429",
+            "delivery_stage": "IN_FLIGHT",
+            "status": "UNKNOWN",
+            "validation": {
+                "status": "UNKNOWN",
+                "error_type": "ClientError",
+                "message": "429 RESOURCE_EXHAUSTED: shared capacity exhausted",
+            },
+            "provider": {
+                "requested_model": "gemini-3.8-flash",
+                "error_type": "ClientError",
+            },
+        },
+    )
+
+    response = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert response.status_code == 200
+    assert response.json()["planner_recovery"] == {
+        "plan_id": "plan-api-legacy-429",
+        "phase_key": "RECONCILE",
+        "attempt_id": "attempt-legacy-429",
+        "revision": checkpoint["revision"],
+        "status": "UNKNOWN",
+        "delivery_stage": "IN_FLIGHT",
+        "action": "START_NEW_PLAN",
+        "requires_paid_call_confirmation": False,
+        "retryable_provider_error": True,
+        "http_status_code": 429,
+        "provider_status": "RESOURCE_EXHAUSTED",
+    }
+
+
+def test_workspace_bootstrap_does_not_mislabel_explicit_permanent_rejection_as_unknown(dsn):
+    repo, client = make_client(dsn)
+    project = client.post(
+        "/projects",
+        json={"name": "Permanent Planner Failure", "goal": "Surface a rejected request truthfully."},
+    ).json()
+    checkpoint = repo.put_planner_checkpoint(
+        project_id=project["id"],
+        plan_id="plan-api-explicit-400",
+        phase_key="SYSTEM_MAP",
+        data={
+            "schema": "archbro.initial_planner_phase.v1",
+            "plan_id": "plan-api-explicit-400",
+            "project_id": project["id"],
+            "phase_key": "SYSTEM_MAP",
+            "attempt_id": "attempt-explicit-400",
+            "delivery_stage": "PROVIDER_REJECTED",
+            "status": "FAILED",
+            "provider": {
+                "requested_model": "gemini-3.8-flash",
+                "error_type": "ClientError",
+                "provider_response_received": True,
+                "retryable_provider_error": False,
+                "http_status_code": 400,
+                "provider_status": "INVALID_ARGUMENT",
+            },
+        },
+    )
+
+    response = client.get(f"/projects/{project['id']}/workspace-bootstrap")
+    assert response.status_code == 200
+    assert response.json()["planner_recovery"] == {
+        "plan_id": "plan-api-explicit-400",
+        "phase_key": "SYSTEM_MAP",
+        "attempt_id": "attempt-explicit-400",
+        "revision": checkpoint["revision"],
+        "status": "FAILED",
+        "delivery_stage": "PROVIDER_REJECTED",
+        "action": None,
+        "requires_paid_call_confirmation": False,
+        "http_status_code": 400,
+        "provider_status": "INVALID_ARGUMENT",
+    }
+
+
 def test_ask_merges_with_current_goal_instead_of_replacing_it(dsn):
     _, client = make_client(dsn)
     current_goal = (

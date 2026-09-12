@@ -50,7 +50,20 @@ def _provider() -> GeminiProvider:
     provider.architecture_phase_timeout_seconds = 1.5
     provider.architecture_total_timeout_seconds = 8.0
     provider.architecture_max_output_tokens = 65536
-    provider.architecture_thinking_level = "high"
+    provider.system_map_max_output_tokens = 4096
+    provider.scope_max_output_tokens = 8192
+    provider.reconcile_max_output_tokens = 16384
+    provider.architecture_thinking_level = "medium"
+    provider.system_map_thinking_level = "low"
+    provider.scope_thinking_level = "low"
+    provider.reconcile_thinking_level = "medium"
+    provider.architecture_retry_attempts = 5
+    provider.retry_initial_delay_seconds = 1.0
+    provider.retry_max_delay_seconds = 8.0
+    provider.retry_exp_base = 2.0
+    provider.retry_jitter = 1.0
+    provider.architecture_max_concurrency = 1
+    provider.architecture_queue_timeout_seconds = 1.0
     return provider
 
 
@@ -142,6 +155,14 @@ class _CheckpointStore:
     def get_planner_checkpoint(self, plan_id: str, phase_key: str):
         value = self.rows.get((plan_id, phase_key))
         return json.loads(json.dumps(value)) if value is not None else None
+
+    def list_planner_checkpoints(self, project_id: str, limit: int = 100):
+        values = [
+            value
+            for value in reversed(list(self.rows.values()))
+            if value.get("project_id") == project_id
+        ][:limit]
+        return json.loads(json.dumps(values))
 
     def put_planner_checkpoint(
         self,
@@ -305,6 +326,306 @@ def test_completed_planner_checkpoints_resume_without_replaying_model_calls():
     assert all(phase["replayed_from_checkpoint"] is True for phase in resumed.last_usage["phases"])
 
 
+@pytest.mark.parametrize(
+    "failed_phase",
+    [
+        "SYSTEM_MAP",
+        "EXPAND_SCOPE:experience",
+        "EXPAND_SCOPE:domain",
+        "EXPAND_SCOPE:coordination",
+        "EXPAND_SCOPE:state",
+        "RECONCILE",
+    ],
+)
+def test_explicit_429_is_retryable_in_every_phase_and_resume_starts_at_failure(
+    failed_phase: str,
+):
+    class StructuredProviderError(RuntimeError):
+        def __init__(self, code: int, status: str, message: str) -> None:
+            self.code = code
+            self.status = status
+            super().__init__(message)
+
+    phase_order = [
+        "SYSTEM_MAP",
+        "EXPAND_SCOPE:experience",
+        "EXPAND_SCOPE:domain",
+        "EXPAND_SCOPE:coordination",
+        "EXPAND_SCOPE:state",
+        "RECONCILE",
+    ]
+    failed_index = phase_order.index(failed_phase)
+    store = _CheckpointStore()
+    context, event = _bootstrap_context()
+    first = _provider()
+    first._checkpoint_repository = store
+    first_calls: list[str] = []
+    _wire_provider(first, first_calls)
+    successful_system_map = first._invoke_system_map
+    successful_scope = first._invoke_scope_delta
+    successful_reconcile = first._invoke_reconcile
+
+    def reject(self: GeminiProvider, model_id: str) -> None:
+        metadata = self._current_invocation_metadata()
+        assert metadata is not None
+        provider_metadata = {
+            "requested_model": model_id,
+            "transport": "vertex",
+            "thinking_level": (
+                "medium" if failed_phase == "RECONCILE" else "low"
+            ),
+            "max_output_tokens": (
+                4096
+                if failed_phase == "SYSTEM_MAP"
+                else (16384 if failed_phase == "RECONCILE" else 8192)
+            ),
+            "retry_attempt_limit": 5,
+            "provider_attempt_count": 5,
+            "provider_rejections": [
+                {
+                    "attempt": attempt,
+                    "error_type": "ClientError",
+                    "http_status_code": 429,
+                    "provider_status": "RESOURCE_EXHAUSTED",
+                    "explicit_response": True,
+                    "retryable": True,
+                }
+                for attempt in range(1, 6)
+            ],
+            "retry_delays_seconds": [1.0, 2.0, 4.0, 8.0],
+            "error_type": "ClientError",
+            "provider_response_received": True,
+            "retryable_provider_error": True,
+            "http_status_code": 429,
+            "provider_status": "RESOURCE_EXHAUSTED",
+            "retry_after_seconds": 2.0,
+        }
+        self._transition_active_planner_checkpoint(
+            "IN_FLIGHT",
+            provider=provider_metadata,
+        )
+        metadata["planner_request_started"] = True
+        metadata["planner_request_in_flight"] = False
+        metadata["planner_dispatch"] = provider_metadata
+        raise StructuredProviderError(
+            429,
+            "RESOURCE_EXHAUSTED",
+            "429 RESOURCE_EXHAUSTED: shared capacity temporarily exhausted",
+        )
+
+    async def maybe_reject_system_map(
+        self: GeminiProvider,
+        model_id: str,
+        prompt: str,
+    ):
+        if failed_phase == "SYSTEM_MAP":
+            first_calls.append("SYSTEM_MAP")
+            reject(self, model_id)
+        return await successful_system_map(model_id, prompt)
+
+    async def maybe_reject_scope(
+        self: GeminiProvider,
+        model_id: str,
+        prompt: str,
+    ):
+        scope_id = self._scope_id_from_prompt(prompt)
+        phase = f"EXPAND_SCOPE:{scope_id}"
+        if failed_phase == phase:
+            first_calls.append(phase)
+            reject(self, model_id)
+        return await successful_scope(model_id, prompt)
+
+    async def maybe_reject_reconcile(
+        self: GeminiProvider,
+        model_id: str,
+        prompt: str,
+    ):
+        if failed_phase == "RECONCILE":
+            first_calls.append("RECONCILE")
+            reject(self, model_id)
+        return await successful_reconcile(model_id, prompt)
+
+    first._invoke_system_map = MethodType(maybe_reject_system_map, first)
+    first._invoke_scope_delta = MethodType(maybe_reject_scope, first)
+    first._invoke_reconcile = MethodType(maybe_reject_reconcile, first)
+
+    with pytest.raises(RuntimeError, match="retryable provider error"):
+        asyncio.run(
+            first.generate(event=event, context=context, system_prompt="unused")
+        )
+
+    assert first_calls == phase_order[: failed_index + 1]
+    plan_id = first._planner_plan_id(context)
+    failed = store.get_planner_checkpoint(plan_id, failed_phase)
+    assert failed is not None
+    assert failed["status"] == "RETRYABLE"
+    assert failed["delivery_stage"] == "PROVIDER_REJECTED"
+    assert failed["validation"]["status"] == "RETRYABLE"
+    assert failed["provider"]["http_status_code"] == 429
+    assert failed["provider"]["provider_status"] == "RESOURCE_EXHAUSTED"
+    assert failed["provider"]["retryable_provider_error"] is True
+    assert failed["provider"]["provider_attempt_count"] == 5
+    assert first.last_usage["phases"][-1]["phase"] == failed_phase
+
+    resumed = _provider()
+    resumed._checkpoint_repository = store
+    resumed_calls: list[str] = []
+    _wire_provider(resumed, resumed_calls)
+    decision = asyncio.run(
+        resumed.generate(event=event, context=context, system_prompt="unused")
+    )
+
+    assert _architecture_from_decision(decision).version == 1
+    assert resumed_calls == phase_order[failed_index:]
+    phases = resumed.last_usage["phases"]
+    assert [phase["phase"] for phase in phases] == phase_order
+    assert all(
+        phase["replayed_from_checkpoint"] is True
+        for phase in phases[:failed_index]
+    )
+    assert all(
+        phase["replayed_from_checkpoint"] is False
+        for phase in phases[failed_index:]
+    )
+    assert phases[failed_index]["status"] == "COMPLETED"
+
+
+def test_new_planner_contract_reuses_compatible_legacy_phases_before_retrying():
+    store = _CheckpointStore()
+    context, event = _bootstrap_context()
+    legacy = _provider()
+    legacy._checkpoint_repository = store
+    legacy._planner_plan_id = MethodType(
+        lambda self, _context: "plan_legacy_v4_fixture",
+        legacy,
+    )
+    legacy_calls: list[str] = []
+    _wire_provider(legacy, legacy_calls)
+
+    async def ambiguous_legacy_reconcile(self, model_id: str, prompt: str):
+        legacy_calls.append("RECONCILE")
+        metadata = self._current_invocation_metadata()
+        assert metadata is not None
+        self._transition_active_planner_checkpoint(
+            "IN_FLIGHT",
+            provider={"requested_model": model_id},
+        )
+        metadata["planner_request_started"] = True
+        metadata["planner_dispatch"] = {"requested_model": model_id}
+        raise TimeoutError("legacy reconcile outcome unknown")
+
+    legacy._invoke_reconcile = MethodType(ambiguous_legacy_reconcile, legacy)
+    with pytest.raises(RuntimeError, match="timed out"):
+        asyncio.run(legacy.generate(event=event, context=context, system_prompt="unused"))
+
+    assert legacy_calls == [
+        "SYSTEM_MAP",
+        "EXPAND_SCOPE:experience",
+        "EXPAND_SCOPE:domain",
+        "EXPAND_SCOPE:coordination",
+        "EXPAND_SCOPE:state",
+        "RECONCILE",
+    ]
+    legacy_reconcile = store.get_planner_checkpoint(
+        "plan_legacy_v4_fixture",
+        "RECONCILE",
+    )
+    assert legacy_reconcile["status"] == "UNKNOWN"
+
+    current = _provider()
+    current._checkpoint_repository = store
+    current_calls: list[str] = []
+    _wire_provider(current, current_calls)
+    decision = asyncio.run(
+        current.generate(event=event, context=context, system_prompt="unused")
+    )
+
+    assert _architecture_from_decision(decision).version == 1
+    assert current_calls == ["RECONCILE"]
+    phases = current.last_usage["phases"]
+    assert all(phase["replayed_from_checkpoint"] is True for phase in phases[:-1])
+    assert all(
+        phase["validation"].get("cross_plan_checkpoint_reuse") is True
+        for phase in phases[:-1]
+    )
+    current_plan_id = current._planner_plan_id(context)
+    imported_system_map = store.get_planner_checkpoint(current_plan_id, "SYSTEM_MAP")
+    assert imported_system_map["delivery_stage"] == "MIGRATED_CHECKPOINT"
+    assert imported_system_map["migrated_from_plan_id"] == "plan_legacy_v4_fixture"
+    assert phases[-1]["phase"] == "RECONCILE"
+    assert phases[-1]["replayed_from_checkpoint"] is False
+
+
+def test_explicit_permanent_provider_rejection_is_failed_not_unknown():
+    class StructuredProviderError(RuntimeError):
+        def __init__(self, code: int, status: str, message: str) -> None:
+            self.code = code
+            self.status = status
+            super().__init__(message)
+
+    store = _CheckpointStore()
+    provider = _provider()
+    provider._checkpoint_repository = store
+    context, event = _bootstrap_context()
+    calls: list[str] = []
+
+    async def rejected_system_map(self, model_id: str, prompt: str):
+        calls.append(model_id)
+        metadata = self._current_invocation_metadata()
+        assert metadata is not None
+        dispatch = {
+            "requested_model": model_id,
+            "transport": "vertex",
+            "error_type": "ClientError",
+            "provider_response_received": True,
+            "retryable_provider_error": False,
+            "http_status_code": 400,
+            "provider_status": "INVALID_ARGUMENT",
+        }
+        self._transition_active_planner_checkpoint("IN_FLIGHT", provider=dispatch)
+        metadata["planner_request_started"] = True
+        metadata["planner_dispatch"] = dispatch
+        raise StructuredProviderError(400, "INVALID_ARGUMENT", "400 invalid schema")
+
+    provider._invoke_system_map = MethodType(rejected_system_map, provider)
+    with pytest.raises(RuntimeError, match="invalid schema"):
+        asyncio.run(provider.generate(event=event, context=context, system_prompt="unused"))
+
+    assert calls == ["gemini-primary"]
+    checkpoint = next(iter(store.rows.values()))
+    assert checkpoint["status"] == "FAILED"
+    assert checkpoint["delivery_stage"] == "PROVIDER_REJECTED"
+    assert checkpoint["validation"]["status"] == "FAIL"
+    assert checkpoint["provider"]["http_status_code"] == 400
+
+
+def test_architecture_admission_timeout_sends_no_provider_request():
+    provider = _provider()
+    provider.architecture_queue_timeout_seconds = 0.01
+    calls: list[str] = []
+    _wire_provider(provider, calls)
+    context, event = _bootstrap_context()
+
+    async def scenario() -> None:
+        semaphore = provider._get_architecture_admission_semaphore()
+        await semaphore.acquire()
+        try:
+            with pytest.raises(RuntimeError, match="generation is busy"):
+                await provider.generate(
+                    event=event,
+                    context=context,
+                    system_prompt="unused",
+                )
+        finally:
+            semaphore.release()
+
+    asyncio.run(scenario())
+    assert calls == []
+    assert provider.last_usage["admission"]["status"] == "TIMEOUT"
+    assert provider.last_usage["admission"]["max_concurrency"] == 1
+    assert provider.last_usage["phases"] == []
+
+
 def test_started_planner_checkpoint_refuses_automatic_paid_replay():
     store = _CheckpointStore()
     provider = _provider()
@@ -386,7 +707,7 @@ def test_temporary_unavailable_after_dispatch_is_unknown_and_never_falls_back():
         raise RuntimeError("503 UNAVAILABLE: dispatch outcome is unknown")
 
     provider._invoke_system_map = MethodType(unavailable_after_dispatch, provider)
-    with pytest.raises(RuntimeError, match="503 unavailable"):
+    with pytest.raises(RuntimeError, match="retryable provider error"):
         asyncio.run(
             provider._run_checkpointed_planner_phase(
                 plan_id=plan_id,
@@ -605,7 +926,7 @@ def test_scope_id_parser_preserves_dotted_server_owned_id():
 
 
 @pytest.mark.parametrize("reconcile", [False, True])
-def test_real_planner_transport_builds_schema_disables_sdk_retry_and_parses_response(monkeypatch, reconcile):
+def test_real_planner_transport_keeps_sdk_single_attempt_and_uses_phase_budget(monkeypatch, reconcile):
     from google import genai
 
     provider = _provider()
@@ -663,8 +984,657 @@ def test_real_planner_transport_builds_schema_disables_sdk_retry_and_parses_resp
         assert expected_schema["properties"]["relationships"].pop("maxItems") == 80
     assert config.response_json_schema == expected_schema
     assert "$defs" in json.dumps(config.response_json_schema)
+    assert config.temperature is None
+    assert config.max_output_tokens == (16384 if reconcile else 4096)
+    assert config.thinking_config.thinking_level.value.lower() == ("medium" if reconcile else "low")
     http_options = captured["http_options"]
     assert http_options.retry_options.attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("phase_name", "output_model", "prompt", "invoke_kwargs", "expected_budgets"),
+    [
+        (
+            "SYSTEM_MAP",
+            GeminiSystemMapWire,
+            "SYSTEM_MAP output escalation fixture",
+            {},
+            [4096, 8192],
+        ),
+        (
+            "EXPAND_SCOPE",
+            GeminiScopeDeltaWire,
+            "EXPAND_SCOPE output escalation fixture",
+            {"expected_scope_id": "experience"},
+            [8192, 16384],
+        ),
+        (
+            "RECONCILE",
+            GeminiReconcileWire,
+            "RECONCILE output escalation fixture",
+            {"reconcile": True},
+            [16384, 32768],
+        ),
+    ],
+)
+def test_max_tokens_expands_only_the_current_phase_until_stop(
+    phase_name,
+    output_model,
+    prompt,
+    invoke_kwargs,
+    expected_budgets,
+):
+    provider = _provider()
+    provider._begin_invocation_metadata()
+    observed_budgets: list[int] = []
+
+    if output_model is GeminiSystemMapWire:
+        completed_output = GeminiSystemMapWire(
+            summary="System map completed after bounded expansion.",
+            roots=_roots(),
+        ).model_dump_json()
+    elif output_model is GeminiScopeDeltaWire:
+        completed_output = GeminiScopeDeltaWire(
+            scope_id="experience",
+            components=[],
+        ).model_dump_json()
+    else:
+        completed_output = GeminiReconcileWire(
+            summary="Reconciliation completed after bounded expansion.",
+            tasks=[TaskProposal(title="Implement bounded planner output")],
+        ).model_dump_json()
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            observed_budgets.append(config.max_output_tokens)
+            if len(observed_budgets) == 1:
+                return SimpleNamespace(
+                    candidates=[
+                        SimpleNamespace(
+                            finish_reason="MAX_TOKENS",
+                            content=SimpleNamespace(
+                                parts=[
+                                    SimpleNamespace(
+                                        text='{"status":"READY","partial":',
+                                        thought=False,
+                                    )
+                                ]
+                            ),
+                        )
+                    ],
+                    usage_metadata=None,
+                    model_version="gemini-output-escalation-test",
+                    response_id="response-truncated",
+                )
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="STOP",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text=completed_output, thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=None,
+                model_version="gemini-output-escalation-test",
+                response_id="response-complete",
+            )
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+        async def aclose(self):
+            return None
+
+    class FakeClient:
+        def __init__(self):
+            self.aio = FakeAio()
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            return FakeClient()
+
+    provider._google_client_factory = FakeFactory()
+    result = asyncio.run(
+        provider._invoke_planner_structured(
+            "gemini-3.8-flash",
+            prompt,
+            output_model,
+            **invoke_kwargs,
+        )
+    )
+
+    assert result is not None, phase_name
+    assert observed_budgets == expected_budgets
+    metadata = provider._current_invocation_metadata()
+    assert metadata is not None
+    response = metadata["planner_response"]
+    assert response["sdk_retry_attempt_limit"] == 1
+    assert response["provider_attempt_count"] == 2
+    assert response["output_token_ceiling"] == 65536
+    assert [attempt["outcome"] for attempt in response["provider_attempts"]] == [
+        "TRUNCATED",
+        "COMPLETED",
+    ]
+    assert response["provider_rejections"] == []
+    assert response["retry_delays_seconds"] == []
+    assert response["retryable_generation"] is False
+
+
+def test_max_tokens_resume_uses_saved_larger_budget_without_replaying_phase_input():
+    store = _CheckpointStore()
+    context, event = _bootstrap_context()
+    prompt = GeminiProvider._system_map_prompt(event=event, context=context)
+    first = _provider()
+    first._checkpoint_repository = store
+    first.architecture_retry_attempts = 1
+    first._begin_invocation_metadata()
+    first_budgets: list[int] = []
+
+    class TruncatedModels:
+        async def generate_content(self, *, model, contents, config):
+            first_budgets.append(config.max_output_tokens)
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="MAX_TOKENS",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text='{"status":', thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=None,
+                model_version="gemini-resume-test",
+                response_id="response-truncated",
+            )
+
+    class TruncatedAio:
+        def __init__(self):
+            self.models = TruncatedModels()
+
+        async def aclose(self):
+            return None
+
+    class TruncatedFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            return SimpleNamespace(aio=TruncatedAio())
+
+    first._google_client_factory = TruncatedFactory()
+    plan_id = first._planner_plan_id(context)
+    with pytest.raises(RuntimeError, match="saved phase will resume"):
+        asyncio.run(
+            first._run_checkpointed_planner_phase(
+                plan_id=plan_id,
+                project_id=context.project.id,
+                phase_key="SYSTEM_MAP",
+                invoke_name="_invoke_system_map",
+                prompt=prompt,
+                output_model=GeminiSystemMapWire,
+                snapshot_before=None,
+                global_deadline=time.perf_counter() + 2.0,
+                validate=lambda _wire: {},
+            )
+        )
+
+    assert first_budgets == [4096]
+    truncated = store.get_planner_checkpoint(plan_id, "SYSTEM_MAP")
+    assert truncated["status"] == "RETRYABLE"
+    assert truncated["delivery_stage"] == "TRUNCATED_RESPONSE"
+    assert truncated["resume_max_output_tokens"] == 8192
+    assert truncated["provider"]["retryable_generation"] is True
+    assert truncated["provider"]["next_max_output_tokens"] == 8192
+
+    resumed = _provider()
+    resumed._checkpoint_repository = store
+    resumed._begin_invocation_metadata()
+    resumed_budgets: list[int] = []
+
+    class CompletedModels:
+        async def generate_content(self, *, model, contents, config):
+            resumed_budgets.append(config.max_output_tokens)
+            output = GeminiSystemMapWire(
+                summary="Resumed from the persisted larger budget.",
+                roots=_roots(),
+            ).model_dump_json()
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="STOP",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text=output, thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=None,
+                model_version="gemini-resume-test",
+                response_id="response-complete",
+            )
+
+    class CompletedAio:
+        def __init__(self):
+            self.models = CompletedModels()
+
+        async def aclose(self):
+            return None
+
+    class CompletedFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            return SimpleNamespace(aio=CompletedAio())
+
+    resumed._google_client_factory = CompletedFactory()
+    result = asyncio.run(
+        resumed._run_checkpointed_planner_phase(
+            plan_id=plan_id,
+            project_id=context.project.id,
+            phase_key="SYSTEM_MAP",
+            invoke_name="_invoke_system_map",
+            prompt=prompt,
+            output_model=GeminiSystemMapWire,
+            snapshot_before=None,
+            global_deadline=time.perf_counter() + 2.0,
+            validate=lambda _wire: {},
+        )
+    )
+
+    assert result.summary == "Resumed from the persisted larger budget."
+    assert resumed_budgets == [8192]
+    completed = store.get_planner_checkpoint(plan_id, "SYSTEM_MAP")
+    assert completed["status"] == "COMPLETED"
+    assert "resume_max_output_tokens" not in completed
+
+
+def test_max_tokens_at_hard_ceiling_is_failed_not_unknown():
+    store = _CheckpointStore()
+    context, event = _bootstrap_context()
+    provider = _provider()
+    provider._checkpoint_repository = store
+    provider.system_map_max_output_tokens = 65536
+    provider._begin_invocation_metadata()
+    calls: list[int] = []
+
+    class CeilingModels:
+        async def generate_content(self, *, model, contents, config):
+            calls.append(config.max_output_tokens)
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="MAX_TOKENS",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text='{"partial":', thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=None,
+                model_version="gemini-ceiling-test",
+                response_id="response-at-ceiling",
+            )
+
+    class CeilingAio:
+        def __init__(self):
+            self.models = CeilingModels()
+
+        async def aclose(self):
+            return None
+
+    class CeilingFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            return SimpleNamespace(aio=CeilingAio())
+
+    provider._google_client_factory = CeilingFactory()
+    prompt = provider._system_map_prompt(event=event, context=context)
+    plan_id = provider._planner_plan_id(context)
+    with pytest.raises(RuntimeError, match="hard output token ceiling"):
+        asyncio.run(
+            provider._run_checkpointed_planner_phase(
+                plan_id=plan_id,
+                project_id=context.project.id,
+                phase_key="SYSTEM_MAP",
+                invoke_name="_invoke_system_map",
+                prompt=prompt,
+                output_model=GeminiSystemMapWire,
+                snapshot_before=None,
+                global_deadline=time.perf_counter() + 2.0,
+                validate=lambda _wire: {},
+            )
+        )
+
+    assert calls == [65536]
+    checkpoint = store.get_planner_checkpoint(plan_id, "SYSTEM_MAP")
+    assert checkpoint["status"] == "FAILED"
+    assert checkpoint["delivery_stage"] == "TRUNCATED_RESPONSE"
+    assert checkpoint["validation"]["status"] == "FAIL"
+    assert checkpoint["provider"]["truncated_response"] is True
+    assert checkpoint["provider"]["retryable_generation"] is False
+
+
+def test_planner_retries_only_explicit_429_and_honors_retry_delay():
+    from google.genai import errors as genai_errors
+
+    provider = _provider()
+    provider._begin_invocation_metadata()
+    provider.retry_jitter = 0.0
+    captured: dict[str, object] = {"calls": 0, "closed": False}
+    delays: list[float] = []
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            captured["calls"] = int(captured["calls"]) + 1
+            if captured["calls"] == 1:
+                raise genai_errors.ClientError(
+                    429,
+                    {
+                        "error": {
+                            "code": 429,
+                            "status": "RESOURCE_EXHAUSTED",
+                            "message": "shared capacity exhausted",
+                            "details": [
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                    "retryDelay": "2.5s",
+                                }
+                            ],
+                        }
+                    },
+                    None,
+                )
+            if captured["calls"] == 2:
+                raise genai_errors.ClientError(
+                    429,
+                    {
+                        "error": {
+                            "code": 429,
+                            "status": "RESOURCE_EXHAUSTED",
+                            "message": "shared capacity still exhausted",
+                        }
+                    },
+                    None,
+                )
+            output = GeminiSystemMapWire(
+                summary="Recovered after explicit capacity rejection",
+                roots=_roots(),
+            ).model_dump_json()
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="STOP",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text=output, thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=None,
+                model_version="gemini-retry-test",
+                response_id="response-after-retry",
+            )
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+        async def aclose(self):
+            captured["closed"] = True
+
+    class FakeClient:
+        def __init__(self):
+            self.aio = FakeAio()
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            captured["http_timeout_ms"] = http_timeout_ms
+            return FakeClient()
+
+    async def record_sleep(self, delay_seconds: float) -> None:
+        delays.append(delay_seconds)
+
+    provider._google_client_factory = FakeFactory()
+    provider._sleep_for_planner_retry = MethodType(record_sleep, provider)
+
+    result = asyncio.run(
+        provider._invoke_planner_structured(
+            "gemini-3.8-flash",
+            "SYSTEM_MAP retry fixture",
+            GeminiSystemMapWire,
+        )
+    )
+
+    assert result.summary == "Recovered after explicit capacity rejection"
+    assert captured["calls"] == 3
+    assert captured["closed"] is True
+    assert delays == [2.5, 2.0]
+    metadata = provider._current_invocation_metadata()
+    assert metadata is not None
+    response = metadata["planner_response"]
+    assert response["retry_attempt_limit"] == 5
+    assert response["provider_attempt_count"] == 3
+    assert response["retry_delays_seconds"] == [2.5, 2.0]
+    assert [item["http_status_code"] for item in response["provider_rejections"]] == [429, 429]
+    assert all(item["explicit_response"] is True for item in response["provider_rejections"])
+    assert metadata["planner_request_in_flight"] is False
+
+
+def test_explicit_429_is_durably_retryable_before_backoff_sleep():
+    from google.genai import errors as genai_errors
+
+    store = _CheckpointStore()
+    context, event = _bootstrap_context()
+    provider = _provider()
+    provider._checkpoint_repository = store
+    provider.retry_jitter = 0.0
+    provider._begin_invocation_metadata()
+    prompt = provider._system_map_prompt(event=event, context=context)
+    plan_id = provider._planner_plan_id(context)
+    calls: list[int] = []
+    observed_during_sleep: list[dict] = []
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            calls.append(config.max_output_tokens)
+            if len(calls) == 1:
+                raise genai_errors.ClientError(
+                    429,
+                    {
+                        "error": {
+                            "code": 429,
+                            "status": "RESOURCE_EXHAUSTED",
+                            "message": "shared capacity exhausted",
+                        }
+                    },
+                    None,
+                )
+            output = GeminiSystemMapWire(
+                summary="Recovered after durable retry checkpoint.",
+                roots=_roots(),
+            ).model_dump_json()
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="STOP",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text=output, thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=None,
+                model_version="gemini-durable-retry-test",
+                response_id="response-after-durable-retry",
+            )
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+        async def aclose(self):
+            return None
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            return SimpleNamespace(aio=FakeAio())
+
+    async def inspect_checkpoint_before_sleep(
+        self: GeminiProvider,
+        delay_seconds: float,
+    ) -> None:
+        checkpoint = store.get_planner_checkpoint(plan_id, "SYSTEM_MAP")
+        assert checkpoint is not None
+        observed_during_sleep.append(checkpoint)
+        assert checkpoint["status"] == "RETRYABLE"
+        assert checkpoint["delivery_stage"] == "PROVIDER_REJECTED"
+        assert checkpoint["validation"]["status"] == "RETRYABLE"
+        assert checkpoint["provider"]["provider_response_received"] is True
+        assert checkpoint["provider"]["retryable_provider_error"] is True
+        assert checkpoint["provider"]["http_status_code"] == 429
+        assert checkpoint["provider"]["provider_attempt_count"] == 1
+        assert len(checkpoint["provider"]["provider_rejections"]) == 1
+        assert delay_seconds == 1.0
+
+    provider._google_client_factory = FakeFactory()
+    provider._sleep_for_planner_retry = MethodType(
+        inspect_checkpoint_before_sleep,
+        provider,
+    )
+
+    result = asyncio.run(
+        provider._run_checkpointed_planner_phase(
+            plan_id=plan_id,
+            project_id=context.project.id,
+            phase_key="SYSTEM_MAP",
+            invoke_name="_invoke_system_map",
+            prompt=prompt,
+            output_model=GeminiSystemMapWire,
+            snapshot_before=None,
+            global_deadline=time.perf_counter() + 2.0,
+            validate=lambda _wire: {},
+        )
+    )
+
+    assert result.summary == "Recovered after durable retry checkpoint."
+    assert calls == [4096, 4096]
+    assert len(observed_during_sleep) == 1
+    completed = store.get_planner_checkpoint(plan_id, "SYSTEM_MAP")
+    assert completed is not None
+    assert completed["status"] == "COMPLETED"
+    assert completed["delivery_stage"] == "RESPONSE_RECORDED"
+    assert completed["validation"]["status"] == "PASS"
+    assert completed["provider"]["provider_attempt_count"] == 2
+
+
+def test_planner_never_retries_ambiguous_transport_timeout():
+    provider = _provider()
+    provider._begin_invocation_metadata()
+    captured: dict[str, object] = {"calls": 0, "closed": False}
+    delays: list[float] = []
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            captured["calls"] = int(captured["calls"]) + 1
+            raise TimeoutError("transport ended without a provider response")
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+        async def aclose(self):
+            captured["closed"] = True
+
+    class FakeClient:
+        def __init__(self):
+            self.aio = FakeAio()
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms):
+            return FakeClient()
+
+    async def record_sleep(self, delay_seconds: float) -> None:
+        delays.append(delay_seconds)
+
+    provider._google_client_factory = FakeFactory()
+    provider._sleep_for_planner_retry = MethodType(record_sleep, provider)
+
+    with pytest.raises(TimeoutError, match="without a provider response"):
+        asyncio.run(
+            provider._invoke_planner_structured(
+                "gemini-3.8-flash",
+                "SYSTEM_MAP ambiguous timeout fixture",
+                GeminiSystemMapWire,
+            )
+        )
+
+    assert captured["calls"] == 1
+    assert captured["closed"] is True
+    assert delays == []
+    metadata = provider._current_invocation_metadata()
+    assert metadata is not None
+    dispatch = metadata["planner_dispatch"]
+    assert dispatch["provider_attempt_count"] == 1
+    assert dispatch["provider_response_received"] is False
+    assert dispatch["retryable_provider_error"] is False
+
+
+def test_model_deadline_during_explicit_rejection_backoff_stays_retryable():
+    store = _CheckpointStore()
+    provider = _provider()
+    provider._checkpoint_repository = store
+    provider.architecture_model_timeout_seconds = 0.01
+    provider.architecture_phase_timeout_seconds = 0.05
+    context, event = _bootstrap_context()
+
+    async def explicit_rejection_then_backoff(
+        self: GeminiProvider,
+        model_id: str,
+        prompt: str,
+    ):
+        metadata = self._current_invocation_metadata()
+        assert metadata is not None
+        dispatch = {
+            "requested_model": model_id,
+            "error_type": "ClientError",
+            "provider_response_received": True,
+            "retryable_provider_error": True,
+            "http_status_code": 429,
+            "provider_status": "RESOURCE_EXHAUSTED",
+            "retry_attempt_limit": 5,
+            "provider_attempt_count": 1,
+        }
+        self._transition_active_planner_checkpoint(
+            "IN_FLIGHT",
+            provider=dispatch,
+        )
+        metadata["planner_request_started"] = True
+        metadata["planner_request_in_flight"] = False
+        metadata["planner_dispatch"] = dispatch
+        await asyncio.sleep(1)
+        raise AssertionError("deadline should cancel the retry wait")
+
+    provider._invoke_system_map = MethodType(
+        explicit_rejection_then_backoff,
+        provider,
+    )
+
+    with pytest.raises(RuntimeError, match="retry deadline after explicit provider rejection"):
+        asyncio.run(
+            provider.generate(event=event, context=context, system_prompt="unused")
+        )
+
+    checkpoint = next(iter(store.rows.values()))
+    assert checkpoint["status"] == "RETRYABLE"
+    assert checkpoint["delivery_stage"] == "PROVIDER_REJECTED"
+    assert checkpoint["validation"]["status"] == "RETRYABLE"
+    assert checkpoint["provider"]["http_status_code"] == 429
 
 
 def test_reconcile_still_rejects_more_than_80_relationships():
@@ -715,8 +1685,9 @@ def test_planner_uses_the_provider_client_factory(monkeypatch):
     class FakeFactory:
         transport = "vertex"
 
-        def create_client(self, *, http_timeout_ms):
+        def create_client(self, *, http_timeout_ms, **retry_options):
             captured["http_timeout_ms"] = http_timeout_ms
+            captured["retry_options"] = retry_options
             return FakeClient()
 
     provider._google_client_factory = FakeFactory()
@@ -732,11 +1703,14 @@ def test_planner_uses_the_provider_client_factory(monkeypatch):
 
     assert result.summary == "Factory transport contract"
     assert captured["http_timeout_ms"] == 500
+    assert captured["retry_options"] == {}
     assert captured["closed"] is True
     metadata = provider._current_invocation_metadata()
     assert metadata is not None
     assert metadata["planner_response"]["transport"] == "vertex"
     assert metadata["planner_response"]["http_timeout_ms"] == 500
+    assert metadata["planner_response"]["retry_attempt_limit"] == 5
+    assert metadata["planner_response"]["provider_attempt_count"] == 1
 
 
 def test_architecture_http_timeout_never_undercuts_the_model_budget(monkeypatch):
@@ -783,8 +1757,9 @@ def test_planner_dispatch_failure_records_effective_deadline_without_model_outpu
     class FakeFactory:
         transport = "vertex"
 
-        def create_client(self, *, http_timeout_ms):
+        def create_client(self, *, http_timeout_ms, **retry_options):
             captured["http_timeout_ms"] = http_timeout_ms
+            captured["retry_options"] = retry_options
             return FakeClient()
 
     provider._google_client_factory = FakeFactory()
@@ -800,6 +1775,7 @@ def test_planner_dispatch_failure_records_effective_deadline_without_model_outpu
         )
 
     assert captured["http_timeout_ms"] == 90_000
+    assert captured["retry_options"] == {}
     assert captured["closed"] is True
     metadata = provider._current_invocation_metadata()
     assert metadata is not None
@@ -824,7 +1800,7 @@ def test_retryable_503_checkpoint_can_retry_without_relaxing_unknown_timeout_bou
         raise RuntimeError("503 UNAVAILABLE: temporary outage")
 
     provider._invoke_system_map = MethodType(unavailable, provider)
-    with pytest.raises(RuntimeError, match="503 unavailable"):
+    with pytest.raises(RuntimeError, match="retryable provider error"):
         asyncio.run(provider.generate(event=event, context=context, system_prompt="unused"))
     assert next(iter(store.rows.values()))["status"] == "RETRYABLE"
 
@@ -1111,13 +2087,22 @@ def test_reconcile_relationship_invariants_apply_even_when_there_is_only_one_lea
         GeminiProvider._validate_reconciled_architecture(duplicated)
 
 
-def test_default_planner_budget_supports_staged_high_thinking(monkeypatch):
+def test_default_planner_budget_uses_bounded_phase_specific_reasoning(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.delenv("GEMINI_ARCHITECTURE_MODEL_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("GEMINI_ARCHITECTURE_PHASE_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("GEMINI_ARCHITECTURE_TOTAL_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS", raising=False)
     monkeypatch.delenv("GEMINI_ARCHITECTURE_THINKING_LEVEL", raising=False)
+    monkeypatch.delenv("GEMINI_SYSTEM_MAP_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("GEMINI_SCOPE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("GEMINI_RECONCILE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("GEMINI_SYSTEM_MAP_THINKING_LEVEL", raising=False)
+    monkeypatch.delenv("GEMINI_SCOPE_THINKING_LEVEL", raising=False)
+    monkeypatch.delenv("GEMINI_RECONCILE_THINKING_LEVEL", raising=False)
+    monkeypatch.delenv("GEMINI_ARCHITECTURE_RETRY_ATTEMPTS", raising=False)
+    monkeypatch.delenv("GEMINI_ARCHITECTURE_MAX_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GEMINI_ARCHITECTURE_QUEUE_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("GEMINI_INTERACTION_MODEL_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("GEMINI_INTERACTION_TOTAL_TIMEOUT_SECONDS", raising=False)
     provider = GeminiProvider(model_id="gemini-test")
@@ -1127,7 +2112,16 @@ def test_default_planner_budget_supports_staged_high_thinking(monkeypatch):
     assert provider.architecture_phase_timeout_seconds == 120
     assert provider.architecture_total_timeout_seconds == 900
     assert provider.architecture_max_output_tokens == 65536
-    assert provider.architecture_thinking_level == "high"
+    assert provider.system_map_max_output_tokens == 4096
+    assert provider.scope_max_output_tokens == 8192
+    assert provider.reconcile_max_output_tokens == 16384
+    assert provider.architecture_thinking_level == "medium"
+    assert provider.system_map_thinking_level == "low"
+    assert provider.scope_thinking_level == "low"
+    assert provider.reconcile_thinking_level == "medium"
+    assert provider.architecture_retry_attempts == 5
+    assert provider.architecture_max_concurrency == 1
+    assert provider.architecture_queue_timeout_seconds == 120
 
 
 def test_system_map_losslessly_accepts_provider_summary_as_responsibility():

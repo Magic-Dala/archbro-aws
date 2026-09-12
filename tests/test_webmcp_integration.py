@@ -195,6 +195,18 @@ def test_webmcp_manifest_and_ping_have_server_build_identity(dsn, monkeypatch):
     assert "WEBMCP_RUNTIME_CHECK_INTERVAL_MS" in module.text
 
 
+def test_runtime_architecture_request_timeout_includes_admission_queue(dsn):
+    repo = PostgresProjectRepository(dsn)
+    provider = FakeModelProvider()
+    provider.architecture_total_timeout_seconds = 90.0
+    provider.architecture_queue_timeout_seconds = 120.0
+    client = TestClient(build_app(repo, provider))
+
+    runtime_config = client.get("/runtime-config.js")
+    assert runtime_config.status_code == 200
+    assert '"architecture_request_timeout_ms": 225000' in runtime_config.text
+
+
 def test_webmcp_bootstrap_bridge_is_single_agent_call_without_builtin_model(dsn):
     client = make_client(dsn)
     app = client.get("/static/app.js")

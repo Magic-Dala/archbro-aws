@@ -5606,6 +5606,45 @@ function renderRecentActivity() {
   }).join('');
 }
 
+function latestPlannerPhase(run = state.lastRun) {
+  const phases = run?.provider_usage?.phases;
+  if (!Array.isArray(phases)) return null;
+  return [...phases].reverse().find((phase) => phase && phase.status !== 'COMPLETED') || null;
+}
+
+function friendlyAgentError(run = state.lastRun) {
+  const admission = run?.provider_usage?.admission;
+  if (admission?.status === 'TIMEOUT') {
+    return 'Architecture generation is busy. No model request was sent; retry shortly.';
+  }
+  const phase = latestPlannerPhase(run);
+  const provider = phase?.provider || {};
+  const isInitialPlannerRun = run?.provider_usage?.schema === 'archbro.gemini_initial_planner_usage.v1';
+  const recovery = run === state.lastRun && isInitialPlannerRun
+    ? state.plannerRecovery
+    : null;
+  const retryable = provider.retryable_provider_error === true
+    || recovery?.retryable_provider_error === true;
+  const retryableGeneration = provider.retryable_generation === true
+    || recovery?.retryable_generation === true;
+  const statusCode = provider.http_status_code ?? recovery?.http_status_code;
+  const providerStatus = provider.provider_status ?? recovery?.provider_status;
+  if (retryableGeneration) {
+    const nextBudget = provider.next_max_output_tokens ?? recovery?.next_max_output_tokens;
+    const budgetText = Number.isInteger(nextBudget)
+      ? ` The next bounded budget is ${nextBudget.toLocaleString()} tokens.`
+      : '';
+    return `The unfinished architecture phase reached its current output budget. Archbro saved the phase and will resume it with a larger bounded budget; completed phases will not be regenerated.${budgetText}`;
+  }
+  if (retryable && (statusCode === 429 || providerStatus === 'RESOURCE_EXHAUSTED')) {
+    return 'Gemini is temporarily at capacity. Archbro used bounded backoff and saved every completed architecture phase. Retry resumes only the unfinished phase.';
+  }
+  if (retryable) {
+    return 'The model service temporarily rejected the unfinished architecture phase. Completed phases are saved, so retry resumes from the failure point.';
+  }
+  return run?.error || 'Agent run failed before state mutation.';
+}
+
 function renderLastRun() {
   const el = $('lastRun');
   if (!el) return;
@@ -5616,8 +5655,11 @@ function renderLastRun() {
   const ok = state.lastRun.result === 'SUCCESS';
   const actions = Array.isArray(state.lastRun.actions) ? state.lastRun.actions : [];
   const details = JSON.stringify(state.lastRun, null, 2);
-  const summary = state.lastRun.summary || state.lastRun.error || 'Latest agent result';
-  el.innerHTML = `<article class="activity-row activity-last-run"><div class="activity-row-summary"><strong>${escapeHtml(goalExcerpt(summary, 96))}</strong><p>${escapeHtml(state.lastRun.provider || 'Agent')} · Latest result</p></div><details class="activity-details"><summary>View result <span aria-hidden="true">＋</span></summary><div class="activity-detail-body"><p class="muted">${ok ? 'SUCCESS' : 'ERROR'} · ${actions.length} action${actions.length === 1 ? '' : 's'} · ${escapeHtml(state.lastRun.model || 'deterministic')}</p>${state.lastRun.error ? `<p class="activity-error">${escapeHtml(state.lastRun.error)}</p>` : ''}<pre>${escapeHtml(details)}</pre></div></details></article>`;
+  const displayError = ok ? null : friendlyAgentError(state.lastRun);
+  const summary = ok
+    ? (state.lastRun.summary || 'Latest agent result')
+    : displayError;
+  el.innerHTML = `<article class="activity-row activity-last-run"><div class="activity-row-summary"><strong>${escapeHtml(goalExcerpt(summary, 96))}</strong><p>${escapeHtml(state.lastRun.provider || 'Agent')} · Latest result</p></div><details class="activity-details"><summary>View result <span aria-hidden="true">＋</span></summary><div class="activity-detail-body"><p class="muted">${ok ? 'SUCCESS' : 'ERROR'} · ${actions.length} action${actions.length === 1 ? '' : 's'} · ${escapeHtml(state.lastRun.model || 'deterministic')}</p>${displayError ? `<p class="activity-error">${escapeHtml(displayError)}</p>` : ''}<pre>${escapeHtml(details)}</pre></div></details></article>`;
 }
 
 function renderGlobalAgentReply() {
@@ -5631,7 +5673,10 @@ function renderGlobalAgentReply() {
   const ok = state.lastRun.result === 'SUCCESS';
   reply.classList.remove('hidden');
   reply.classList.toggle('error', !ok);
-  reply.innerHTML = `<div class="global-agent-reply-head"><span>${ok ? 'AGENT RESPONSE' : 'AGENT ERROR'}</span><small>${escapeHtml(state.lastRun.provider)} · ${escapeHtml(state.lastRun.model)}</small></div><p>${escapeHtml(state.lastRun.summary || state.lastRun.error || 'No response summary.')}</p>`;
+  const responseText = ok
+    ? (state.lastRun.summary || 'No response summary.')
+    : friendlyAgentError(state.lastRun);
+  reply.innerHTML = `<div class="global-agent-reply-head"><span>${ok ? 'AGENT RESPONSE' : 'AGENT ERROR'}</span><small>${escapeHtml(state.lastRun.provider)} · ${escapeHtml(state.lastRun.model)}</small></div><p>${escapeHtml(responseText)}</p>`;
 }
 
 function selectedAgentContextNode() {
@@ -5937,7 +5982,7 @@ async function sendEvent(type, payload, workingDetail = '') {
     if (!committedProjectGuardIsCurrent(guard)) return result;
     state.lastRun = result;
     if (boundedContextRequested) clearAgentContextPreview();
-    if (result.result === 'ERROR') toast(result.error || 'Agent run failed before state mutation.', true);
+    if (result.result === 'ERROR') toast(friendlyAgentError(result), true);
     else toast(result.architecture_review_required ? 'Agent created an architecture proposal for review.' : 'Project state updated.');
     await refresh({projectId, guard});
     return result;
@@ -5975,7 +6020,7 @@ function setArchitectureProgress(working, startedAt = 0) {
       $('architectureProgressHint').textContent = `${architectureModelDisplayName()} is reasoning over the confirmed Goal.`;
     } else if (elapsed < 30) {
       $('architectureProgressText').textContent = 'Reasoning within the configured model deadline';
-      $('architectureProgressHint').textContent = 'Archbro will not issue a second paid model call after an ambiguous dispatch.';
+      $('architectureProgressHint').textContent = 'Explicit transient provider rejections use bounded backoff. Ambiguous timeouts are never replayed automatically.';
     } else {
       $('architectureProgressText').textContent = 'Validating the architecture result';
       $('architectureProgressHint').textContent = 'Components, relationships, and tasks must satisfy the machine-readable Architecture contract.';
@@ -6000,6 +6045,11 @@ function architectureModelDisplayName(modelId = RUNTIME_CONFIG.architecture_mode
 
 function initialArchitectureActionState(recovery = state.plannerRecovery) {
   switch (recovery?.action) {
+    case 'START_NEW_PLAN':
+      return {
+        label: 'Resume architecture generation',
+        hint: 'Gemini explicitly rejected the unfinished phase before returning a result. The updated planner starts safely from the saved Goal without treating it as an unknown paid outcome.',
+      };
     case 'AUTHORIZE_NEW_ATTEMPT':
       return {
         label: 'Authorize new architecture attempt',
@@ -6016,6 +6066,18 @@ function initialArchitectureActionState(recovery = state.plannerRecovery) {
         hint: 'The previous attempt stopped before provider dispatch, so it can be reclaimed without duplicating a paid request.',
       };
     case 'RETRY_EVENT':
+      if (recovery?.retryable_generation) {
+        return {
+          label: 'Resume architecture generation',
+          hint: 'The unfinished phase reached its current output budget. Archbro will retry only that phase with the saved larger bounded budget.',
+        };
+      }
+      if (recovery?.retryable_provider_error) {
+        return {
+          label: 'Resume architecture generation',
+          hint: 'The provider temporarily rejected the unfinished phase. Completed phases are checkpointed, so retry resumes only from the failure point.',
+        };
+      }
       return {
         label: 'Retry initial architecture',
         hint: 'The durable planner state is ready for a fenced retry using the saved Goal.',
@@ -6047,7 +6109,7 @@ function syncInitialArchitectureAction() {
 }
 
 async function recoverInitialArchitectureCheckpoint(projectId, recovery, {signal} = {}) {
-  if (!recovery || recovery.action === 'RETRY_EVENT') return null;
+  if (!recovery || ['RETRY_EVENT', 'START_NEW_PLAN'].includes(recovery.action)) return null;
   if (!recovery.action) throw new Error('This planner checkpoint requires manual recovery.');
   const requestId = `architecture-recovery:${recovery.attempt_id}:${recovery.revision}`;
   const checkpoint = await api(
@@ -6099,7 +6161,7 @@ async function generateInitialArchitecture() {
     if (result.result === 'SUCCESS') {
       toast('Architecture v1 and initial tasks created from the confirmed Goal.');
     } else {
-      toast(result.error || 'Architecture generation stopped safely. Retry when ready.', true);
+      toast(friendlyAgentError(result), true);
     }
     await refresh({projectId, guard});
     return result;

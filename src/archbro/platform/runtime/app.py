@@ -179,9 +179,30 @@ def create_app(
         architecture_total_timeout_seconds = 45.0
     if not math.isfinite(architecture_total_timeout_seconds) or architecture_total_timeout_seconds <= 0:
         architecture_total_timeout_seconds = 45.0
+    try:
+        architecture_queue_timeout_seconds = float(
+            getattr(selected_provider, "architecture_queue_timeout_seconds", 0.0)
+        )
+    except (TypeError, ValueError):
+        architecture_queue_timeout_seconds = 0.0
+    if (
+        not math.isfinite(architecture_queue_timeout_seconds)
+        or architecture_queue_timeout_seconds < 0
+    ):
+        architecture_queue_timeout_seconds = 0.0
+    # The browser deadline must include admission wait as well as the planner's
+    # own global deadline. Otherwise a queued request can be aborted by the UI
+    # while the backend is still safely waiting to begin its first paid call.
     architecture_request_timeout_ms = max(
         60_000,
-        round((architecture_total_timeout_seconds + 15.0) * 1000),
+        round(
+            (
+                architecture_queue_timeout_seconds
+                + architecture_total_timeout_seconds
+                + 15.0
+            )
+            * 1000
+        ),
     )
 
     frontend_dir = Path(web_dir) if web_dir is not None else _project_root() / "frontend" / "web"

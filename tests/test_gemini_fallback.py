@@ -81,17 +81,24 @@ def test_temporary_unavailable_classifier_reads_provider_status_from_exception_c
 
     quota = RuntimeError("provider request failed")
     quota.__cause__ = ProviderStatusError("RESOURCE_EXHAUSTED", "quota exhausted")
-    assert GeminiProvider._is_temporary_unavailable(quota) is False
+    assert GeminiProvider._is_temporary_unavailable(quota) is True
+    disposition = GeminiProvider._provider_error_disposition(quota)
+    assert disposition.explicit_response is True
+    assert disposition.provider_status == "RESOURCE_EXHAUSTED"
 
 
 def test_temporary_unavailable_classifier_accepts_message_only_service_unavailable():
     assert GeminiProvider._is_temporary_unavailable(RuntimeError("upstream unavailable")) is True
     assert GeminiProvider._is_temporary_unavailable(RuntimeError("Service temporarily unavailable")) is True
-    assert GeminiProvider._is_temporary_unavailable(RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")) is False
+    disposition = GeminiProvider._provider_error_disposition(
+        RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")
+    )
+    assert disposition.retryable is True
+    assert disposition.explicit_response is False
 
 
-def test_temporary_unavailable_classifier_protected_message_signals_win():
-    assert GeminiProvider._is_temporary_unavailable(RuntimeError("429 RESOURCE_EXHAUSTED: service temporarily unavailable")) is False
+def test_temporary_unavailable_classifier_auth_message_signals_win():
+    assert GeminiProvider._is_temporary_unavailable(RuntimeError("429 RESOURCE_EXHAUSTED: service temporarily unavailable")) is True
     assert GeminiProvider._is_temporary_unavailable(RuntimeError("401 UNAUTHENTICATED: service temporarily unavailable")) is False
     assert GeminiProvider._is_temporary_unavailable(RuntimeError("403 PERMISSION_DENIED: upstream unavailable")) is False
 
@@ -104,7 +111,7 @@ def test_temporary_unavailable_classifier_nested_protected_status_wins():
 
     outer = ProviderStatusError("UNAVAILABLE", "Service temporarily unavailable")
     outer.__cause__ = ProviderStatusError("RESOURCE_EXHAUSTED", "quota exhausted")
-    assert GeminiProvider._is_temporary_unavailable(outer) is False
+    assert GeminiProvider._is_temporary_unavailable(outer) is True
 
     branched = RuntimeError("provider request failed")
     branched.__cause__ = ProviderStatusError("UNAVAILABLE", "Service temporarily unavailable")
@@ -114,7 +121,7 @@ def test_temporary_unavailable_classifier_nested_protected_status_wins():
 
 def test_temporary_unavailable_classifier_conservative_message_only_policy():
     assert GeminiProvider._is_temporary_unavailable(RuntimeError("Request failed with status 503")) is True
-    assert GeminiProvider._is_temporary_unavailable(RuntimeError("Request failed with status 500")) is False
+    assert GeminiProvider._is_temporary_unavailable(RuntimeError("Request failed with status 500")) is True
     assert GeminiProvider._is_temporary_unavailable(RuntimeError("provider request failed")) is False
 
 
@@ -133,6 +140,35 @@ def test_temporary_unavailable_classifier_accepts_installed_google_genai_server_
     assert type(error).__module__.startswith("google.genai")
     assert error.code == 503
     assert GeminiProvider._is_temporary_unavailable(error) is True
+
+
+def test_provider_error_disposition_reads_real_google_client_error_429_and_retry_delay():
+    from google.genai import errors as genai_errors
+
+    error = genai_errors.ClientError(
+        429,
+        {
+            "error": {
+                "code": 429,
+                "message": "shared capacity exhausted",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "2.5s",
+                    }
+                ],
+            }
+        },
+        None,
+    )
+
+    disposition = GeminiProvider._provider_error_disposition(error)
+    assert disposition.retryable is True
+    assert disposition.explicit_response is True
+    assert disposition.http_status_code == 429
+    assert disposition.provider_status == "RESOURCE_EXHAUSTED"
+    assert disposition.retry_after_seconds == 2.5
 
 
 def test_provider_uses_custom_gateway_transport_when_configured(monkeypatch):
@@ -200,8 +236,9 @@ def test_strands_agent_uses_prebuilt_client_and_closes_it(monkeypatch):
     class FakeFactory:
         transport = "vertex"
 
-        def create_client(self, *, http_timeout_ms):
+        def create_client(self, *, http_timeout_ms, **retry_options):
             captured["http_timeout_ms"] = http_timeout_ms
+            captured["retry_options"] = retry_options
             return client
 
     class FakeGeminiModel:
@@ -233,6 +270,7 @@ def test_strands_agent_uses_prebuilt_client_and_closes_it(monkeypatch):
     assert captured["client"] is client
     assert captured["model_id"] == "gemini-test"
     assert captured["http_timeout_ms"] == 4321
+    assert captured["retry_options"] == {}
     assert captured["closed"] == 1
     assert "sync_closed" not in captured
 
@@ -254,7 +292,7 @@ def test_client_cleanup_failure_does_not_mask_the_provider_error(monkeypatch):
     class FakeFactory:
         transport = "vertex"
 
-        def create_client(self, *, http_timeout_ms):
+        def create_client(self, *, http_timeout_ms, **retry_options):
             return FakeClient()
 
     class FakeGeminiModel:
@@ -394,22 +432,27 @@ def test_wrapped_unavailable_status_falls_through_to_next_model():
     assert decision.actions[0].type == AgentActionType.NO_ACTION
 
 
-def test_429_does_not_fallback():
+def test_429_falls_through_to_an_available_model_after_sdk_retries():
     provider = _provider_with_chain()
     attempts: list[str] = []
 
     async def fake_invoke(self, model_id: str, prompt: str):
         attempts.append(model_id)
-        raise RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")
+        if len(attempts) == 1:
+            raise RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")
+        return GeminiDecisionWire(
+            summary="Recovered after shared-capacity rejection.",
+            evaluation=_aligned_evaluation(),
+            actions=[AgentAction(type=AgentActionType.NO_ACTION)],
+        )
 
     provider._invoke = MethodType(fake_invoke, provider)
     context, event = _context_and_event()
+    decision = asyncio.run(provider.generate(event=event, context=context, system_prompt="test"))
 
-    with pytest.raises(RuntimeError, match="429"):
-        asyncio.run(provider.generate(event=event, context=context, system_prompt="test"))
-
-    assert attempts == ["gemini-3.8-flash"]
-    assert provider.last_model_id == "gemini-3.8-flash"
+    assert attempts == ["gemini-3.8-flash", "gemini-3.6-flash"]
+    assert provider.last_model_id == "gemini-3.6-flash"
+    assert decision.actions[0].type == AgentActionType.NO_ACTION
 
 
 def test_goal_and_routine_chains_use_high_quota_flash_lite_models_first():

@@ -102,6 +102,43 @@ Merging the source migration alone does not switch a running stack: activate it
 only after the runtime service account has the Vertex role and that stack's
 hand-managed `.env` contains the Vertex settings above.
 
+Each deployed stack should also pin the planner reliability policy in its
+hand-managed `.env` so the release fingerprint and operator intent agree:
+
+```env
+GEMINI_SYSTEM_MAP_THINKING_LEVEL=low
+GEMINI_SCOPE_THINKING_LEVEL=low
+GEMINI_RECONCILE_THINKING_LEVEL=medium
+GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS=65536
+GEMINI_SYSTEM_MAP_MAX_OUTPUT_TOKENS=4096
+GEMINI_SCOPE_MAX_OUTPUT_TOKENS=8192
+GEMINI_RECONCILE_MAX_OUTPUT_TOKENS=16384
+GEMINI_ARCHITECTURE_RETRY_ATTEMPTS=5
+GEMINI_RETRY_INITIAL_DELAY_SECONDS=1
+GEMINI_RETRY_MAX_DELAY_SECONDS=8
+GEMINI_RETRY_EXP_BASE=2
+GEMINI_RETRY_JITTER=1
+GEMINI_ARCHITECTURE_MAX_CONCURRENCY=1
+GEMINI_ARCHITECTURE_QUEUE_TIMEOUT_SECONDS=120
+```
+
+Archbro performs the only same-model retry loop for explicit `408`, `429`, and
+`5xx` responses. The Google SDK remains at one attempt because it also retries
+transport timeouts/connect failures whose upstream outcome may be ambiguous.
+Archbro owns model fallback, admission, and durable phase checkpoints. Explicit
+provider rejection is recorded as `PROVIDER_REJECTED`
+(`RETRYABLE` for transient status codes); a transport timeout with no provable
+response remains `UNKNOWN` and cannot be replayed automatically. Validated
+phases are resumed independently, including compatible phases imported from an
+older planner contract, so a failed reconciliation does not regenerate the
+system map or scope expansions.
+
+The phase output values above are starting budgets, not hard truncation limits.
+When Vertex returns the explicit `MAX_TOKENS` finish reason, Archbro records the
+response as `TRUNCATED_RESPONSE`, refuses to parse its partial JSON, and retries
+only that phase with a doubled budget up to the 65,536-token hard ceiling. If the
+request deadline ends first, the larger budget is persisted for the next retry.
+
 First-party provider OAuth transient state is process-local. Deployed provider
 OAuth therefore runs as a single application worker. The runtime guard checks
 `WEB_CONCURRENCY`, `UVICORN_WORKERS`, Uvicorn `--workers N`, and `--workers=N`

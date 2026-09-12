@@ -407,6 +407,15 @@ test('architecture generation uses runtime model identity, bounded recovery, and
   assert.match(js, /ARCHITECTURE_REQUEST_TIMEOUT_MS/);
   assert.match(js, /Authorize new architecture attempt/);
   assert.match(js, /never replay it automatically/);
+  assert.match(js, /START_NEW_PLAN/);
+  assert.match(js, /function friendlyAgentError\(/);
+  assert.match(js, /Gemini is temporarily at capacity/);
+  assert.match(js, /bounded backoff/);
+  assert.match(js, /retry resumes only from the failure point/);
+  assert.match(js, /reached its current output budget/);
+  assert.match(js, /completed phases will not be regenerated/);
+  assert.match(js, /retryable_generation/);
+  assert.match(js, /\['RETRY_EVENT', 'START_NEW_PLAN'\]\.includes\(recovery\.action\)/);
   assert.match(js, /\/planner\/checkpoints\/\$\{encodeURIComponent\(recovery\.plan_id\)\}/);
   assert.match(js, /action: recovery\.action/);
   assert.doesNotMatch(js, /3\.7 Flash/);

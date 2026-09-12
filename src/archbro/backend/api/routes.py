@@ -159,18 +159,53 @@ def _planner_recovery_descriptor(
             and isinstance(provider.get("raw_model_output"), str)
             and provider.get("raw_model_output")
         )
+        provider_response_received = bool(
+            isinstance(provider, dict)
+            and provider.get("provider_response_received") is True
+        )
+        retryable_provider_error = bool(
+            isinstance(provider, dict)
+            and provider.get("retryable_provider_error") is True
+        )
+        retryable_generation = bool(
+            isinstance(provider, dict)
+            and provider.get("retryable_generation") is True
+        )
+        validation = checkpoint.get("validation")
+        validation_message = (
+            str(validation.get("message") or "")
+            if isinstance(validation, dict)
+            else ""
+        )
+        # v4 planner checkpoints predate structured provider-error metadata and
+        # incorrectly stored an explicit Google ClientError 429 as UNKNOWN.
+        # This narrow signature is enough to start the v5 plan without asking
+        # the user to authorize an already-rejected paid request. Ambiguous
+        # timeouts and connection failures retain the manual boundary.
+        legacy_explicit_429 = bool(
+            status == "UNKNOWN"
+            and delivery_stage == "IN_FLIGHT"
+            and isinstance(provider, dict)
+            and provider.get("error_type") == "ClientError"
+            and "429" in validation_message
+            and "RESOURCE_EXHAUSTED" in validation_message.upper()
+        )
         if status in {"RETRYABLE", "REPROCESSABLE"}:
             action: str | None = "RETRY_EVENT"
+        elif legacy_explicit_429:
+            action = "START_NEW_PLAN"
         elif delivery_stage == "RESPONSE_RECORDED" and response_reprocessable:
             action = "REPROCESS_RESPONSE"
         elif delivery_stage == "PREPARED":
             action = "RECLAIM_PREPARED"
+        elif status == "FAILED" and provider_response_received:
+            action = None
         elif delivery_stage == "IN_FLIGHT" or status == "UNKNOWN":
             action = "AUTHORIZE_NEW_ATTEMPT"
         else:
             action = None
 
-        return {
+        descriptor = {
             "plan_id": plan_id,
             "phase_key": phase_key,
             "attempt_id": attempt_id,
@@ -180,6 +215,31 @@ def _planner_recovery_descriptor(
             "action": action,
             "requires_paid_call_confirmation": action == "AUTHORIZE_NEW_ATTEMPT",
         }
+        if retryable_provider_error or legacy_explicit_429:
+            descriptor["retryable_provider_error"] = True
+        if retryable_generation:
+            descriptor["retryable_generation"] = True
+        if isinstance(provider, dict):
+            http_status_code = provider.get("http_status_code")
+            if isinstance(http_status_code, int):
+                descriptor["http_status_code"] = http_status_code
+            provider_status = provider.get("provider_status")
+            if isinstance(provider_status, str) and provider_status:
+                descriptor["provider_status"] = provider_status
+            retry_after_seconds = provider.get("retry_after_seconds")
+            if isinstance(retry_after_seconds, (int, float)):
+                descriptor["retry_after_seconds"] = retry_after_seconds
+            next_max_output_tokens = provider.get("next_max_output_tokens")
+            if (
+                isinstance(next_max_output_tokens, int)
+                and not isinstance(next_max_output_tokens, bool)
+                and next_max_output_tokens > 0
+            ):
+                descriptor["next_max_output_tokens"] = next_max_output_tokens
+        if legacy_explicit_429:
+            descriptor["http_status_code"] = 429
+            descriptor["provider_status"] = "RESOURCE_EXHAUSTED"
+        return descriptor
     return None
 
 

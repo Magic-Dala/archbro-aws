@@ -212,6 +212,40 @@ application-default login`. To retain Developer API or gateway mode, set
 `GOOGLE_GENAI_USE_VERTEXAI=false` and configure one of `GEMINI_API_KEY` or
 `GOOGLE_API_KEY`.
 
+Initial Architecture generation is shaped for shared Vertex capacity rather
+than sending an unbounded burst. The application admits one bootstrap plan at a
+time by default, uses a bounded Archbro-owned backoff loop for explicit `408`,
+`429`, and `5xx` provider rejections, and checkpoints every validated phase. A retry therefore
+resumes at the first unfinished phase; compatible completed phases from an older
+planner contract are revalidated and imported instead of regenerated. A real
+timeout or connection loss after dispatch remains `UNKNOWN` and still requires
+explicit human authorization because the upstream outcome cannot be proven.
+The Google SDK remains configured for one attempt so it cannot silently retry
+an ambiguous transport failure underneath that checkpoint boundary.
+
+The default planner budgets are deliberately phase-specific:
+
+```env
+GEMINI_SYSTEM_MAP_THINKING_LEVEL=low
+GEMINI_SCOPE_THINKING_LEVEL=low
+GEMINI_RECONCILE_THINKING_LEVEL=medium
+GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS=65536
+GEMINI_SYSTEM_MAP_MAX_OUTPUT_TOKENS=4096
+GEMINI_SCOPE_MAX_OUTPUT_TOKENS=8192
+GEMINI_RECONCILE_MAX_OUTPUT_TOKENS=16384
+GEMINI_ARCHITECTURE_RETRY_ATTEMPTS=5
+GEMINI_ARCHITECTURE_MAX_CONCURRENCY=1
+```
+
+The three phase values are starting budgets. An explicit `MAX_TOKENS` response
+is a known provider result, so Archbro checkpoints that exact phase and doubles
+only its output budget, bounded by the 65,536-token hard ceiling. It never parses
+or accepts a truncated JSON response and never regenerates completed phases.
+See `.env.example` for the complete retry timing, queue timeout, and hard output
+ceiling. These values enter the public safe-configuration fingerprint, so a
+deployed runtime reports which reliability policy it is actually using without
+exposing credentials.
+
 For deterministic WebMCP acceptance without built-in model calls:
 
 ```env
