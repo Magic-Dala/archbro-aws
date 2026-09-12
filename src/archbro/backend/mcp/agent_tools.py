@@ -225,6 +225,33 @@ def requested_github_repositories(event: ProjectEvent) -> tuple[str, ...]:
     return tuple(repositories)
 
 
+def _repository_evidence_opted_out(text: str) -> bool:
+    """Return True when the user explicitly says not to retrieve repository data."""
+
+    repository_action = (
+        r"(?:use\s+(?:the\s+)?github(?:[ -]+mcp)?|fetch|read|open|get|"
+        r"inspect|check|search|look\s+up|retrieve|load)"
+    )
+    english_negations = (
+        rf"\b(?:do\s+not|don't|never)\s+(?:actually\s+)?{repository_action}\b",
+        rf"\bnot\s+(?:asking|requesting|trying)\s+(?:you\s+)?to\s+{repository_action}\b",
+        rf"\bnot\s+(?:a\s+)?request\s+to\s+{repository_action}\b",
+        rf"\b(?:no\s+need|not\s+necessary)\s+to\s+{repository_action}\b",
+    )
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in english_negations):
+        return True
+
+    chinese_action = (
+        r"(?:使用\s*github(?:[ -]*mcp)?|抓取|讀取|查詢|搜尋|取得|"
+        r"fetch|read|open|get|retrieve|load)"
+    )
+    chinese_negations = (
+        rf"(?:不要|不用|無需|毋須)\s*(?:你\s*)?{chinese_action}",
+        rf"(?:不是|並非)\s*(?:要|要求|請求)?\s*(?:你\s*)?(?:去\s*)?{chinese_action}",
+    )
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in chinese_negations)
+
+
 def repository_evidence_requested(event: ProjectEvent) -> bool:
     """Conservatively identify an explicit repository/MCP verification request."""
 
@@ -249,7 +276,7 @@ def repository_evidence_requested(event: ProjectEvent) -> bool:
             "不要用github",
             "不用github",
         )
-    ):
+    ) or _repository_evidence_opted_out(lowered):
         return False
     explicit_tool_request = re.search(r"\b(?:use|using)\s+(?:the\s+)?github[ -]+mcp\b|(?:使用|透過|用)\s*github[ -]*mcp", lowered) is not None
     if explicit_tool_request:
