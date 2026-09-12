@@ -21,6 +21,10 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from archbro.backend.mcp.provider_credentials import (
+    ProviderCredentialStore,
+    StoredProviderCredential,
+)
 from archbro.integrations.google_drive import DRIVE_API_BASE_URL, GoogleDriveApiAdapter
 from archbro.integrations.microsoft_teams import MicrosoftTeamsGraphAdapter
 
@@ -124,10 +128,13 @@ class _ConnectionState:
     google_access_token: str | None = None
     drive_adapter: GoogleDriveApiAdapter | None = None
     graph_adapter: MicrosoftTeamsGraphAdapter | None = None
+    restored_from_store: bool = False
+    credential_committed: bool = False
+    credential_dirty: bool = False
 
 
 class ExternalMcpGateway:
-    """Human-configured, memory-only MCP connection gateway."""
+    """Principal-scoped MCP gateway with optional encrypted OAuth persistence."""
 
     def __init__(
         self,
@@ -135,6 +142,8 @@ class ExternalMcpGateway:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         google_auth_timeout_seconds: float = GOOGLE_AUTH_TIMEOUT_SECONDS,
         reuse_existing_google_credential: bool = False,
+        credential_owner: str | None = None,
+        credential_store: ProviderCredentialStore | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
@@ -143,7 +152,13 @@ class ExternalMcpGateway:
         self.timeout_seconds = timeout_seconds
         self.google_auth_timeout_seconds = google_auth_timeout_seconds
         self.reuse_existing_google_credential = reuse_existing_google_credential
+        owner = (credential_owner or "").strip()
+        if bool(owner) != bool(credential_store):
+            raise ValueError("credential_owner and credential_store must be configured together")
+        self.credential_owner = owner or None
+        self.credential_store = credential_store
         self._connections: dict[str, _ConnectionState] = {}
+        self._credential_lock = threading.RLock()
 
     def add_connection(self, config: McpConnectionConfig) -> dict[str, Any]:
         connection_id = f"mcp_{uuid4().hex}"
@@ -159,6 +174,125 @@ class ExternalMcpGateway:
             # read-only capability filter and removes mutation tools.
             headers["X-MCP-Readonly"] = "true"
         return headers
+
+    @property
+    def credential_persistence_enabled(self) -> bool:
+        return bool(self.credential_owner and self.credential_store and self.credential_store.persistent)
+
+    def _credential_for_state(self, state: _ConnectionState) -> StoredProviderCredential:
+        oauth = state.oauth
+        provider = (state.provider or "").strip()
+        endpoint = (state.config.url or "").strip()
+        authorization = state.config.headers.get("Authorization", "")
+        prefix, separator, access_token = authorization.partition(" ")
+        if (
+            oauth is None
+            or not provider
+            or not endpoint
+            or prefix.lower() != "bearer"
+            or not separator
+            or not access_token.strip()
+        ):
+            raise RuntimeError("OAuth provider connection cannot be persisted safely")
+        return StoredProviderCredential(
+            connection_id=state.id,
+            provider=provider,
+            name=state.config.name,
+            url=endpoint,
+            auth_type=state.auth_type,
+            access_token=access_token.strip(),
+            refresh_token=oauth.refresh_token,
+            expires_at=oauth.expires_at,
+            token_url=oauth.token_url,
+            client_id=oauth.client_id,
+            client_secret=oauth.client_secret,
+            display_endpoint=state.display_endpoint,
+            tool_count=state.tool_count,
+        )
+
+    def _persist_state(self, state: _ConnectionState) -> None:
+        with self._credential_lock:
+            if not self.credential_persistence_enabled:
+                return
+            if self._connections.get(state.id) is not state:
+                raise RuntimeError("Provider connection changed; a removed connection cannot be persisted")
+            assert self.credential_owner is not None
+            assert self.credential_store is not None
+            self.credential_store.upsert(
+                self.credential_owner,
+                self._credential_for_state(state),
+            )
+            state.credential_dirty = False
+
+    def restore_oauth_connection(
+        self, credential: StoredProviderCredential
+    ) -> dict[str, Any]:
+        if credential.auth_type not in {"oauth", "microsoft_teams_oauth"}:
+            raise ValueError("only first-party OAuth connections can be restored")
+        if credential.connection_id in self._connections:
+            raise ValueError("stored provider connection ID is already active")
+        headers = (
+            {"Authorization": f"Bearer {credential.access_token}"}
+            if credential.auth_type == "microsoft_teams_oauth"
+            else self._provider_bearer_headers(credential.provider, credential.access_token)
+        )
+        config = McpConnectionConfig(
+            name=credential.name,
+            transport="streamable_http",
+            url=credential.url,
+            headers=headers,
+        )
+        graph_adapter = None
+        if credential.auth_type == "microsoft_teams_oauth":
+            graph_adapter = MicrosoftTeamsGraphAdapter(
+                credential.access_token,
+                timeout_seconds=self.timeout_seconds,
+                enable_write=os.getenv("ARCHBRO_TEAMS_ENABLE_WRITE", "").strip().lower()
+                in {"1", "true", "yes", "on"},
+            )
+        state = _ConnectionState(
+            id=credential.connection_id,
+            config=config,
+            provider=credential.provider,
+            auth_type=credential.auth_type,
+            oauth=_OAuthTokenState(
+                provider=credential.provider,
+                token_url=credential.token_url,
+                client_id=credential.client_id,
+                client_secret=credential.client_secret,
+                refresh_token=credential.refresh_token,
+                expires_at=credential.expires_at,
+            ),
+            display_endpoint=credential.display_endpoint,
+            tool_count=credential.tool_count,
+            graph_adapter=graph_adapter,
+            restored_from_store=True,
+            credential_committed=True,
+        )
+        self._remove_provider_connections(
+            credential.provider,
+            endpoint=credential.url,
+            name=credential.name,
+            persist=False,
+        )
+        self._connections[state.id] = state
+        return self._public(state)
+
+    def commit_oauth_connection(self, connection_id: str) -> dict[str, Any]:
+        with self._credential_lock:
+            state = self._get(connection_id)
+            if state.oauth is None or not state.provider:
+                raise ValueError("connection is not a persistable OAuth provider")
+            self._persist_state(state)
+            state.credential_committed = True
+            self._remove_provider_connections(
+                state.provider,
+                endpoint=state.config.url or "",
+                name=state.config.name,
+                persist=False,
+                exclude_connection_id=state.id,
+            )
+            return self._public(state)
 
     def add_bearer_connection(
         self,
@@ -428,6 +562,8 @@ class ExternalMcpGateway:
         token_url: str,
         client_id: str,
         client_secret: str,
+        persist: bool = True,
+        replace_existing: bool = True,
     ) -> dict[str, Any]:
         provider = provider.strip()
         if not provider:
@@ -435,7 +571,11 @@ class ExternalMcpGateway:
         token = access_token.strip()
         if not token:
             raise ValueError("OAuth access token is required")
-        self._remove_provider_connections(provider, endpoint=url, name=name)
+        existing_ids = [
+            connection_id
+            for connection_id, existing in self._connections.items()
+            if existing.provider == provider
+        ]
         config = McpConnectionConfig(
             name=name,
             transport="streamable_http",
@@ -457,8 +597,18 @@ class ExternalMcpGateway:
                 refresh_token=refresh_token,
                 expires_at=expires_at,
             ),
+            credential_committed=persist,
         )
         self._connections[connection_id] = state
+        try:
+            if persist:
+                self._persist_state(state)
+        except Exception:
+            self._connections.pop(connection_id, None)
+            raise
+        if replace_existing:
+            for existing_id in existing_ids:
+                self.remove_connection(existing_id, persist=False)
         return self._public(state)
 
     def add_microsoft_teams_oauth_connection(
@@ -472,6 +622,8 @@ class ExternalMcpGateway:
         token_url: str,
         client_id: str,
         client_secret: str,
+        persist: bool = True,
+        replace_existing: bool = True,
     ) -> dict[str, Any]:
         """Add the local MCP-shaped Teams adapter after Microsoft OAuth."""
         provider = provider.strip()
@@ -481,7 +633,11 @@ class ExternalMcpGateway:
         if not token:
             raise ValueError("Microsoft Teams access token is required")
         endpoint = "https://graph.microsoft.com/v1.0"
-        self._remove_provider_connections(provider, endpoint=endpoint, name=name)
+        existing_ids = [
+            connection_id
+            for connection_id, existing in self._connections.items()
+            if existing.provider == provider
+        ]
         config = McpConnectionConfig(
             name=name,
             transport="streamable_http",
@@ -507,32 +663,67 @@ class ExternalMcpGateway:
             graph_adapter=MicrosoftTeamsGraphAdapter(
                 token,
                 timeout_seconds=self.timeout_seconds,
-                enable_write=os.getenv("ARCHBRO_TEAMS_ENABLE_WRITE", "").strip().lower() in {"1", "true", "yes", "on"},
+                enable_write=os.getenv("ARCHBRO_TEAMS_ENABLE_WRITE", "").strip().lower()
+                in {"1", "true", "yes", "on"},
             ),
+            credential_committed=persist,
         )
         self._connections[connection_id] = state
+        try:
+            if persist:
+                self._persist_state(state)
+        except Exception:
+            self._connections.pop(connection_id, None)
+            raise
+        if replace_existing:
+            for existing_id in existing_ids:
+                self.remove_connection(existing_id, persist=False)
         return self._public(state)
 
-    def _remove_provider_connections(self, provider: str, *, endpoint: str, name: str) -> None:
+    def _remove_provider_connections(
+        self,
+        provider: str,
+        *,
+        endpoint: str,
+        name: str,
+        persist: bool = True,
+        exclude_connection_id: str | None = None,
+    ) -> None:
         for connection_id, existing in list(self._connections.items()):
-            same_provider = existing.provider == provider or (existing.oauth and existing.oauth.provider == provider)
+            if connection_id == exclude_connection_id:
+                continue
+            same_provider = existing.provider == provider or (
+                existing.oauth and existing.oauth.provider == provider
+            )
             same_legacy_connection = (
                 existing.config.transport == "streamable_http"
                 and existing.config.url == endpoint
                 and existing.config.name == name
             )
             if same_provider or same_legacy_connection:
-                self.remove_connection(connection_id)
+                self.remove_connection(connection_id, persist=persist)
 
-    def remove_connection(self, connection_id: str) -> bool:
-        state = self._connections.pop(connection_id, None)
-        if state is None:
-            return False
-        if state.stdio_session is not None:
-            self._stop_persistent_stdio(state.stdio_session)
-        if state.browser_auth_session is not None:
-            self._stop_browser_auth_session(state.browser_auth_session)
-        return True
+    def remove_connection(self, connection_id: str, *, persist: bool = True) -> bool:
+        with self._credential_lock:
+            state = self._connections.get(connection_id)
+            if state is None:
+                return False
+            if (
+                persist
+                and state.oauth is not None
+                and state.credential_committed
+                and state.provider
+                and self.credential_persistence_enabled
+            ):
+                assert self.credential_owner is not None
+                assert self.credential_store is not None
+                self.credential_store.delete(self.credential_owner, state.provider)
+            self._connections.pop(connection_id, None)
+            if state.stdio_session is not None:
+                self._stop_persistent_stdio(state.stdio_session)
+            if state.browser_auth_session is not None:
+                self._stop_browser_auth_session(state.browser_auth_session)
+            return True
 
     def list_connections(self) -> list[dict[str, Any]]:
         return [self._public(state) for state in self._connections.values()]
@@ -549,6 +740,8 @@ class ExternalMcpGateway:
         state.tool_count = len(tools)
         state.last_probe_ok = True
         state.last_error = None
+        if state.oauth is not None and state.credential_committed:
+            self._persist_state(state)
         return {"ok": True, "tool_count": len(tools), "connection": self._public(state)}
 
     def list_tools(self, connection_id: str) -> dict[str, Any]:
@@ -585,8 +778,7 @@ class ExternalMcpGateway:
         message = str(exc).strip() or type(exc).__name__
         return message[:500]
 
-    @staticmethod
-    def _public(state: _ConnectionState) -> dict[str, Any]:
+    def _public(self, state: _ConnectionState) -> dict[str, Any]:
         config = state.config
         endpoint = state.display_endpoint or (config.url if config.transport == "streamable_http" else (config.command or ""))
         return {
@@ -603,9 +795,25 @@ class ExternalMcpGateway:
             "auth_type": state.auth_type,
             "provider": state.provider,
             "authorization_pending": state.authorization_pending,
+            "persistent": bool(
+                state.oauth is not None
+                and state.credential_committed
+                and self.credential_persistence_enabled
+            ),
+            "restored": state.restored_from_store,
         }
 
     def _ensure_fresh_oauth(self, state: _ConnectionState) -> None:
+        with self._credential_lock:
+            if self._connections.get(state.id) is not state:
+                raise RuntimeError("Provider connection changed; refresh the available connections")
+            if state.credential_dirty:
+                # A provider may have rotated its refresh token before a database
+                # outage. Retry that save, not the paid/rotating provider request.
+                self._persist_state(state)
+            self._refresh_oauth(state)
+
+    def _refresh_oauth(self, state: _ConnectionState) -> None:
         if state.auth_type in {"google_gcloud", "google_drive_oauth"}:
             if state.authorization_pending:
                 raise RuntimeError("Google Drive authorization is still pending")
@@ -660,6 +868,7 @@ class ExternalMcpGateway:
         access_token = str(token.get("access_token") or "").strip()
         if not access_token:
             raise RuntimeError(f"{oauth.provider} OAuth refresh returned no access token")
+        state.credential_dirty = bool(state.credential_committed and self.credential_persistence_enabled)
         state.config.headers["Authorization"] = f"Bearer {access_token}"
         if state.graph_adapter is not None:
             state.graph_adapter.update_access_token(access_token)
@@ -671,6 +880,8 @@ class ExternalMcpGateway:
         except (TypeError, ValueError):
             expires_in = 3600
         oauth.expires_at = time.time() + max(60, expires_in)
+        if state.credential_committed:
+            self._persist_state(state)
 
     def _list_tools(self, config: McpConnectionConfig) -> list[dict[str, Any]]:
         result = self._request(config, "tools/list", {})

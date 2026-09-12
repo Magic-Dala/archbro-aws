@@ -13,13 +13,16 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from archbro.backend.api.provider_connections import ProviderMcpRuntimeRegistry
 from archbro.backend.api.routes import build_router
 from archbro.backend.core.authorization import PrincipalProvider
 from archbro.backend.core.repository import ProjectRepositoryPort
 from archbro.backend.llm.fake import FakeModelProvider
 from archbro.backend.llm.gemini import GeminiProvider
 from archbro.backend.llm.provider import ModelProvider
+from archbro.backend.mcp.provider_credentials import ProviderCredentialStore
 from archbro.platform.persistence.postgres import PostgresProjectRepository
+from archbro.platform.persistence.provider_credentials import PostgresProviderCredentialStore
 from archbro.platform.runtime.release_identity import (
     build_public_readiness_report,
     build_readiness_report,
@@ -63,6 +66,7 @@ def create_app(
     *,
     web_dir: str | Path | None = None,
     principal_provider: PrincipalProvider | None = None,
+    provider_credential_store: ProviderCredentialStore | None = None,
 ) -> FastAPI:
     """Max-owned runtime composition root.
 
@@ -71,13 +75,13 @@ def create_app(
     deployment/runtime details.
     """
 
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
     selected_repository = repository
     if selected_repository is None:
         persistence_mode = os.getenv("ARCHBRO_PERSISTENCE", "postgres").strip().lower()
         if persistence_mode != "postgres":
             raise ValueError("ARCHBRO_PERSISTENCE must be 'postgres'")
 
-        database_url = (os.getenv("DATABASE_URL") or "").strip()
         if not database_url:
             raise ValueError(
                 "DATABASE_URL is required when ARCHBRO_PERSISTENCE=postgres"
@@ -87,6 +91,38 @@ def create_app(
     environment = os.getenv("ARCHBRO_ENV", "local").strip().lower()
     if environment not in {"local", "test", "production"}:
         raise ValueError("ARCHBRO_ENV must be 'local', 'test', or 'production'")
+
+
+    selected_provider_credential_store = provider_credential_store
+    provider_credential_key = os.getenv("ARCHBRO_PROVIDER_CREDENTIAL_KEY", "").strip()
+    provider_oauth_configured = any(
+        os.getenv(name, "").strip()
+        for name in (
+            "ARCHBRO_GITHUB_OAUTH_CLIENT_ID",
+            "ARCHBRO_GOOGLE_DRIVE_OAUTH_CLIENT_ID",
+            "ARCHBRO_SLACK_OAUTH_CLIENT_ID",
+            "ARCHBRO_MICROSOFT_TEAMS_CLIENT_ID",
+        )
+    )
+    if selected_provider_credential_store is None and provider_credential_key:
+        if not database_url:
+            raise ValueError(
+                "DATABASE_URL is required when ARCHBRO_PROVIDER_CREDENTIAL_KEY is configured"
+            )
+        selected_provider_credential_store = PostgresProviderCredentialStore(
+            database_url,
+            provider_credential_key,
+        )
+    if (
+        environment == "production"
+        and provider_oauth_configured
+        and selected_provider_credential_store is None
+    ):
+        raise ValueError(
+            "ARCHBRO_PROVIDER_CREDENTIAL_KEY is required when first-party provider OAuth "
+            "is enabled in production"
+        )
+    provider_mcp_runtime = ProviderMcpRuntimeRegistry(selected_provider_credential_store)
 
     edge_guard_mode = os.getenv("ARCHBRO_EDGE_GUARD", "off").strip().lower()
     if edge_guard_mode not in {"off", "required"}:
@@ -277,6 +313,7 @@ def create_app(
             selected_provider,
             goal_request_timeout_seconds=goal_timeout,
             principal_provider=selected_principal_provider,
+            provider_mcp_runtime=provider_mcp_runtime,
         )
     )
 

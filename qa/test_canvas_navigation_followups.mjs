@@ -145,7 +145,7 @@ test('Living and Code graph switches preserve independent selections', () => {
 
 async function scopeHarness({visibleComponent=false}={}) {
   const callbacks=[]; const focused=[];
-  const state={projectId:'current', architecture:{version:1}, readingMode:'MAP', scopeComponentId:null, workspaceAsync:{}, diagram:{nodes:[]}};
+  const state={projectId:'current', currentView:'architecture', architecture:{version:1}, readingMode:'MAP', scopeComponentId:null, workspaceAsync:{}, diagram:{nodes:[]}};
   let current=true;
   const context={
     state, ARCHITECTURE_CANVAS_MODE:false, CSS:{escape:value=>value},
@@ -163,7 +163,7 @@ async function scopeHarness({visibleComponent=false}={}) {
   };
   const navigate=runInNewContext(source('async function navigateGraphScope(')+';navigateGraphScope',context);
   assert.equal(await navigate('scope-root', {focusComponentId:'scope-root', loader:async()=>({}), render:()=>{}, notify:()=>{}}),true);
-  return {focused, flush:()=>callbacks.forEach(callback=>callback()), supersede:()=>{current=false;}};
+  return {focused, flush:()=>callbacks.forEach(callback=>callback()), supersede:()=>{current=false;}, leave:()=>{state.currentView='tasks';}};
 }
 test('Scoped navigation focuses Back when the projected root is omitted', async () => {
   const h=await scopeHarness(); h.flush(); assert.deepEqual(h.focused,['back']);
@@ -173,4 +173,8 @@ test('Scoped navigation focuses a component when it remains visible', async () =
 });
 test('A superseded scope transition cannot steal keyboard focus', async () => {
   const h=await scopeHarness(); h.supersede(); h.flush(); assert.deepEqual(h.focused,[]);
+});
+
+test('A completed scope cannot steal focus after leaving Architecture', async () => {
+  const h=await scopeHarness(); h.leave(); h.flush(); assert.deepEqual(h.focused,[]);
 });

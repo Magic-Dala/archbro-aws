@@ -79,6 +79,7 @@ PYTEST_PATTERNS = {
         "tests/test_pipeline_runner.py",
         "tests/test_project_authorization.py",
         "tests/test_project_repository_*.py",
+        "tests/test_handoff_repository_regressions.py",
         "tests/test_runtime_health.py",
         "tests/test_signal_pipeline.py",
         "tests/test_sync_cursor.py",
@@ -86,8 +87,11 @@ PYTEST_PATTERNS = {
     ),
     "persistence": (
         "tests/test_postgres_foundation.py",
+        "tests/test_provider_credential_persistence.py",
+        "tests/test_provider_persistence_races.py",
         "tests/test_*repository.py",
         "tests/test_project_repository_*.py",
+        "tests/test_handoff_repository_regressions.py",
         "tests/test_secret_cipher.py",
         "tests/test_sqlite_migration.py",
         "tests/test_sync_cursor.py",
@@ -104,6 +108,7 @@ PYTEST_PATTERNS = {
         "tests/test_pipeline_runner.py",
         "tests/test_provider_*.py",
         "tests/test_project_repository_*.py",
+        "tests/test_handoff_repository_regressions.py",
         "tests/test_slack_*.py",
         "tests/test_webmcp_*.py",
     ),
@@ -186,9 +191,9 @@ def classify(event_name: str, base_ref: str, paths: list[str]) -> dict[str, bool
         if path.startswith("src/archbro/platform/persistence/"):
             flags["persistence"] = True
             persistence_name = Path(path).name
-            if persistence_name in {"postgres.py", "secrets.py", "slack_inbox.py"}:
+            if persistence_name in {"postgres.py", "provider_credentials.py", "secrets.py", "slack_inbox.py"}:
                 flags["integrations"] = True
-            if persistence_name == "postgres.py":
+            if persistence_name in {"postgres.py", "provider_credentials.py"}:
                 # PostgreSQL is the sole repository implementation, so core API
                 # and integration tests exercise it directly too.
                 flags["backend-core"] = True

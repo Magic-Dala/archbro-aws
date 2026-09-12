@@ -65,7 +65,7 @@ test('cross-project child-view activation selects the project directly into the 
   const harness = activateHarness();
   assert.equal(await harness.activate('B', 'tasks'), true);
   assert.deepEqual(JSON.parse(JSON.stringify(harness.selected)), [
-    {projectId:'B', options:{view:'tasks', historyMode:'push'}},
+    {projectId:'B', options:{view:'tasks', historyMode:'push', route:{workspaceTab:'tasks'}}},
   ]);
   assert.deepEqual(harness.switched, []);
 });
@@ -122,7 +122,7 @@ test('project tree, workspace tabs, normal views, and WebMCP focus use one navig
   assert.match(tab, /beginNavigationTransition\(state\.projectId, \{invalidateGraph:false\}\)/);
 
   const view = section('function switchView(', 'function goTargetOptions(');
-  assert.match(view, /const invalidateGraph = state\.currentView === 'architecture' && name !== 'architecture'/);
+  assert.match(view, /const invalidateGraph = false/);
   assert.match(view, /beginNavigationTransition\(state\.projectId, \{invalidateGraph\}\)/);
 
   const focus = section('async focusItem(', 'async reportChange(');

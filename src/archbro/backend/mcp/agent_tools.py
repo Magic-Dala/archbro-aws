@@ -49,7 +49,8 @@ _SECRET_VALUE = re.compile(
     re.IGNORECASE,
 )
 _GITHUB_REPOSITORY_URL = re.compile(
-    r"https://github\.com/(?P<repository>[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}?)(?:\.git)?(?=$|[\s?#),;!])",
+    r"https://github\.com/(?P<repository>[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,104})"
+    r"(?:/[^\s<>\"'“”「」`]*|[?#][^\s<>\"'“”「」`]*)?",
     re.IGNORECASE,
 )
 _GITHUB_REPOSITORY_TOKEN = re.compile(
@@ -159,21 +160,32 @@ def _repository_request_text(event: ProjectEvent) -> str:
     text = str(event.payload.get("message") or "").strip()
     if not text:
         return ""
-    # Quoted examples, code blocks, and quoted prior messages are descriptions,
-    # not repository execution targets.
     text = re.sub(r"```[\s\S]*?```", "", text)
-    text = re.sub(r'"[^"\n]*"|“[^”\n]*”|「[^」\n]*」', "", text)
+    # Quotation marks can delimit an execution target, not just an example.
+    # Mask only quoted text introduced as something to explain/translate. Keep
+    # the surrounding sentence so a subsequent real command is still checked.
+    quoted = re.compile('"[^"\\n]*"|\\u201c[^\\u201d\\n]*\\u201d|\\u300c[^\\u300d\\n]*\\u300d|`[^`\\n]*`|\'[^\'\\n]*\'')
+    explanation = re.compile(
+        r"(?:\b(?:explain|translate|paraphrase)\s+(?:(?:the|this|following)\s+)?"
+        r"(?:(?:phrase|sentence|quote|command|example)\s*)?[:：]?\s*"
+        r"|(?:解釋|翻譯|說明)(?:(?:一下|以下|這個|這句話|這句|這段|句子|指令)\s*)*[:：]?\s*)$",
+        re.IGNORECASE,
+    )
+    spans = [m.span() for m in quoted.finditer(text)
+             if explanation.search(text[max(0, m.start() - 120):m.start()])]
+    for start, end in reversed(spans):
+        text = text[:start] + " " * (end - start) + text[end:]
     return re.sub(r"(?m)^\s*>.*$", "", text).strip()
 
 
 def requested_github_repositories(event: ProjectEvent) -> tuple[str, ...]:
-    """Extract explicit high-confidence owner/repo targets from a request.
+    """Extract repository identities without treating branch/path operands as repos.
 
-    File paths such as ``docs/README.md`` and Git refs such as ``refs/heads``
-    must not be mistaken for repository identities. The result is used only as
-    a deterministic pre-discovery boundary; tool arguments remain guarded too.
+    Explicit GitHub URLs and repo/repository syntax take precedence over path
+    heuristics. In `read report/status in owner/repo`, the first operand is a
+    file; in `inspect branch feature/login`, it is a branch. Quoted targets are
+    retained by the request-text classifier above.
     """
-
     text = _repository_request_text(event)
     if not text:
         return ()
@@ -181,28 +193,35 @@ def requested_github_repositories(event: ProjectEvent) -> tuple[str, ...]:
     seen: set[str] = set()
 
     def add_candidate(candidate: str) -> None:
-        candidate = candidate.rstrip(".,;:!?)]}")
-        owner, _, repo = candidate.partition("/")
-        lowered_owner = owner.casefold()
-        lowered_repo = repo.casefold()
-        if lowered_owner in _LIKELY_PATH_OWNERS:
-            return
-        if lowered_repo.endswith(_LIKELY_FILE_SUFFIXES):
-            return
         try:
-            normalized = normalize_github_repository(candidate)
+            normalized = normalize_github_repository(candidate.rstrip(".,;:!?)]}"))
         except ValueError:
             return
-        key = normalized.casefold()
-        if key not in seen:
-            seen.add(key)
+        if normalized.casefold() not in seen:
+            seen.add(normalized.casefold())
             repositories.append(normalized)
 
     for match in _GITHUB_REPOSITORY_URL.finditer(text):
         add_candidate(match.group("repository"))
-    text_without_urls = _GITHUB_REPOSITORY_URL.sub(" ", text)
-    for match in _GITHUB_REPOSITORY_TOKEN.finditer(text_without_urls):
-        add_candidate(match.group("repository"))
+    text = _GITHUB_REPOSITORY_URL.sub(lambda m: " " * len(m.group()), text)
+    for match in _GITHUB_REPOSITORY_TOKEN.finditer(text):
+        candidate = match.group("repository").rstrip(".,;:!?)]}")
+        prefix = text[:match.start()].rstrip(' \"\'`“「')
+        suffix = text[match.end():].lstrip(' \"\'`”」')
+        explicit_repo = re.search(r"\b(?:repo|repository)\s*[:=]?\s*$|(?:儲存庫|倉庫)\s*[:：]?\s*$", prefix, re.I)
+        path_operand = re.search(r"\b(?:branch|ref|path|file|directory|folder)\s*[:=]?\s*$|(?:分支|路徑|檔案)\s*[:：]?\s*$", prefix, re.I)
+        # A read operand followed by a repository location is a path, including
+        # extensionless files. Do not apply this to compare A/B and C/D.
+        file_in_repo = (re.search(r"\b(?:read|open|fetch|get)\s*$", prefix, re.I)
+                        and re.match(r"\s+(?:in|from|within)\s+", " " + suffix, re.I))
+        location_repo = re.search(r"\b(?:in|from|of)\s*(?:(?:the|private|public)\s+)?$", prefix, re.I)
+        if not explicit_repo and (path_operand or file_in_repo):
+            continue
+        owner, _, repo = candidate.partition("/")
+        if not explicit_repo and not location_repo:
+            if owner.casefold() in _LIKELY_PATH_OWNERS or repo.casefold().endswith(_LIKELY_FILE_SUFFIXES):
+                continue
+        add_candidate(candidate)
     return tuple(repositories)
 
 
@@ -417,6 +436,7 @@ class AgentMcpToolSession:
         self._input_validation_failures: list[dict[str, Any]] = []
         self._result_chars_used = 0
         self._cache: dict[str, dict[str, Any]] = {}
+        self._scope_failure: str | None = None
 
     @classmethod
     def discover(
@@ -633,6 +653,8 @@ class AgentMcpToolSession:
     @property
     def successful_call_count(self) -> int:
         with self._lock:
+            if self._scope_failure:
+                return 0
             return sum(1 for call in self._calls if call.get("status") == "SUCCESS")
 
     def context_facts(self) -> dict[str, Any]:
@@ -688,6 +710,13 @@ class AgentMcpToolSession:
 
     def record_input_failure(self, tool_name: str, error: Exception) -> None:
         with self._lock:
+            if str(error).startswith("repository_scope_mismatch:"):
+                # Terminal for this request: never let SDK repair retries silently
+                # substitute the selected repository for a rejected target.
+                self._scope_failure = "Repository scope mismatch; no fallback read is permitted for this request."
+                self.scope_mode = "PROJECT_REPOSITORY_MISMATCH"
+                self.discovery_error = self._scope_failure
+                self._cache.clear()
             if len(self._input_validation_failures) < self.max_calls * 2:
                 self._input_validation_failures.append({
                     "tool_name": tool_name, "stage": "INPUT_VALIDATION",
@@ -748,6 +777,9 @@ class AgentMcpToolSession:
         return normalized
 
     def call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._scope_failure:
+                raise ValueError(self._scope_failure)
         if tool_name not in {descriptor.name for descriptor in self.descriptors}:
             raise ValueError(f"GitHub MCP tool {tool_name!r} is not exposed to this request")
         try:
@@ -766,6 +798,8 @@ class AgentMcpToolSession:
             f"{tool_name}\n{_json_text(arguments)}".encode()
         ).hexdigest()
         with self._lock:
+            if self._scope_failure:
+                raise ValueError(self._scope_failure)
             cached = self._cache.get(cache_key)
             if cached is not None:
                 self._calls.append(
@@ -791,6 +825,9 @@ class AgentMcpToolSession:
         started = time.perf_counter()
         try:
             raw_result = self.gateway.call_tool(self.connection_id, tool_name, arguments)
+            with self._lock:
+                if self._scope_failure:
+                    raise ValueError(self._scope_failure)
             if self.scope_check:
                 self.scope_check()
             evidence_payload = (
@@ -888,6 +925,8 @@ class AgentMcpToolSession:
     def evidence_references(self, *, limit: int = 5) -> list[str]:
         references: list[str] = []
         with self._lock:
+            if self._scope_failure:
+                return []
             calls = list(self._calls)
         for call in calls:
             if call.get("status") != "SUCCESS":

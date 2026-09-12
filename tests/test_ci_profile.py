@@ -72,6 +72,7 @@ def test_docs_only_pr_runs_only_smoke() -> None:
         ("src/archbro/backend/agent/orchestration.py", "backend-core"),
         ("src/archbro/backend/api/routes.py", "backend-core"),
         ("src/archbro/platform/persistence/postgres.py", "persistence"),
+        ("src/archbro/platform/persistence/provider_credentials.py", "persistence"),
         ("src/archbro/integrations/slack/events.py", "integrations"),
         ("src/archbro/backend/mcp/gateway.py", "integrations"),
         ("deploy/deploy-stack.sh", "release"),
@@ -129,7 +130,10 @@ def test_cross_layer_groups_include_their_direct_regressions() -> None:
     assert {
         "tests/test_agent_context_mcp_gateway.py",
         "tests/test_pipeline_runner.py",
+        "tests/test_provider_credential_persistence.py",
     } <= integrations
+    persistence = set(CI._expand_targets(ROOT, ["persistence"], []))
+    assert "tests/test_provider_credential_persistence.py" in persistence
 
 
 def test_every_test_file_is_grouped_or_explicitly_full_only() -> None:

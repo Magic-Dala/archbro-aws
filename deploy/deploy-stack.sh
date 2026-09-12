@@ -179,10 +179,56 @@ require_production_firebase() {
     require_literal_nonempty ARCHBRO_FIREBASE_AUTH_DOMAIN "$browser_auth_domain"
 }
 
+require_provider_credential_persistence() {
+    local oauth_enabled=0
+    local pair
+    local client_key
+    local secret_key
+    local client_value
+    local secret_value
+    local value
+    local ephemeral
+
+    local provider_pairs=(
+        "ARCHBRO_GITHUB_OAUTH_CLIENT_ID:ARCHBRO_GITHUB_OAUTH_CLIENT_SECRET"
+        "ARCHBRO_GOOGLE_DRIVE_OAUTH_CLIENT_ID:ARCHBRO_GOOGLE_DRIVE_OAUTH_CLIENT_SECRET"
+        "ARCHBRO_SLACK_OAUTH_CLIENT_ID:ARCHBRO_SLACK_OAUTH_CLIENT_SECRET"
+        "ARCHBRO_MICROSOFT_TEAMS_CLIENT_ID:ARCHBRO_MICROSOFT_TEAMS_CLIENT_SECRET"
+    )
+    for pair in "${provider_pairs[@]}"; do
+        client_key="${pair%%:*}"
+        secret_key="${pair#*:}"
+        client_value="$(read_env_value "$client_key" 0)"
+        secret_value="$(read_env_value "$secret_key" 0)"
+        if [ -n "$client_value" ] || [ -n "$secret_value" ]; then
+            if [ -z "$client_value" ]; then
+                contract_error "must set $client_key when $secret_key is configured"
+            fi
+            if [ -z "$secret_value" ]; then
+                contract_error "must set $secret_key when $client_key is configured"
+            fi
+            require_literal_nonempty "$client_key" "$client_value"
+            require_literal_nonempty "$secret_key" "$secret_value"
+            oauth_enabled=1
+        fi
+    done
+
+    ephemeral="$(read_env_value ARCHBRO_ALLOW_EPHEMERAL_PROVIDER_OAUTH 0)"
+    if [ -n "$ephemeral" ] && [ "$ephemeral" != "false" ] && [ "$ephemeral" != "0" ]; then
+        contract_error "must not enable ARCHBRO_ALLOW_EPHEMERAL_PROVIDER_OAUTH on a deployed stack"
+    fi
+
+    if [ "$oauth_enabled" = "1" ]; then
+        value="$(read_env_value ARCHBRO_PROVIDER_CREDENTIAL_KEY)"
+        require_literal_nonempty ARCHBRO_PROVIDER_CREDENTIAL_KEY "$value"
+    fi
+}
+
 case "$STACK" in
     archbro-main)
         # Main serves production traffic and must never fall back to local auth.
         require_production_firebase
+        require_provider_credential_persistence
         ;;
     archbro-dev | archbro-dev2)
         # Both dev stacks are externally reachable. Cloudflare Access protects
@@ -190,6 +236,7 @@ case "$STACK" in
         # having a distinct verified principal. The deterministic local-demo
         # identity is therefore never valid for a deployed dev stack.
         require_production_firebase
+        require_provider_credential_persistence
         ;;
     *)
         echo "::error::unsupported stack $STACK"

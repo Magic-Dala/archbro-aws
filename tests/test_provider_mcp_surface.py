@@ -15,6 +15,12 @@ from conftest import requires_database
 
 pytestmark = requires_database
 
+PROVIDER_CREDENTIAL_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+
+def _enable_persistent_provider_store(monkeypatch) -> None:
+    monkeypatch.setenv("ARCHBRO_PROVIDER_CREDENTIAL_KEY", PROVIDER_CREDENTIAL_KEY)
+
 
 def _client(dsn, tmp_path, monkeypatch, *, environment="test", base_url="http://127.0.0.1:8012") -> TestClient:
     async def principal_provider(token: str) -> TrustedPrincipal:
@@ -214,6 +220,7 @@ def test_slack_oauth_redirect_uses_the_request_host_outside_local(
 def test_configured_production_oauth_requires_a_pinned_public_origin(
     dsn, tmp_path, monkeypatch
 ):
+    _enable_persistent_provider_store(monkeypatch)
     monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_ID", "slack-client")
     monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_SECRET", "slack-secret")
     monkeypatch.delenv("ARCHBRO_OAUTH_REDIRECT_BASE_URL", raising=False)
@@ -231,6 +238,7 @@ def test_configured_production_oauth_requires_a_pinned_public_origin(
 def test_configured_production_oauth_uses_the_pinned_public_origin(
     dsn, tmp_path, monkeypatch
 ):
+    _enable_persistent_provider_store(monkeypatch)
     monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_ID", "slack-client")
     monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_SECRET", "slack-secret")
     monkeypatch.setenv("ARCHBRO_OAUTH_REDIRECT_BASE_URL", "https://archbro-dev.magicdala.com")
@@ -247,9 +255,21 @@ def test_configured_production_oauth_uses_the_pinned_public_origin(
 
 
 def test_production_provider_oauth_rejects_multiple_workers(dsn, tmp_path, monkeypatch):
+    _enable_persistent_provider_store(monkeypatch)
     monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_ID", "slack-client")
     monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_SECRET", "slack-secret")
     monkeypatch.setenv("WEB_CONCURRENCY", "2")
 
-    with pytest.raises(RuntimeError, match="process-memory state.*single worker"):
+    with pytest.raises(RuntimeError, match="callback state.*single worker"):
+        _client(dsn, tmp_path, monkeypatch, environment="production")
+
+
+def test_production_provider_oauth_requires_encrypted_credential_store(
+    dsn, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_ID", "slack-client")
+    monkeypatch.setenv("ARCHBRO_SLACK_OAUTH_CLIENT_SECRET", "slack-secret")
+    monkeypatch.delenv("ARCHBRO_PROVIDER_CREDENTIAL_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="ARCHBRO_PROVIDER_CREDENTIAL_KEY"):
         _client(dsn, tmp_path, monkeypatch, environment="production")

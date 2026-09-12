@@ -9,7 +9,8 @@ from archbro.backend.mcp.provider_oauth import McpOAuthManager
 class FakeGateway:
     def __init__(self) -> None:
         self.added: dict | None = None
-        self.removed: list[str] = []
+        self.removed: list[tuple[str, bool]] = []
+        self.committed: list[str] = []
 
     def add_oauth_connection(self, **kwargs):
         self.added = kwargs
@@ -38,8 +39,22 @@ class FakeGateway:
             },
         }
 
-    def remove_connection(self, connection_id: str):
-        self.removed.append(connection_id)
+    def commit_oauth_connection(self, connection_id: str):
+        assert connection_id == "mcp_test"
+        assert self.added is not None
+        self.committed.append(connection_id)
+        return {
+            "id": connection_id,
+            "name": self.added["name"],
+            "provider": self.added["provider"],
+            "auth_type": "oauth",
+            "endpoint": self.added["url"],
+            "last_probe_ok": True,
+            "persistent": True,
+        }
+
+    def remove_connection(self, connection_id: str, *, persist: bool = True):
+        self.removed.append((connection_id, persist))
         return True
 
 
@@ -170,6 +185,9 @@ def test_public_provider_callback_builds_backend_only_remote_mcp_connection(
     assert gateway.added["access_token"] == "server-only-access-token"
     assert gateway.added["refresh_token"] == "server-only-refresh-token"
     assert gateway.added["client_secret"] == f"{provider_id}-secret"
+    assert gateway.added["persist"] is False
+    assert gateway.added["replace_existing"] is False
+    assert gateway.committed == ["mcp_test"]
     assert result["connection"]["endpoint"] == remote_mcp_url
     assert "server-only-access-token" not in str(result)
     assert "server-only-refresh-token" not in str(result)

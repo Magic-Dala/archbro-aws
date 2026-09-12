@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Archbro</title>
   <link rel="icon" href="/static/archbro-logo.svg?v=35cea50bf08b54c3" />
-  <link rel="stylesheet" href="/static/styles.css?v=2fee0739351721cb" />
+  <link rel="stylesheet" href="/static/styles.css?v=8d05b06e09bbfb1b" />
   <link rel="stylesheet" href="/static/progress.css?v=90e493c3fd6518b1" />
 </head>
 <body>
@@ -160,7 +160,7 @@
         <section id="workspaceHome" class="workspace-home hidden" aria-labelledby="workspaceHomeTitle">
           <div class="workspace-home-head">
             <div>
-              <span class="eyebrow">PERSONAL WORKSPACE</span>
+              <span class="eyebrow">PROJECT WORKSPACE</span>
               <h2 id="workspaceHomeTitle">Your projects</h2>
               <p id="workspaceHomeSubtitle">Keep projects, drafts, and living architecture snapshots together.</p>
             </div>
@@ -419,6 +419,7 @@
           </div>
 
           <div id="mcpConnectedPane" class="mcp-library-pane hidden">
+            <div id="mcpConnectionNotice" class="mcp-connection-notice hidden" role="status" aria-live="polite"></div>
             <div class="mcp-library-label"><strong>Your connections</strong><span>Test or remove configured MCPs</span></div>
             <div id="mcpConnectionList" class="mcp-connection-list"><p class="muted">No connections configured.</p></div>
           </div>
@@ -428,7 +429,7 @@
           <input id="mcpPreset" type="hidden" value="github-remote" />
           <div class="mcp-config-head">
             <div class="mcp-config-provider"><span id="mcpConfigIcon" class="mcp-provider-icon github-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.22c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.78 1.2 1.78 1.2 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.57-.29-5.27-1.29-5.27-5.73 0-1.27.45-2.3 1.2-3.11-.12-.3-.52-1.48.11-3.07 0 0 .98-.31 3.16 1.19A11 11 0 0 1 12 6.05c.98 0 1.95.13 2.86.38 2.18-1.5 3.16-1.19 3.16-1.19.63 1.59.23 2.77.11 3.07.75.81 1.2 1.84 1.2 3.11 0 4.45-2.71 5.43-5.29 5.72.42.36.79 1.06.79 2.14v3.26c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg></span><div><small>CONNECTION SETUP</small><h3 id="mcpConfigTitle">GitHub</h3><p id="mcpConfigSubtitle">OAuth · Official MCP</p></div></div>
-            <span class="mcp-memory-pill">Memory only</span>
+            <span id="mcpStoragePill" class="mcp-memory-pill">Checking storage…</span>
           </div>
 
           <div id="mcpManualPanel">
@@ -455,17 +456,17 @@
           <div id="mcpOAuthPanel" class="mcp-oauth-panel hidden">
             <div class="mcp-oauth-hero">
               <div id="mcpOAuthProviderIcon" class="mcp-oauth-provider-icon"></div>
-              <div><small>SECURE OAUTH CONNECTION</small><h3 id="mcpOAuthTitle">Connect provider</h3><p id="mcpOAuthDescription">A provider sign-in window will open. ArchBro receives the OAuth callback and keeps the token in backend memory.</p></div>
+              <div><small>SECURE OAUTH CONNECTION</small><h3 id="mcpOAuthTitle">Connect provider</h3><p id="mcpOAuthDescription">A provider sign-in window will open. ArchBro receives the OAuth callback and keeps the token backend-only and encrypted at rest.</p></div>
             </div>
             <div id="mcpOAuthReady" class="mcp-oauth-state hidden">
               <span class="mcp-oauth-state-icon ready">✓</span>
-              <div><strong>Ready to connect</strong><p id="mcpOAuthRedirectReady"></p></div>
+              <div><strong id="mcpOAuthStateTitle">Ready to connect</strong><p id="mcpOAuthRedirectReady"></p></div>
             </div>
             <div id="mcpProviderSetup" class="mcp-oauth-state setup hidden">
               <span class="mcp-oauth-state-icon">!</span>
               <div><strong>Provider sign-in unavailable</strong><p id="mcpProviderSetupText"></p></div>
             </div>
-            <div class="mcp-oauth-privacy"><span>🔒</span><p>Access and refresh tokens remain backend-only and memory-only. The browser and WebMCP agent never receive them.</p></div>
+            <div class="mcp-oauth-privacy"><span>🔒</span><p id="mcpOAuthPrivacyText">Access and refresh tokens stay backend-only and are encrypted in PostgreSQL. The browser and WebMCP agent never receive them.</p></div>
           </div>
 
           <div class="mcp-config-actions">
@@ -482,7 +483,7 @@
   <script src="/runtime-config.js"></script>
   <script src="/static/prototype.js?v=bd187140bfd50057"></script>
   <script src="/static/firebase-auth-client.js?v=20260901-auth-providers"></script>
-  <script type="module" src="/static/app.js?v=fd86e6455876576a"></script>
+  <script type="module" src="/static/app.js?v=cf541dd0eb9a2653"></script>
   <script type="module" src="/static/archbro-webmcp.js?v=78844908f59573dd"></script>
 </body>
 </html>

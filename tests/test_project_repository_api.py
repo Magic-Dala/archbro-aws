@@ -256,3 +256,36 @@ def test_settings_do_not_enable_github_for_initial_or_ordinary_tasks(setup):
             result=client.post(f'/projects/{p.id}/events',json={'type':'USER_MESSAGE','payload':{'message':message}})
             assert result.status_code==200
         assert gw.calls==[]
+
+
+def test_unbound_webmcp_route_reports_binding_action_without_discovery(setup):
+    repo,p,reg,gw=setup
+    with client_for(repo,registry=reg) as client:
+        for response in (
+            client.get(f'/projects/{p.id}/github/tools'),
+            client.post(f'/projects/{p.id}/github/tools/get_file_contents',json={'arguments':{'path':'README.md'}}),
+        ):
+            assert response.status_code==409
+            detail=response.json()['detail']
+            assert detail['code']=='PROJECT_REPOSITORY_REQUIRED'
+            assert detail['action']=='OPEN_PROJECT_REPOSITORY_SETTINGS'
+            assert 'reconnect' not in detail['message'].lower()
+    assert gw.list_connections_calls==gw.list_tools_calls==0
+    assert gw.calls==[]
+
+
+@pytest.mark.parametrize('target',['"octocat/Hello-World"','“octocat/Hello-World”','「octocat/Hello-World」'])
+def test_quoted_scope_denial_is_durable_and_has_no_bound_fallback(setup,target):
+    repo,p,reg,gw=setup
+    repo.save_architecture(p.id,Architecture(version=1,summary='Accepted architecture'))
+    with client_for(repo,registry=reg) as client:
+        assert save(client,p.id,branch='dev2').status_code==200
+        gw.calls.clear();gw.list_connections_calls=gw.list_tools_calls=0
+        response=client.post(f'/projects/{p.id}/events',json={'type':'USER_MESSAGE','payload':{'message':f'Use GitHub MCP to read README.md from {target}.'}})
+        assert response.status_code==200,response.text
+        body=response.json()
+        assert body['result']=='SUCCESS' and body['provider']=='deterministic'
+        assert body['context_telemetry']['external_mcp']['scope_mode']=='PROJECT_REPOSITORY_MISMATCH'
+        assert body['context_telemetry']['external_mcp']['dispatched_call_count']==0
+        assert 'targets octocat/Hello-World' in body['summary']
+        assert gw.list_connections_calls==gw.list_tools_calls==0 and gw.calls==[]

@@ -22,6 +22,7 @@ from archbro.backend.mcp.agent_tools import (
     AgentMcpToolSession,
     repository_evidence_requested,
 )
+from archbro.backend.mcp.provider_credentials import ProviderCredentialStore
 from archbro.backend.mcp.provider_gateway import McpConnectionConfig
 from archbro.backend.mcp.provider_oauth import McpOAuthManager, OAuthSetupRequired
 from archbro.backend.mcp.provider_policy import ReadOnlyExternalMcpGateway as ExternalMcpGateway
@@ -82,10 +83,15 @@ class McpToolCallRequest(BaseModel):
 class ProviderMcpRuntimeRegistry:
     """Own per-principal provider runtimes shared by HTTP and built-in agents."""
 
-    def __init__(self) -> None:
+    def __init__(self, credential_store: ProviderCredentialStore | None = None) -> None:
+        self.credential_store = credential_store
         self.gateways: dict[str, ExternalMcpGateway] = {}
         self.oauth_managers: dict[str, McpOAuthManager] = {}
         self._lock = threading.RLock()
+
+    @property
+    def credential_persistence_enabled(self) -> bool:
+        return bool(self.credential_store and self.credential_store.persistent)
 
     def runtime_for(
         self,
@@ -97,7 +103,13 @@ class ProviderMcpRuntimeRegistry:
             oauth_managers = self.oauth_managers
             gateway = gateways.get(user_id)
             if gateway is None:
-                gateway = ExternalMcpGateway()
+                gateway = ExternalMcpGateway(
+                    credential_owner=user_id if self.credential_store else None,
+                    credential_store=self.credential_store,
+                )
+                if self.credential_store is not None:
+                    for credential in self.credential_store.list_for_user(user_id):
+                        gateway.restore_oauth_connection(credential)
                 gateways[user_id] = gateway
                 oauth_managers[user_id] = McpOAuthManager(gateway)
             return gateway, oauth_managers[user_id]
@@ -122,7 +134,7 @@ class ProviderMcpRuntimeRegistry:
         repository_scope=None,
         scope_check=None,
     ) -> AgentMcpToolSession | None:
-        if not repository_evidence_requested(event):
+        if event.payload.get("intent") == "INITIAL_ARCHITECTURE" or not repository_evidence_requested(event):
             return None
         gateway, _ = self.runtime_for(principal)
         return AgentMcpToolSession.discover(
@@ -141,8 +153,9 @@ def build_provider_mcp_router(
     """Human-controlled MCP provider connections scoped to one trusted principal.
 
     This surface is intentionally separate from the project-scoped ConnectedMcpGateway
-    used by WebMCP agents. Provider credentials and dynamic connections remain backend-
-    only and memory-only; the browser never receives access or refresh tokens.
+    used by WebMCP agents. First-party OAuth credentials remain backend-only and are
+    encrypted in the shared credential store; the browser never receives access or
+    refresh tokens. Local custom connections remain process-scoped.
     """
 
     router = APIRouter()
@@ -204,11 +217,16 @@ def build_provider_mcp_router(
     runtime_environment = os.getenv("ARCHBRO_ENV", "local").strip().lower()
     local_environment = runtime_environment == "local"
     production_environment = runtime_environment == "production"
+    ephemeral_oauth_allowed = (
+        not production_environment
+        or os.getenv("ARCHBRO_ALLOW_EPHEMERAL_PROVIDER_OAUTH", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     provider_oauth_configured = any(os.getenv(name, "").strip() for name in PROVIDER_OAUTH_CLIENT_ID_ENVS)
     if production_environment and provider_oauth_configured and _configured_worker_count() > 1:
         raise RuntimeError(
-            "First-party provider OAuth uses process-memory state and requires a single worker. "
-            "Use one worker until a shared encrypted provider credential store is configured."
+            "First-party provider OAuth callback state requires a single worker. "
+            "Committed credentials are shared through the encrypted provider credential store."
         )
 
     def runtime_for(principal: TrustedPrincipal) -> tuple[ExternalMcpGateway, McpOAuthManager]:
@@ -321,7 +339,8 @@ def build_provider_mcp_router(
             ),
             None,
         )
-        configured = shutil.which("docker") is not None
+        runtime_available = shutil.which("docker") is not None
+        configured = runtime_available and ephemeral_oauth_allowed
         return {
             "provider": "github",
             "name": "GitHub",
@@ -329,11 +348,15 @@ def build_provider_mcp_router(
             "connected": connected is not None,
             "auth_method": "official_mcp_oauth",
             "endpoint": "GitHub official MCP · OAuth",
+            "persistent": False,
+            "session_only": True,
             "message": (
                 "GitHub OAuth is connected."
                 if connected
-                else "Ready to open the official GitHub authorization window."
+                else "Ready to open the session-only GitHub authorization window."
                 if configured
+                else "Configure ArchBro GitHub OAuth for durable deployed connections."
+                if not ephemeral_oauth_allowed
                 else "Docker is required for the official GitHub MCP OAuth runtime."
             ),
         }
@@ -341,6 +364,11 @@ def build_provider_mcp_router(
     @router.post("/mcp/auth/github/start")
     async def start_github_authorization(http_request: Request):
         principal = await provider_principal_for(http_request)
+        if not ephemeral_oauth_allowed:
+            raise HTTPException(
+                status_code=409,
+                detail="Session-only GitHub OAuth is disabled on deployed ArchBro. Configure durable first-party OAuth.",
+            )
         gateway, _ = runtime_for(principal)
         try:
             return await asyncio.to_thread(gateway.start_github_oauth_connection)
@@ -375,17 +403,24 @@ def build_provider_mcp_router(
         )
         gcloud = shutil.which("gcloud")
         readiness = gateway.google_drive_readiness(gcloud=gcloud)
+        configured = bool(gcloud) and ephemeral_oauth_allowed
         return {
             "provider": "google-drive",
             "name": "Google Drive",
-            "configured": bool(gcloud),
+            "configured": configured,
             "connected": connected is not None,
             "auth_method": "google_drive_oauth",
             "endpoint": "Google Drive API · OAuth",
             "prerequisites": readiness,
+            "persistent": False,
+            "session_only": True,
             "message": (
                 "Google Drive OAuth is connected."
                 if connected
+                else readiness["message"]
+                if configured
+                else "Configure ArchBro Google Drive OAuth for durable deployed connections."
+                if not ephemeral_oauth_allowed
                 else readiness["message"]
             ),
         }
@@ -393,6 +428,11 @@ def build_provider_mcp_router(
     @router.post("/mcp/auth/google-drive/start")
     async def start_google_drive_authorization(http_request: Request):
         principal = await provider_principal_for(http_request)
+        if not ephemeral_oauth_allowed:
+            raise HTTPException(
+                status_code=409,
+                detail="Session-only Google Drive OAuth is disabled on deployed ArchBro. Configure durable first-party OAuth.",
+            )
         gateway, _ = runtime_for(principal)
         try:
             return await asyncio.to_thread(gateway.start_google_drive_oauth_connection)
@@ -413,14 +453,46 @@ def build_provider_mcp_router(
     @router.get("/mcp/oauth/{provider_id}/status")
     async def get_mcp_oauth_status(provider_id: str, http_request: Request):
         principal = await provider_principal_for(http_request)
-        _, manager = runtime_for(principal)
+        gateway, manager = runtime_for(principal)
         try:
-            return manager.provider_status(
+            status = manager.provider_status(
                 provider_id,
                 oauth_redirect_uri(http_request, provider_id),
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="MCP OAuth provider not found")
+        connection = next(
+            (
+                item
+                for item in gateway.list_connections()
+                if item.get("provider") == provider_id
+                and item.get("auth_type") in {"oauth", "microsoft_teams_oauth"}
+                and not item.get("authorization_pending")
+            ),
+            None,
+        )
+        status.update(
+            {
+                "connected": connection is not None,
+                "connection": connection,
+                "persistent": runtime_registry.credential_persistence_enabled,
+                "storage": (
+                    "encrypted_postgres"
+                    if runtime_registry.credential_persistence_enabled
+                    else "process_memory"
+                ),
+                "message": (
+                    f"{status['name']} is connected and stored securely."
+                    if connection and runtime_registry.credential_persistence_enabled
+                    else f"{status['name']} is connected for this process only."
+                    if connection
+                    else "Ready to connect."
+                    if status["configured"]
+                    else "Provider OAuth is not configured in this deployment."
+                ),
+            }
+        )
+        return status
 
     @router.get("/mcp/oauth/{provider_id}/start")
     @router.post("/mcp/oauth/{provider_id}/start")

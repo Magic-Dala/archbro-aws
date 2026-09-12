@@ -284,6 +284,9 @@ let mcpOAuthStatusRequestId = 0;
 const MCP_PROVIDER_STATUS_TTL_MS = 5000;
 const mcpProviderStatusCache = new Map();
 const handledMcpOAuthPopups = new WeakSet();
+let mcpConnectionsSnapshot = [];
+let mcpUiGeneration = 0;
+let mcpConnectionsRequestSerial = 0;
 
 const $ = (id) => document.getElementById(id);
 const views = {
@@ -308,7 +311,8 @@ function readNavigationRoute(locationLike = window.location, {useStorageFallback
   const requestedTab = String(params.get('tab') || '').trim().toLowerCase();
   const inspectorTab = nodeId && INSPECTOR_TABS.has(requestedTab) ? requestedTab : 'overview';
   let requestedWorkspaceTab = String(params.get('workspace') || '').trim().toLowerCase();
-  if (!workspaceTabNames.includes(requestedWorkspaceTab) && useStorageFallback && projectId) {
+  if (!workspaceTabNames.includes(requestedWorkspaceTab) && useStorageFallback && projectId
+      && !params.has('view') && !params.has('workspace')) {
     requestedWorkspaceTab = String(localStorage.getItem(`archbro-workspace-tab:${projectId}`) || '').trim().toLowerCase();
   }
   const workspaceTab = projectId && view === 'tasks' && workspaceTabNames.includes(requestedWorkspaceTab)
@@ -508,7 +512,7 @@ function applyWorkspaceTabInvariants(tabName, {focusedProposalId = null} = {}) {
 function renderWorkspaceTabs() {
   const shell = $('workspaceTabs');
   if (!shell) return;
-  const visible = state.currentView === 'tasks';
+  const visible = Boolean(state.projectId && state.project) && state.currentView === 'tasks';
   const activeTab = workspaceTabNames.includes(state.workspaceTab) ? state.workspaceTab : 'tasks';
   shell.classList.toggle('hidden', !visible);
   workspaceTabNames.forEach((tabName) => {
@@ -522,6 +526,7 @@ function renderWorkspaceTabs() {
     button.setAttribute('aria-label', `${workspaceTabMeta[tabName].title} (${total})`);
     button.tabIndex = selected ? 0 : -1;
     panel.hidden = !selected;
+    panel.inert = !selected;
     panel.classList.toggle('hidden', !selected);
     if (count) count.textContent = String(total);
   });
@@ -1193,7 +1198,9 @@ function renderWorkspaceHome() {
   $('workspace').classList.remove('hidden');
   $('workspaceHome').classList.remove('hidden');
   $('workspaceSwitcherBtn').setAttribute('aria-current', 'page');
-  document.querySelectorAll('#workspace > .view').forEach((view) => view.classList.remove('active'));
+  document.querySelectorAll('#workspace .view').forEach((view) => view.classList.remove('active'));
+  renderWorkspaceTabs();
+  renderTaskDetails();
   $('globalAgentDock').classList.add('hidden');
   $('pageTitle').textContent = 'Project workspace';
   $('pageSubtitle').textContent = 'Browse your projects and open one when you are ready.';
@@ -1237,6 +1244,8 @@ async function openPersonalWorkspace({historyMode = 'push', navigationGuard = nu
   state.scopeComponentId = null;
   state.readingMode = 'MAP';
   state.selectedTaskId = null;
+  state.taskDetailId = null;
+  state.taskDetailOrigin = null;
   state.selectedProposalId = null;
   state.currentView = 'overview';
   state.openProjectMenuId = null;
@@ -1363,7 +1372,12 @@ function openMobileSidebar() {
   $('sidebarBackdrop').classList.remove('hidden');
   $('mobileSidebarBtn').setAttribute('aria-expanded', 'true');
   syncMobileSidebarLayers();
-  setTimeout(() => ($('newProjectBtn') || document.querySelector('[data-project-open]'))?.focus(), 0);
+  setTimeout(() => {
+    if (!mobileSidebarEnabled() || !document.body.classList.contains('sidebar-open')) return;
+    // Do not override a keyboard/pointer focus already chosen inside the sidebar.
+    if ($('workspaceSidebar').contains(document.activeElement)) return;
+    ($('newProjectBtn') || document.querySelector('[data-project-open]'))?.focus();
+  }, 0);
 }
 
 function closeMobileSidebar({returnFocus = true} = {}) {
@@ -1417,9 +1431,10 @@ async function commitInlineRename(projectId) {
 async function activateProjectView(projectId, view, {historyMode = 'push'} = {}) {
   if (!projectId || !ROUTED_VIEWS.has(view)) return false;
   if (projectId !== state.projectId || !state.project) {
-    return selectProject(projectId, {view, historyMode});
+    return selectProject(projectId, {view, historyMode,
+      ...(view === 'tasks' ? {route:{workspaceTab:'tasks'}} : {})});
   }
-  return switchView(view, {historyMode});
+  return switchView(view, {historyMode, ...(view === 'tasks' ? {workspaceTab:'tasks'} : {})});
 }
 
 function wireProjectTree() {
@@ -1744,7 +1759,7 @@ function deferredBootstrapResourceHref(resource, expectedPrefix, architectureVer
 }
 // WORKSPACE_CORE_LOADER_END
 
-async function refreshCanvasResource(contextTicket, architecture, {scopeComponentId = null, retainData = false, deferredResources = null} = {}) {
+async function refreshCanvasResource(contextTicket, architecture, {scopeComponentId = null, retainData = false, deferredResources = null, replacementAttempt = false} = {}) {
   const surface = ARCHITECTURE_CANVAS_MODE ? 'canvas' : 'project';
   const projectionScope = surface === 'canvas' ? null : (scopeComponentId || null);
   const readingMode = normalizedArchitectureReadingMode(state.readingMode);
@@ -1758,6 +1773,18 @@ async function refreshCanvasResource(contextTicket, architecture, {scopeComponen
   });
   const request = beginWorkspaceResource(state.workspaceAsync, 'canvas', contextTicket, {retainData:retainData && Boolean(state.diagram)});
   if (!request) return false;
+  const replaceSupersededProjection = () => {
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!replacementAttempt && state.projectId && state.architecture) {
+      return refreshCanvasResource(currentWorkspaceContextTicket(state.workspaceAsync), state.architecture, {
+        scopeComponentId:state.scopeComponentId, retainData:Boolean(state.diagram), replacementAttempt:true,
+      });
+    }
+    const error = new Error('The graph view changed while loading. Retry the current view.');
+    settleWorkspaceResource(state.workspaceAsync, request, 'error', error);
+    render();
+    return false;
+  };
   try {
     let diagram;
     if (surface === 'canvas' && deferredResources?.canvas) {
@@ -1771,7 +1798,8 @@ async function refreshCanvasResource(contextTicket, architecture, {scopeComponen
         ? await loadArchitectureCanvasDiagram(contextTicket.projectId, architecture, 'FULL')
         : await loadArchitectureDiagram(contextTicket.projectId, architecture, projectionScope, readingMode);
     }
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphProjectionMatchesCommittedState(projectionGuard)) return false;
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!graphProjectionMatchesCommittedState(projectionGuard)) return replaceSupersededProjection();
     const currentInteraction = captureGraphInteractionState();
     state.diagram = diagram;
     state.diagramError = null;
@@ -1792,7 +1820,8 @@ async function refreshCanvasResource(contextTicket, architecture, {scopeComponen
     render();
     return true;
   } catch (error) {
-    if (!workspaceResourceIsCurrent(state.workspaceAsync, request) || !graphProjectionMatchesCommittedState(projectionGuard)) return false;
+    if (!workspaceResourceIsCurrent(state.workspaceAsync, request)) return false;
+    if (!graphProjectionMatchesCommittedState(projectionGuard)) return replaceSupersededProjection();
     architectureViewCache.delete(architectureViewCacheKey(surface, contextTicket.projectId, architecture.version, projectionScope, cacheReadingMode));
     state.diagramError = error?.message || String(error);
     if (!retainData) state.diagram = null;
@@ -1909,7 +1938,8 @@ async function selectProject(projectId, {
   route = null,
 } = {}) {
   if (!projectId) return false;
-  const guard = navigationGuard || beginNavigationTransition(projectId);
+  const invalidateGraph = projectId !== state.projectId || !state.project || canvas !== ARCHITECTURE_CANVAS_MODE;
+  const guard = navigationGuard || beginNavigationTransition(projectId, {invalidateGraph});
   if (!navigationGenerationIsCurrent(guard)) return false;
   state.openProjectMenuId = null;
 
@@ -1917,7 +1947,7 @@ async function selectProject(projectId, {
     state.onboarding.active = false;
     state.currentView = ROUTED_VIEWS.has(view) ? view : 'overview';
     if (state.currentView === 'tasks') {
-      applyWorkspaceTabInvariants(route?.workspaceTab || workspaceTabForProject(projectId));
+      applyWorkspaceTabInvariants(route?.workspaceTab || 'tasks');
     }
     if (route?.canvas && route?.nodeId) {
       state.selectedComponentId = route.nodeId;
@@ -2001,7 +2031,7 @@ async function selectProject(projectId, {
       proposalPreviews: new Map(),
       proposalPreviewSerial: state.proposalPreviewSerial + 1,
       workspaceTab: nextView === 'tasks'
-        ? (route?.workspaceTab || workspaceTabForProject(projectId))
+        ? (route?.workspaceTab || 'tasks')
         : 'tasks',
       currentView: nextView,
       inspectorTab: canvas && route?.nodeId ? (route.inspectorTab || 'overview') : 'overview',
@@ -2683,6 +2713,7 @@ function renderAccountIdentity() {
 }
 
 function resetEphemeralSessionState() {
+  resetMcpAccountUi();
   supersedeWorkspaceContextRequests();
   if (state.onboarding.workingTimer) clearInterval(state.onboarding.workingTimer);
   state.openProjectMenuId = null;
@@ -3682,7 +3713,7 @@ async function navigateGraphScope(scopeComponentId, {focusComponentId = state.sc
     settleWorkspaceResource(state.workspaceAsync, request, 'ready');
     render();
     if (typeof document !== 'undefined') setTimeout(() => {
-      if (!graphTransitionIsCurrent(transition)) return;
+      if (!graphTransitionIsCurrent(transition) || state.currentView !== 'architecture') return;
       const componentTarget = focusComponentId
         ? document.querySelector(`[data-component="${CSS.escape(focusComponentId)}"]`)
         : null;
@@ -6212,11 +6243,12 @@ function switchView(name, {
 } = {}) {
   if (state.onboarding.active) return false;
   if (!views[name]) return false;
-  const invalidateGraph = state.currentView === 'architecture' && name !== 'architecture';
+  // Switching ordinary panels does not change the graph projection identity.
+  const invalidateGraph = false;
   const guard = navigationGuard || beginNavigationTransition(state.projectId, {invalidateGraph});
   if (!navigationGenerationIsCurrent(guard)) return false;
   if (name === 'tasks') {
-    const nextWorkspaceTab = workspaceTabNames.includes(workspaceTab) ? workspaceTab : workspaceTabForProject();
+    const nextWorkspaceTab = workspaceTabNames.includes(workspaceTab) ? workspaceTab : 'tasks';
     applyWorkspaceTabInvariants(nextWorkspaceTab, {focusedProposalId});
     state.selectedComponentId = null;
   } else if (name === 'architecture') {
@@ -6301,6 +6333,72 @@ function mcpPresetForProvider(providerId) {
   return null;
 }
 
+function captureMcpAccountUi() {
+  return {generation:mcpUiGeneration, userId:prototype.currentProfile(localStorage)?.id || null};
+}
+
+function mcpAccountUiIsCurrent(ticket) {
+  return ticket.generation === mcpUiGeneration
+    && ticket.userId === (prototype.currentProfile(localStorage)?.id || null);
+}
+
+function resetMcpAccountUi() {
+  mcpUiGeneration += 1;
+  mcpConnectionsRequestSerial += 1;
+  mcpConnectionsSnapshot = [];
+  for (const entry of mcpProviderStatusCache.values()) entry.generation += 1;
+  mcpProviderStatusCache.clear();
+  if ($('mcpConnectionList')) $('mcpConnectionList').replaceChildren();
+  if ($('mcpConnectedCount')) $('mcpConnectedCount').textContent = '0';
+  const notice = $('mcpConnectionNotice');
+  if (notice) { notice.textContent = ''; delete notice.dataset.provider; notice.classList.add('hidden'); }
+  syncMcpProviderCards();
+}
+
+function mcpConnectionForProvider(providerId, connections = mcpConnectionsSnapshot) {
+  return (connections || []).find((connection) => (
+    connection.provider === providerId && !connection.authorization_pending
+  )) || null;
+}
+
+function syncMcpProviderCards(connections = mcpConnectionsSnapshot) {
+  document.querySelectorAll('[data-mcp-preset]').forEach((card) => {
+    const providerId = mcpOAuthProviderId(card.dataset.mcpPreset);
+    const connection = providerId ? mcpConnectionForProvider(providerId, connections) : null;
+    const connected = Boolean(connection);
+    card.classList.toggle('connected', connected);
+    card.dataset.connected = String(connected);
+    const chevron = card.querySelector('.mcp-provider-chevron');
+    if (chevron) {
+      chevron.textContent = connected ? '✓' : '›';
+      chevron.classList.toggle('connected', connected);
+      chevron.setAttribute('aria-label', connected ? 'Connected' : 'Open setup');
+    }
+  });
+}
+
+function announceMcpConnection(providerId, connections = mcpConnectionsSnapshot, message = '') {
+  const connection = mcpConnectionForProvider(providerId, connections);
+  const notice = $('mcpConnectionNotice');
+  if (!notice || !connection) return connection;
+  const persistence = connection.persistent ? 'Saved securely and available after deployment updates.' : 'Connected for this server session.';
+  notice.dataset.provider = providerId;
+  notice.textContent = message || `${connection.name} connected. ${persistence}`;
+  notice.classList.remove('hidden');
+  return connection;
+}
+
+async function completeMcpConnectionUi(providerId, message = '') {
+  const ticket = captureMcpAccountUi();
+  if (providerId) await refreshMcpProviderStatusAfterMutation(providerId);
+  if (!mcpAccountUiIsCurrent(ticket)) return [];
+  const connections = await loadMcpConnections();
+  if (!mcpAccountUiIsCurrent(ticket)) return [];
+  if (providerId) announceMcpConnection(providerId, connections, message);
+  setMcpPickerTab('connected');
+  return connections;
+}
+
 function mcpProviderStatusEntry(providerId) {
   let entry = mcpProviderStatusCache.get(providerId);
   if (!entry) {
@@ -6322,14 +6420,18 @@ function mcpLegacyProviderStatusEndpoint(providerId) {
 
 async function resolveMcpProviderStatus(providerId) {
   const generic = await api(mcpProviderStatusEndpoint(providerId));
-  if (generic?.configured === true) return {...generic, oauth_strategy: 'generic'};
+  if (generic?.configured === true || generic?.connected === true) {
+    return {...generic, oauth_strategy: 'generic'};
+  }
 
   const legacyEndpoint = mcpLegacyProviderStatusEndpoint(providerId);
   if (!legacyEndpoint) return {...generic, oauth_strategy: 'generic'};
 
   try {
     const legacy = await api(legacyEndpoint);
-    if (legacy?.configured === true) return {...legacy, oauth_strategy: 'legacy-runtime'};
+    if (legacy?.configured === true || legacy?.connected === true) {
+      return {...legacy, oauth_strategy: 'legacy-runtime'};
+    }
   } catch {
     // Keep the deployment OAuth result when the optional runtime fallback is unavailable.
   }
@@ -6346,6 +6448,7 @@ function invalidateMcpProviderStatus(providerId) {
 }
 
 function requestMcpProviderStatus(providerId, {force = false} = {}) {
+  const ticket = captureMcpAccountUi();
   const entry = mcpProviderStatusEntry(providerId);
   const fresh = entry.value && (Date.now() - entry.fetchedAt) < MCP_PROVIDER_STATUS_TTL_MS;
   if (!force && fresh) return Promise.resolve(entry.value);
@@ -6354,6 +6457,7 @@ function requestMcpProviderStatus(providerId, {force = false} = {}) {
   const generation = entry.generation;
   const request = resolveMcpProviderStatus(providerId)
     .then((value) => {
+      if (!mcpAccountUiIsCurrent(ticket) || entry.generation !== generation) return null;
       if (entry.generation === generation) {
         entry.value = value;
         entry.fetchedAt = Date.now();
@@ -6385,9 +6489,10 @@ function renderMcpOAuthStatusShell(preset) {
     github: 'Sign in to your own GitHub account and approve ArchBro. Your GitHub token stays backend-only and is attached only to your ArchBro user while connecting to GitHub remote MCP.',
     slack: 'Sign in to your own Slack workspace account and approve ArchBro. Your Slack user token stays backend-only and is attached only to your ArchBro user while connecting to Slack remote MCP.',
     'google-drive': 'Sign in to your own Google account and approve ArchBro. Your Google token stays backend-only and is attached only to your ArchBro user while connecting to Google Drive remote MCP.',
-    'microsoft-teams': 'A Microsoft authorization window will open. ArchBro uses delegated Microsoft Graph access for Teams and keeps the OAuth session backend-only and memory-only.',
+    'microsoft-teams': 'A Microsoft authorization window will open. ArchBro uses delegated Microsoft Graph access for Teams and keeps the OAuth session backend-only and encrypted at rest.',
   };
   $('mcpOAuthDescription').textContent = descriptions[providerId] || 'A provider sign-in window will open.';
+  $('mcpStoragePill').textContent = 'Checking storage…';
   return providerId;
 }
 
@@ -6409,22 +6514,36 @@ function renderMcpOAuthStatus(preset, status) {
   $('mcpProviderSetup').classList.add('hidden');
   delete $('mcpOAuthConnectBtn').dataset.statusRetry;
 
-
   const configured = status.configured === true;
-  $('mcpOAuthRedirectReady').textContent = configured
-    ? `${status.name} sign-in is ready. Authorization opens in a separate window.`
-    : `${status.name} is a built-in ArchBro connector. Sign-in requires the ArchBro deployment provider identity.`;
-  $('mcpOAuthReady').classList.toggle('hidden', !configured);
-  $('mcpProviderSetup').classList.toggle('hidden', configured);
+  const connected = status.connected === true;
+  const persistent = status.persistent === true;
+  if (providerId && connected) {
+    const entry = mcpProviderStatusEntry(providerId);
+    entry.value = status;
+    entry.fetchedAt = Date.now();
+  }
+  $('mcpStoragePill').textContent = persistent ? 'Encrypted at rest' : 'Session only';
+  $('mcpOAuthPrivacyText').textContent = persistent
+    ? 'Access and refresh tokens stay backend-only and are encrypted in PostgreSQL. The browser and WebMCP agent never receive them.'
+    : 'This connector is available only for the current server session. Deployed ArchBro should use encrypted provider storage.';
+  $('mcpOAuthStateTitle').textContent = connected ? 'Connected' : 'Ready to connect';
+  $('mcpOAuthRedirectReady').textContent = connected
+    ? `${status.name} is connected.${persistent ? ' This authorization remains available after deployment updates.' : ' This session is not persisted.'}`
+    : configured
+      ? `${status.name} sign-in is ready. Authorization opens in a separate window.`
+      : `${status.name} is a built-in ArchBro connector. Sign-in requires the ArchBro deployment provider identity.`;
+  $('mcpOAuthReady').classList.toggle('hidden', !(configured || connected));
+  $('mcpProviderSetup').classList.toggle('hidden', configured || connected);
   const missingConfiguration = Array.isArray(status.missing_configuration) && status.missing_configuration.length
     ? ` Missing: ${status.missing_configuration.join(', ')}.`
     : '';
-  $('mcpProviderSetupText').textContent = configured
+  $('mcpProviderSetupText').textContent = configured || connected
     ? ''
     : `${status.name} sign-in is not provisioned for this ArchBro deployment. The deployment owner must configure the provider identity.${missingConfiguration}`;
   $('mcpOAuthConnectBtn').classList.remove('hidden');
   $('mcpOAuthConnectBtn').disabled = !configured;
-  $('mcpOAuthConnectBtn').textContent = `Continue with ${status.name}`;
+  $('mcpOAuthConnectBtn').textContent = connected ? `Reconnect ${status.name}` : `Continue with ${status.name}`;
+  syncMcpProviderCards();
 }
 
 function renderMcpOAuthStatusError(preset, err) {
@@ -6438,14 +6557,17 @@ function renderMcpOAuthStatusError(preset, err) {
 
 async function refreshMcpProviderStatusAfterMutation(providerId) {
   if (!providerId) return null;
+  const ticket = captureMcpAccountUi();
   invalidateMcpProviderStatus(providerId);
   const preset = mcpPresetForProvider(providerId);
   try {
     const status = await requestMcpProviderStatus(providerId, {force: true});
+    if (!mcpAccountUiIsCurrent(ticket)) return null;
     if (preset) renderMcpOAuthStatus(preset, status);
+    syncMcpProviderCards();
     return status;
   } catch (err) {
-    if (preset) renderMcpOAuthStatusError(preset, err);
+    if (mcpAccountUiIsCurrent(ticket) && preset) renderMcpOAuthStatusError(preset, err);
     return null;
   }
 }
@@ -6488,6 +6610,7 @@ function watchMcpOAuthPopup(popup, preset) {
 }
 
 function applyMcpPreset(preset = $('mcpPreset').value) {
+  $('mcpStoragePill').textContent = mcpOAuthProviderId(preset) ? 'Checking storage…' : 'Memory only';
   $('mcpBearerToken').value = '';
   $('mcpCommand').value = '';
   $('mcpArgs').value = '';
@@ -6579,9 +6702,7 @@ async function startLegacyMcpOAuth(providerId, popup, preset, status) {
     if (started.connected) {
       popup.close();
       toast(`${status.name} connected: ${started.tool_count || started.connection?.tool_count || 0} tools discovered.`);
-      await refreshMcpProviderStatusAfterMutation(providerId);
-      await loadMcpConnections();
-      setMcpPickerTab('connected');
+      await completeMcpConnectionUi(providerId, `${status.name} connected successfully.`);
       return;
     }
     if (!started.authorization_url || !connectionId) {
@@ -6602,9 +6723,7 @@ async function startLegacyMcpOAuth(providerId, popup, preset, status) {
       }
       if (!popup.closed) popup.close();
       toast(`${status.name} connected: ${result.tool_count || 0} tools discovered.`);
-      await refreshMcpProviderStatusAfterMutation(providerId);
-      await loadMcpConnections();
-      setMcpPickerTab('connected');
+      await completeMcpConnectionUi(providerId, `${status.name} connected successfully.`);
       return;
     }
     throw new Error(`${status.name} authorization timed out. Retry Connect when ready.`);
@@ -6695,14 +6814,27 @@ function parseMcpJson(id, fallback) {
 }
 
 async function loadMcpConnections() {
+  const ticket = captureMcpAccountUi();
+  const serial = ++mcpConnectionsRequestSerial;
   const connections = await api('/mcp/connections');
+  if (!mcpAccountUiIsCurrent(ticket)) return [];
+  if (serial !== mcpConnectionsRequestSerial) return mcpConnectionsSnapshot;
+  mcpConnectionsSnapshot = Array.isArray(connections) ? connections : [];
+  syncMcpProviderCards(mcpConnectionsSnapshot);
+  const connectionNotice = $('mcpConnectionNotice');
+  if (connectionNotice?.dataset.provider
+      && !mcpConnectionForProvider(connectionNotice.dataset.provider, mcpConnectionsSnapshot)) {
+    connectionNotice.textContent = '';
+    delete connectionNotice.dataset.provider;
+    connectionNotice.classList.add('hidden');
+  }
   const list = $('mcpConnectionList');
-  $('mcpConnectedCount').textContent = connections.length;
-  if (!connections.length) {
+  $('mcpConnectedCount').textContent = mcpConnectionsSnapshot.length;
+  if (!mcpConnectionsSnapshot.length) {
     list.innerHTML = '<div class="mcp-empty-state"><strong>No MCPs connected yet</strong><span>Choose Browse and connect one when you are ready.</span></div>';
     return connections;
   }
-  list.innerHTML = connections.map((connection) => {
+  list.innerHTML = mcpConnectionsSnapshot.map((connection) => {
     const probe = connection.last_probe_ok === true ? 'READY' : connection.last_probe_ok === false ? 'FAILED' : 'NOT TESTED';
     const probeClass = connection.last_probe_ok === true ? 'ready' : connection.last_probe_ok === false ? 'failed' : '';
     const toolCount = connection.tool_count == null ? '—' : connection.tool_count;
@@ -6715,8 +6847,11 @@ async function loadMcpConnections() {
         : connection.auth_type === 'microsoft_teams_oauth'
           ? '<span class="ready">Teams OAuth</span>'
         : connection.has_credentials ? '<span>credential set</span>' : '';
+    const storageBadge = connection.persistent
+      ? '<span class="ready">Saved securely</span>'
+      : connection.provider ? '<span>Session only</span>' : '';
     return `<div class="mcp-connection-row">
-      <div class="mcp-connected-main"><span class="mcp-connected-dot ${probeClass}"></span><div><strong>${escapeHtml(connection.name)}</strong><p>${escapeHtml(connection.endpoint || '')}</p><div class="mcp-connection-meta"><span>${escapeHtml(connection.transport)}</span><span class="${probeClass}">${probe}</span><span>${toolCount} tools</span>${authBadge}</div>${connection.last_error ? `<p class="mcp-connection-error">${escapeHtml(connection.last_error)}</p>` : ''}</div></div>
+      <div class="mcp-connected-main"><span class="mcp-connected-dot ${probeClass}"></span><div><strong>${escapeHtml(connection.name)}</strong><p>${escapeHtml(connection.endpoint || '')}</p><div class="mcp-connection-meta"><span>${escapeHtml(connection.transport)}</span><span class="${probeClass}">${probe}</span><span>${toolCount} tools</span>${authBadge}${storageBadge}</div>${connection.last_error ? `<p class="mcp-connection-error">${escapeHtml(connection.last_error)}</p>` : ''}</div></div>
       <div class="mcp-connection-actions"><button type="button" data-mcp-probe="${escapeHtml(connection.id)}">Test</button><button type="button" class="danger" data-mcp-remove="${escapeHtml(connection.id)}" data-mcp-provider="${escapeHtml(connection.provider || '')}">Remove</button></div>
     </div>`;
   }).join('');
@@ -6745,7 +6880,7 @@ async function loadMcpConnections() {
       await loadMcpConnections();
     }
   }));
-  return connections;
+  return mcpConnectionsSnapshot;
 }
 
 function openMcpConnections() {
@@ -7864,9 +7999,7 @@ window.addEventListener('message', async (event) => {
   if (payload.ok) {
     toast(payload.message || 'MCP OAuth connection completed.');
     try {
-      if (providerId) await refreshMcpProviderStatusAfterMutation(providerId);
-      await loadMcpConnections();
-      setMcpPickerTab('connected');
+      await completeMcpConnectionUi(providerId, payload.message || 'MCP OAuth connection completed.');
     } catch (err) {
       toast(err.message, true);
     }
@@ -8070,7 +8203,10 @@ document.querySelectorAll('[data-architecture-graph-kind]').forEach((button) => 
 $('architectureCanvasBtn')?.addEventListener('click', toggleArchitectureCanvas);
 async function restoreNavigationFromLocation() {
   const route = readNavigationRoute(window.location, {useStorageFallback:false});
-  const guard = beginNavigationTransition(route.projectId);
+  // History owns location, but an unchanged graph still owns its pending data.
+  const invalidateGraph = route.projectId !== state.projectId || !state.project
+    || route.canvas !== ARCHITECTURE_CANVAS_MODE;
+  const guard = beginNavigationTransition(route.projectId, {invalidateGraph});
   if (!route.projectId) {
     return openPersonalWorkspace({historyMode:'none', navigationGuard:guard});
   }

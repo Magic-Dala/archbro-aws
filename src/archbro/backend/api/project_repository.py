@@ -118,6 +118,12 @@ def build_project_repository_router(repository, registry, authorized_project, pr
 
     async def session_for(http_request, project_id):
         principal, project, gateway = await resolved(http_request, project_id, ProjectPermission.WRITE)
+        if project.source_repository is None:
+            raise HTTPException(409, {
+                'code': 'PROJECT_REPOSITORY_REQUIRED',
+                'message': "Select a GitHub repository from this project's ... menu before requesting repository evidence.",
+                'action': 'OPEN_PROJECT_REPOSITORY_SETTINGS',
+            })
         def check_scope():
             current = repository.get_project(project_id)
             authorizer.require(principal, current, ProjectPermission.WRITE)

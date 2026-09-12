@@ -147,7 +147,7 @@ class OAuthSetupRequired(RuntimeError):
 
 
 class McpOAuthManager:
-    """Memory-only OAuth broker for first-party MCP provider connections."""
+    """OAuth broker whose committed credentials are owned by the gateway store."""
 
     def __init__(self, gateway: ExternalMcpGateway, *, timeout_seconds: float = 15.0) -> None:
         self.gateway = gateway
@@ -277,6 +277,8 @@ class McpOAuthManager:
                 token_url=token_url,
                 client_id=client_id,
                 client_secret=client_secret,
+                persist=False,
+                replace_existing=False,
             )
         else:
             connection = self.gateway.add_oauth_connection(
@@ -289,17 +291,21 @@ class McpOAuthManager:
                 token_url=token_url,
                 client_id=client_id,
                 client_secret=client_secret,
+                persist=False,
+                replace_existing=False,
             )
-        if provider.connection_kind == "mcp":
-            try:
-                verified = self.gateway.probe(connection["id"])
-            except (KeyError, RuntimeError, ValueError) as exc:
-                self.gateway.remove_connection(connection["id"])
-                raise RuntimeError(
-                    f"{provider.name} authorization succeeded, but MCP verification failed: {exc}"
-                ) from None
-            return {"provider": provider.id, "connection": verified["connection"]}
-        return {"provider": provider.id, "connection": connection}
+        try:
+            verified = self.gateway.probe(connection["id"])
+            committed = self.gateway.commit_oauth_connection(connection["id"])
+        except (KeyError, RuntimeError, ValueError) as exc:
+            self.gateway.remove_connection(connection["id"], persist=False)
+            raise RuntimeError(
+                f"{provider.name} authorization succeeded, but provider verification failed: {exc}"
+            ) from None
+        # Preserve probe metadata in the response while making the committed,
+        # durable connection object authoritative.
+        committed["tool_count"] = verified.get("tool_count", committed.get("tool_count"))
+        return {"provider": provider.id, "connection": committed}
 
     def _exchange_token(
         self,

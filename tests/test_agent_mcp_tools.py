@@ -330,10 +330,6 @@ def test_session_discovers_bounded_read_only_tools_calls_private_evidence_and_re
         },
     )
 
-    with pytest.raises(ValueError, match="scope_mismatch"):
-        tool(arguments={"repo": "other", "path": "README.md"})
-    assert len(gateway.calls) == 2
-
     session.call(
         "get_file_contents",
         {
@@ -353,6 +349,13 @@ def test_session_discovers_bounded_read_only_tools_calls_private_evidence_and_re
     assert session.evidence_references()[0].startswith(
         "GitHub MCP get_file_contents: Magic-Dala/archbro"
     )
+
+    with pytest.raises(ValueError, match="scope_mismatch"):
+        tool(arguments={"repo": "other", "path": "README.md"})
+    with pytest.raises(ValueError, match="no fallback"):
+        tool(path="README.md")
+    assert len(gateway.calls) == 3
+    assert session.evidence_references() == []
 
 
 def test_provider_runtime_registry_reuses_only_the_authenticated_principals_gateway(
