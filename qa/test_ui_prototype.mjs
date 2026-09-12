@@ -376,13 +376,13 @@ test('deleting the last project returns through the navigation authority', async
   assert.doesNotMatch(deletion, /renderWorkspaceHome\(\)/);
 });
 
-test('Personal workspace opens the complete project home from an active project', async () => {
+test('Project workspace opens the complete project home from an active project', async () => {
   const [html, js] = await Promise.all([
     readFile(new URL('index.html', webRoot), 'utf8'),
     readFile(new URL('app.js', webRoot), 'utf8'),
   ]);
   assert.match(html, /id="workspaceSwitcherBtn"/);
-  assert.match(html, /Personal workspace/);
+  assert.match(html, /Project workspace/);
   assert.match(js, /async function openPersonalWorkspace\(/);
   assert.match(js, /state\.projectId = null;/);
   assert.match(js, /commitNavigation\(\{projectId:null, view:'overview', canvas:false, nodeId:null, inspectorTab:'overview'\}/);

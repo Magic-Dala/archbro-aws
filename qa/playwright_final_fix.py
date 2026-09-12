@@ -832,12 +832,12 @@ def case_empty_workspace_cancel(browser: Browser) -> None:
         for width in (1051, 1050, 901, 900, 860, 761, 390):
             page.set_viewport_size({"width": width, "height": 844})
             page.wait_for_timeout(60)
-            assert page.locator("#pageTitle").inner_text() == "Personal workspace"
+            assert page.locator("#pageTitle").inner_text() == "Project workspace"
             title_metrics = page.locator("#pageTitle").evaluate(
                 """node => { const style=getComputedStyle(node); const rect=node.getBoundingClientRect(); return {height:rect.height,fontSize:parseFloat(style.fontSize),whiteSpace:style.whiteSpace}; }"""
             )
-            assert title_metrics["whiteSpace"] == "nowrap", f"Personal workspace can wrap at {width}px"
-            assert title_metrics["height"] <= title_metrics["fontSize"] * 1.5, f"Personal workspace wrapped at {width}px"
+            assert title_metrics["whiteSpace"] == "nowrap", f"Project workspace can wrap at {width}px"
+            assert title_metrics["height"] <= title_metrics["fontSize"] * 1.5, f"Project workspace wrapped at {width}px"
             topbar = page.locator(".topbar").bounding_box()
             heading = page.locator(".page-heading").bounding_box()
             actions = page.locator(".top-actions").bounding_box()

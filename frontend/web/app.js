@@ -1195,7 +1195,7 @@ function renderWorkspaceHome() {
   $('workspaceSwitcherBtn').setAttribute('aria-current', 'page');
   document.querySelectorAll('#workspace > .view').forEach((view) => view.classList.remove('active'));
   $('globalAgentDock').classList.add('hidden');
-  $('pageTitle').textContent = 'Personal workspace';
+  $('pageTitle').textContent = 'Project workspace';
   $('pageSubtitle').textContent = 'Browse your projects and open one when you are ready.';
   $('workspaceHomeCount').textContent = `${state.projects.length} project${state.projects.length === 1 ? '' : 's'}`;
   $('workspaceHomeEmpty').classList.toggle('hidden', state.projects.length > 0);
