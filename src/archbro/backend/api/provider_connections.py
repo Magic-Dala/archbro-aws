@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from html import escape
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -22,12 +24,20 @@ from archbro.backend.mcp.agent_tools import (
     AgentMcpToolSession,
     repository_evidence_requested,
 )
-from archbro.backend.mcp.provider_credentials import ProviderCredentialStore
+from archbro.backend.mcp.provider_credentials import (
+    ProviderCredentialStore,
+    StoredProviderCredential,
+)
 from archbro.backend.mcp.provider_gateway import McpConnectionConfig
-from archbro.backend.mcp.provider_oauth import McpOAuthManager, OAuthSetupRequired
+from archbro.backend.mcp.provider_oauth import (
+    PROVIDERS,
+    McpOAuthManager,
+    OAuthSetupRequired,
+)
 from archbro.backend.mcp.provider_policy import ReadOnlyExternalMcpGateway as ExternalMcpGateway
 
 
+logger = logging.getLogger(__name__)
 PrincipalFor = Callable[[Request], Awaitable[TrustedPrincipal]]
 
 OAUTH_STATE_TTL_SECONDS = 600
@@ -81,17 +91,86 @@ class McpToolCallRequest(BaseModel):
 
 
 class ProviderMcpRuntimeRegistry:
-    """Own per-principal provider runtimes shared by HTTP and built-in agents."""
+    """Own live per-principal runtimes while OAuth grants remain account-owned."""
+
+    _RESTORE_ERROR = (
+        "The saved authorization could not be restored. Reconnect this provider."
+    )
 
     def __init__(self, credential_store: ProviderCredentialStore | None = None) -> None:
         self.credential_store = credential_store
         self.gateways: dict[str, ExternalMcpGateway] = {}
         self.oauth_managers: dict[str, McpOAuthManager] = {}
+        self._restore_errors: dict[tuple[str, str], str] = {}
         self._lock = threading.RLock()
 
     @property
     def credential_persistence_enabled(self) -> bool:
         return bool(self.credential_store and self.credential_store.persistent)
+
+    @staticmethod
+    def _credential_for_current_deployment(
+        credential: StoredProviderCredential,
+    ) -> StoredProviderCredential:
+        provider = PROVIDERS.get(credential.provider)
+        if provider is None:
+            raise RuntimeError("stored provider is no longer supported")
+        current_client_id = os.getenv(provider.client_id_env, "").strip()
+        current_client_secret = os.getenv(provider.client_secret_env, "").strip()
+        return replace(
+            credential,
+            name=provider.name,
+            url=provider.mcp_url,
+            client_id=current_client_id or credential.client_id,
+            client_secret=current_client_secret or credential.client_secret,
+        )
+
+    def _restore_credentials(
+        self,
+        user_id: str,
+        gateway: ExternalMcpGateway,
+    ) -> None:
+        store = self.credential_store
+        if store is None:
+            return
+        for provider_id in store.providers_for_user(user_id):
+            error_key = (user_id, provider_id)
+            try:
+                credential = self._credential_for_current_deployment(
+                    store.get(user_id, provider_id)
+                )
+                if (
+                    credential.expires_at is not None
+                    and credential.expires_at <= time.time() + 60
+                    and not credential.refresh_token
+                ):
+                    raise RuntimeError(
+                        "stored provider authorization expired and cannot be refreshed"
+                    )
+                gateway.restore_oauth_connection(credential)
+            except KeyError:
+                # A concurrent remove can delete a provider between the bounded
+                # provider listing and its individual read. Treat that as absent,
+                # not as a broken authorization that asks the user to reconnect.
+                self._restore_errors.pop(error_key, None)
+                continue
+            except Exception as exc:
+                self._restore_errors[error_key] = self._RESTORE_ERROR
+                logger.warning(
+                    "provider_authorization_restore_failed provider=%s reason=%s",
+                    provider_id,
+                    type(exc).__name__,
+                )
+            else:
+                self._restore_errors.pop(error_key, None)
+
+    def restore_error(self, user_id: str, provider_id: str) -> str | None:
+        with self._lock:
+            return self._restore_errors.get((user_id, provider_id))
+
+    def clear_restore_error(self, user_id: str, provider_id: str) -> None:
+        with self._lock:
+            self._restore_errors.pop((user_id, provider_id), None)
 
     def runtime_for(
         self,
@@ -107,9 +186,7 @@ class ProviderMcpRuntimeRegistry:
                     credential_owner=user_id if self.credential_store else None,
                     credential_store=self.credential_store,
                 )
-                if self.credential_store is not None:
-                    for credential in self.credential_store.list_for_user(user_id):
-                        gateway.restore_oauth_connection(credential)
+                self._restore_credentials(user_id, gateway)
                 gateways[user_id] = gateway
                 oauth_managers[user_id] = McpOAuthManager(gateway)
             return gateway, oauth_managers[user_id]
@@ -124,6 +201,24 @@ class ProviderMcpRuntimeRegistry:
             if gateway is None or manager is None:
                 return None
             return gateway, manager
+
+    def remove_connection(
+        self,
+        principal: TrustedPrincipal,
+        connection_id: str,
+    ) -> bool:
+        gateway, _ = self.runtime_for(principal)
+        connection = next(
+            (item for item in gateway.list_connections() if item.get("id") == connection_id),
+            None,
+        )
+        if connection is None:
+            return False
+        removed = gateway.remove_connection(connection_id)
+        provider_id = str(connection.get("provider") or "").strip()
+        if removed and provider_id:
+            self.clear_restore_error(principal.user_id, provider_id)
+        return removed
 
     def agent_tool_session(
         self,
@@ -471,21 +566,28 @@ def build_provider_mcp_router(
             ),
             None,
         )
+        if connection is not None:
+            runtime_registry.clear_restore_error(principal.user_id, provider_id)
+        restore_error = runtime_registry.restore_error(principal.user_id, provider_id)
+        persistent = runtime_registry.credential_persistence_enabled
         status.update(
             {
                 "connected": connection is not None,
                 "connection": connection,
-                "persistent": runtime_registry.credential_persistence_enabled,
-                "storage": (
-                    "encrypted_postgres"
-                    if runtime_registry.credential_persistence_enabled
-                    else "process_memory"
+                "persistent": persistent,
+                "durable_authorization": bool(connection and persistent),
+                "storage": "encrypted_postgres" if persistent else "process_memory",
+                "restore_error": restore_error,
+                "legacy_fallback_allowed": bool(
+                    local_environment and ephemeral_oauth_allowed
                 ),
                 "message": (
                     f"{status['name']} is connected and stored securely."
-                    if connection and runtime_registry.credential_persistence_enabled
+                    if connection and persistent
                     else f"{status['name']} is connected for this process only."
                     if connection
+                    else restore_error
+                    if restore_error
                     else "Ready to connect."
                     if status["configured"]
                     else "Provider OAuth is not configured in this deployment."
@@ -590,6 +692,7 @@ def build_provider_mcp_router(
         except (ValueError, RuntimeError) as exc:
             return oauth_popup_response(provider_id, ok=False, message=str(exc))
         connection = result["connection"]
+        runtime_registry.clear_restore_error(owner_user_id, provider_id)
         return oauth_popup_response(
             provider_id,
             ok=True,
@@ -620,8 +723,7 @@ def build_provider_mcp_router(
     @router.delete("/mcp/connections/{connection_id}", status_code=204)
     async def remove_mcp_connection(connection_id: str, http_request: Request):
         principal = await provider_principal_for(http_request)
-        gateway, _ = runtime_for(principal)
-        if not gateway.remove_connection(connection_id):
+        if not runtime_registry.remove_connection(principal, connection_id):
             raise HTTPException(status_code=404, detail="MCP connection not found")
         return None
 

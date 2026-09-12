@@ -14,6 +14,12 @@ class StoredProviderCredential:
     The object contains secrets and must only cross the backend persistence
     boundary. Implementations are responsible for authenticated encryption at
     rest and must never return it to browser or WebMCP surfaces.
+
+    Deployment OAuth client secrets are intentionally not required to be
+    durable. New writes leave ``client_secret`` empty and runtime composition
+    supplies the current deployment secret when rebuilding a live connection.
+    The field remains in the v1 envelope for backward-compatible migration of
+    credentials written by earlier builds.
     """
 
     connection_id: str
@@ -26,7 +32,7 @@ class StoredProviderCredential:
     expires_at: float | None
     token_url: str
     client_id: str
-    client_secret: str
+    client_secret: str = ""
     display_endpoint: str | None = None
     tool_count: int | None = None
 
@@ -77,6 +83,10 @@ class ProviderCredentialStore(Protocol):
 
     @property
     def persistent(self) -> bool: ...
+
+    def providers_for_user(self, user_id: str) -> list[str]: ...
+
+    def get(self, user_id: str, provider: str) -> StoredProviderCredential: ...
 
     def list_for_user(self, user_id: str) -> list[StoredProviderCredential]: ...
 

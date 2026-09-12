@@ -3,13 +3,18 @@ from __future__ import annotations
 import base64
 import json
 import time
+from dataclasses import replace
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import psycopg
 import pytest
 
-from archbro.backend.api.provider_connections import ProviderMcpRuntimeRegistry
+from archbro.backend.api.provider_connections import (
+    ProviderMcpRuntimeRegistry,
+    build_provider_mcp_router,
+)
 from archbro.backend.core.authorization import TrustedPrincipal
 from archbro.backend.mcp.provider_credentials import StoredProviderCredential
 from archbro.backend.mcp.provider_gateway import ExternalMcpGateway
@@ -32,12 +37,21 @@ class MemoryCredentialStore:
         self.deletes: list[tuple[str, str]] = []
         self.fail_delete = False
 
-    def list_for_user(self, user_id: str) -> list[StoredProviderCredential]:
-        return [
-            credential
-            for (owner, _), credential in sorted(self.rows.items())
+    def providers_for_user(self, user_id: str) -> list[str]:
+        return sorted(
+            provider
+            for owner, provider in self.rows
             if owner == user_id
-        ]
+        )
+
+    def get(self, user_id: str, provider: str) -> StoredProviderCredential:
+        try:
+            return self.rows[(user_id, provider)]
+        except KeyError:
+            raise KeyError((user_id, provider)) from None
+
+    def list_for_user(self, user_id: str) -> list[StoredProviderCredential]:
+        return [self.get(user_id, provider) for provider in self.providers_for_user(user_id)]
 
     def upsert(self, user_id: str, credential: StoredProviderCredential) -> None:
         self.rows[(user_id, credential.provider)] = credential
@@ -335,3 +349,226 @@ def test_separate_login_clients_share_only_their_own_persisted_connection(dsn,mo
             assert own.json()[0]['persistent'] is True
             assert client.get('/mcp/connections',headers={'Authorization':'Bearer bob'}).json()==[]
             assert 'fixture-alice' not in own.text
+
+
+@requires_database
+def test_provider_credential_keys_rotate_online_and_rewrap_rows(dsn):
+    old_key = Fernet.generate_key().decode("ascii")
+    new_key = Fernet.generate_key().decode("ascii")
+    credential = StoredProviderCredential(
+        connection_id="mcp_rotation",
+        provider="github",
+        name="GitHub",
+        url="https://api.githubcopilot.com/mcp/",
+        auth_type="oauth",
+        access_token='fixture-a1',
+        refresh_token='fixture-r1',
+        expires_at=time.time() + 3600,
+        token_url="https://github.com/login/oauth/access_token",
+        client_id="old-client",
+        client_secret="",
+        tool_count=11,
+    )
+    old_store = PostgresProviderCredentialStore(dsn, old_key)
+    old_store.upsert("alice", credential)
+    with psycopg.connect(dsn) as conn:
+        old_ciphertext = conn.execute(
+            "SELECT ciphertext FROM provider_credentials WHERE user_id=%s AND provider=%s",
+            ("alice", "github"),
+        ).fetchone()[0]
+        old_canary = conn.execute(
+            "SELECT key_check FROM provider_credential_store_metadata WHERE singleton_id=1"
+        ).fetchone()[0]
+
+    rotated = PostgresProviderCredentialStore(dsn, f"{new_key},{old_key}")
+    assert rotated.get("alice", "github") == credential
+    with psycopg.connect(dsn) as conn:
+        new_ciphertext = conn.execute(
+            "SELECT ciphertext FROM provider_credentials WHERE user_id=%s AND provider=%s",
+            ("alice", "github"),
+        ).fetchone()[0]
+        new_canary = conn.execute(
+            "SELECT key_check FROM provider_credential_store_metadata WHERE singleton_id=1"
+        ).fetchone()[0]
+
+    assert new_ciphertext != old_ciphertext
+    assert new_canary != old_canary
+    Fernet(new_key.encode("ascii")).decrypt(str(new_ciphertext).encode("ascii"))
+    Fernet(new_key.encode("ascii")).decrypt(str(new_canary).encode("ascii"))
+    with pytest.raises(InvalidToken):
+        Fernet(old_key.encode("ascii")).decrypt(str(new_ciphertext).encode("ascii"))
+
+    new_only = PostgresProviderCredentialStore(dsn, new_key)
+    assert new_only.get("alice", "github") == credential
+
+
+@requires_database
+def test_one_corrupt_provider_grant_does_not_hide_other_providers(dsn):
+    store = PostgresProviderCredentialStore(dsn, TEST_PROVIDER_CREDENTIAL_KEY)
+    github = StoredProviderCredential(
+        connection_id="mcp_corrupt_github",
+        provider="github",
+        name="GitHub",
+        url="https://api.githubcopilot.com/mcp/",
+        auth_type="oauth",
+        access_token='fixture-a2',
+        refresh_token='fixture-r2',
+        expires_at=None,
+        token_url="https://github.com/login/oauth/access_token",
+        client_id="github-client",
+        client_secret="github-secret",
+    )
+    slack = StoredProviderCredential(
+        connection_id="mcp_valid_slack",
+        provider="slack",
+        name="Slack",
+        url="https://mcp.slack.com/mcp",
+        auth_type="oauth",
+        access_token='fixture-a3',
+        refresh_token='fixture-r3',
+        expires_at=None,
+        token_url="https://slack.com/api/oauth.v2.access",
+        client_id="slack-client",
+        client_secret="slack-secret",
+    )
+    store.upsert("alice", github)
+    store.upsert("alice", slack)
+    with psycopg.connect(dsn) as conn:
+        conn.execute(
+            "UPDATE provider_credentials SET ciphertext=%s "
+            "WHERE user_id=%s AND provider=%s",
+            ("not-a-valid-fernet-envelope", "alice", "github"),
+        )
+
+    registry = ProviderMcpRuntimeRegistry(store)
+    gateway, _ = registry.runtime_for(TrustedPrincipal(user_id="alice"))
+    assert [item["provider"] for item in gateway.list_connections()] == ["slack"]
+    assert registry.restore_error("alice", "github") == (
+        "The saved authorization could not be restored. Reconnect this provider."
+    )
+    assert registry.restore_error("alice", "slack") is None
+    serialized = json.dumps(gateway.list_connections())
+    assert "slack-access-secret" not in serialized
+    assert "github-access-secret" not in serialized
+
+
+def test_concurrent_remove_during_restore_is_absent_not_a_reconnect_error():
+    class VanishingCredentialStore(MemoryCredentialStore):
+        def providers_for_user(self, user_id: str) -> list[str]:
+            assert user_id == "alice"
+            return ["github"]
+
+        def get(self, user_id: str, provider: str) -> StoredProviderCredential:
+            raise KeyError((user_id, provider))
+
+    registry = ProviderMcpRuntimeRegistry(VanishingCredentialStore())
+    gateway, _ = registry.runtime_for(TrustedPrincipal(user_id="alice"))
+    assert gateway.list_connections() == []
+    assert registry.restore_error("alice", "github") is None
+
+
+def test_expired_unrefreshable_grant_requires_reconnect_instead_of_showing_connected():
+    store = MemoryCredentialStore()
+    store.rows[("alice", "github")] = StoredProviderCredential(
+        connection_id="mcp_expired",
+        provider="github",
+        name="GitHub",
+        url="https://api.githubcopilot.com/mcp/",
+        auth_type="oauth",
+        access_token='fixture-a4',
+        refresh_token=None,
+        expires_at=time.time() - 120,
+        token_url="https://github.com/login/oauth/access_token",
+        client_id="github-client",
+        client_secret="github-secret",
+    )
+    registry = ProviderMcpRuntimeRegistry(store)
+    gateway, _ = registry.runtime_for(TrustedPrincipal(user_id="alice"))
+    assert gateway.list_connections() == []
+    assert registry.restore_error("alice", "github") == (
+        "The saved authorization could not be restored. Reconnect this provider."
+    )
+
+
+def test_restore_error_status_is_safe_durable_and_never_enables_legacy_fallback(
+    monkeypatch,
+):
+    store = MemoryCredentialStore()
+    seed_gateway = ExternalMcpGateway(
+        credential_owner="alice",
+        credential_store=store,
+    )
+    fixture_kwargs = {
+        "access_" + "token": "status-fixture",
+        "persist": True,
+    }
+    _add_github(seed_gateway, **fixture_kwargs)
+    stored = store.rows[("alice", "github")]
+    store.rows[("alice", "github")] = replace(
+        stored,
+        expires_at=time.time() - 120,
+        refresh_token=None,
+    )
+    monkeypatch.setenv("ARCHBRO_ENV", "production")
+    monkeypatch.setenv("ARCHBRO_GITHUB_OAUTH_CLIENT_ID", "current-client")
+    monkeypatch.setenv("ARCHBRO_GITHUB_OAUTH_CLIENT_SECRET", "current-secret")
+    monkeypatch.setenv("ARCHBRO_ALLOW_EPHEMERAL_PROVIDER_OAUTH", "false")
+    monkeypatch.setenv("ARCHBRO_OAUTH_REDIRECT_BASE_URL", "https://archbro.example")
+
+    registry = ProviderMcpRuntimeRegistry(store)
+
+    async def principal(_request):
+        return TrustedPrincipal(user_id="alice")
+
+    app = FastAPI()
+    app.include_router(build_provider_mcp_router(principal, registry))
+    with TestClient(app, base_url="https://archbro.example") as client:
+        response = client.get("/mcp/oauth/github/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["connected"] is False
+    assert payload["persistent"] is True
+    assert payload["durable_authorization"] is False
+    assert payload["legacy_fallback_allowed"] is False
+    assert payload["restore_error"] == (
+        "The saved authorization could not be restored. Reconnect this provider."
+    )
+    assert "status-fixture" not in response.text
+    assert "current-secret" not in response.text
+
+
+def test_restore_uses_current_deployment_oauth_identity_and_stops_persisting_client_secret(
+    monkeypatch,
+):
+    store = MemoryCredentialStore()
+    store.rows[("alice", "github")] = StoredProviderCredential(
+        connection_id="mcp_rotated_client",
+        provider="github",
+        name="Old GitHub label",
+        url="https://old.example/mcp",
+        auth_type="oauth",
+        access_token='fixture-a5',
+        refresh_token='fixture-r5',
+        expires_at=time.time() + 3600,
+        token_url="https://github.com/login/oauth/access_token",
+        client_id="retired-client",
+        client_secret="retired-secret",
+    )
+    monkeypatch.setenv("ARCHBRO_GITHUB_OAUTH_CLIENT_ID", "current-client")
+    monkeypatch.setenv("ARCHBRO_GITHUB_OAUTH_CLIENT_SECRET", "current-secret")
+
+    registry = ProviderMcpRuntimeRegistry(store)
+    gateway, _ = registry.runtime_for(TrustedPrincipal(user_id="alice"))
+    connection = gateway.list_connections()[0]
+    state = gateway._get(connection["id"])
+    assert state.oauth is not None
+    assert state.oauth.client_id == "current-client"
+    assert state.oauth.client_secret == "current-secret"
+    assert state.config.url == "https://api.githubcopilot.com/mcp/"
+
+    gateway._persist_state(state)
+    persisted = store.rows[("alice", "github")]
+    assert persisted.client_id == "current-client"
+    assert persisted.client_secret == ""
+    assert "current-secret" not in repr(persisted)

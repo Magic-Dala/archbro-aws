@@ -6388,15 +6388,42 @@ function announceMcpConnection(providerId, connections = mcpConnectionsSnapshot,
   return connection;
 }
 
-async function completeMcpConnectionUi(providerId, message = '') {
+async function reconcileMcpProviderConnection(
+  providerId,
+  {message = '', openConnected = true} = {},
+) {
   const ticket = captureMcpAccountUi();
-  if (providerId) await refreshMcpProviderStatusAfterMutation(providerId);
-  if (!mcpAccountUiIsCurrent(ticket)) return [];
-  const connections = await loadMcpConnections();
-  if (!mcpAccountUiIsCurrent(ticket)) return [];
-  if (providerId) announceMcpConnection(providerId, connections, message);
-  setMcpPickerTab('connected');
-  return connections;
+  const preset = mcpPresetForProvider(providerId);
+  if (providerId) invalidateMcpProviderStatus(providerId);
+  const statusRequest = providerId
+    ? requestMcpProviderStatus(providerId, {force: true})
+    : Promise.resolve(null);
+  const [status, connections] = await Promise.all([
+    statusRequest,
+    loadMcpConnections(),
+  ]);
+  if (!mcpAccountUiIsCurrent(ticket)) {
+    return {connected: false, status: null, connections: [], connection: null};
+  }
+  if (preset && status) renderMcpOAuthStatus(preset, status);
+  syncMcpProviderCards(connections);
+  const connection = providerId
+    ? mcpConnectionForProvider(providerId, connections)
+    : null;
+  const connected = Boolean(connection || status?.connected === true);
+  if (providerId && connection && message) {
+    announceMcpConnection(providerId, connections, message);
+  }
+  if (connected && openConnected) setMcpPickerTab('connected');
+  window.dispatchEvent(new CustomEvent('archbro:mcp-connections-changed', {
+    detail: {provider: providerId, connected, connection, status},
+  }));
+  return {connected, status, connections, connection};
+}
+
+async function completeMcpConnectionUi(providerId, message = '') {
+  const result = await reconcileMcpProviderConnection(providerId, {message});
+  return result.connections;
 }
 
 function mcpProviderStatusEntry(providerId) {
@@ -6420,7 +6447,12 @@ function mcpLegacyProviderStatusEndpoint(providerId) {
 
 async function resolveMcpProviderStatus(providerId) {
   const generic = await api(mcpProviderStatusEndpoint(providerId));
-  if (generic?.configured === true || generic?.connected === true) {
+  if (
+    generic?.configured === true
+    || generic?.connected === true
+    || Boolean(generic?.restore_error)
+    || generic?.legacy_fallback_allowed !== true
+  ) {
     return {...generic, oauth_strategy: 'generic'};
   }
 
@@ -6517,6 +6549,7 @@ function renderMcpOAuthStatus(preset, status) {
   const configured = status.configured === true;
   const connected = status.connected === true;
   const persistent = status.persistent === true;
+  const restoreError = String(status.restore_error || '').trim();
   if (providerId && connected) {
     const entry = mcpProviderStatusEntry(providerId);
     entry.value = status;
@@ -6526,14 +6559,21 @@ function renderMcpOAuthStatus(preset, status) {
   $('mcpOAuthPrivacyText').textContent = persistent
     ? 'Access and refresh tokens stay backend-only and are encrypted in PostgreSQL. The browser and WebMCP agent never receive them.'
     : 'This connector is available only for the current server session. Deployed ArchBro should use encrypted provider storage.';
-  $('mcpOAuthStateTitle').textContent = connected ? 'Connected' : 'Ready to connect';
+  $('mcpOAuthStateTitle').textContent = connected
+    ? 'Connected'
+    : restoreError
+      ? 'Reconnect required'
+      : 'Ready to connect';
   $('mcpOAuthRedirectReady').textContent = connected
-    ? `${status.name} is connected.${persistent ? ' This authorization remains available after deployment updates.' : ' This session is not persisted.'}`
-    : configured
-      ? `${status.name} sign-in is ready. Authorization opens in a separate window.`
-      : `${status.name} is a built-in ArchBro connector. Sign-in requires the ArchBro deployment provider identity.`;
-  $('mcpOAuthReady').classList.toggle('hidden', !(configured || connected));
-  $('mcpProviderSetup').classList.toggle('hidden', configured || connected);
+    ? `${status.name} is connected.${persistent ? ' This authorization follows your ArchBro account across signed-in browsers and deployment updates.' : ' This session is not persisted.'}`
+    : restoreError
+      ? `${status.name} authorization could not be restored. ${restoreError}`
+      : configured
+        ? `${status.name} sign-in is ready. Authorization opens in a separate window.`
+        : `${status.name} is a built-in ArchBro connector. Sign-in requires the ArchBro deployment provider identity.`;
+  const ready = configured || connected || Boolean(restoreError);
+  $('mcpOAuthReady').classList.toggle('hidden', !ready);
+  $('mcpProviderSetup').classList.toggle('hidden', ready);
   const missingConfiguration = Array.isArray(status.missing_configuration) && status.missing_configuration.length
     ? ` Missing: ${status.missing_configuration.join(', ')}.`
     : '';
@@ -6542,7 +6582,9 @@ function renderMcpOAuthStatus(preset, status) {
     : `${status.name} sign-in is not provisioned for this ArchBro deployment. The deployment owner must configure the provider identity.${missingConfiguration}`;
   $('mcpOAuthConnectBtn').classList.remove('hidden');
   $('mcpOAuthConnectBtn').disabled = !configured;
-  $('mcpOAuthConnectBtn').textContent = connected ? `Reconnect ${status.name}` : `Continue with ${status.name}`;
+  $('mcpOAuthConnectBtn').textContent = connected || restoreError
+    ? `Reconnect ${status.name}`
+    : `Continue with ${status.name}`;
   syncMcpProviderCards();
 }
 
@@ -6593,7 +6635,8 @@ function openMcpOAuthPopup(providerId) {
   return popup;
 }
 
-function watchMcpOAuthPopup(popup, preset) {
+function watchMcpOAuthPopup(popup, preset, {wasConnected = false} = {}) {
+  const providerId = mcpOAuthProviderId(preset);
   const timer = setInterval(async () => {
     if (!popup.closed) return;
     clearInterval(timer);
@@ -6603,8 +6646,19 @@ function watchMcpOAuthPopup(popup, preset) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
-    if ($('mcpConnectionsDialog').open && $('mcpPreset').value === preset) {
-      await loadMcpOAuthStatus(preset, {force: true});
+    if (!providerId) return;
+    const openConnected = Boolean(
+      $('mcpConnectionsDialog').open && $('mcpPreset').value === preset,
+    );
+    try {
+      const result = await reconcileMcpProviderConnection(providerId, {openConnected});
+      if (result.connected && !wasConnected) {
+        const name = result.status?.name || providerId.replace('-', ' ');
+        toast(`${name} connected to your ArchBro account.`);
+        if (openConnected) setMcpPickerTab('connected');
+      }
+    } catch (err) {
+      if (openConnected) renderMcpOAuthStatusError(preset, err);
     }
   }, 500);
 }
@@ -6776,7 +6830,7 @@ async function startMcpOAuth() {
     if (!started?.authorization_url) throw new Error(`${status.name} did not return an authorization URL.`);
     popup.location.replace(started.authorization_url);
     popup.focus();
-    watchMcpOAuthPopup(popup, preset);
+    watchMcpOAuthPopup(popup, preset, {wasConnected: status.connected === true});
   } catch (err) {
     if (!popup.closed) popup.close();
     toast(err.message, true);

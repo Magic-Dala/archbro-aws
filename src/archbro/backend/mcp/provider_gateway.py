@@ -205,7 +205,9 @@ class ExternalMcpGateway:
             expires_at=oauth.expires_at,
             token_url=oauth.token_url,
             client_id=oauth.client_id,
-            client_secret=oauth.client_secret,
+            # Deployment OAuth app secrets are supplied by the current runtime.
+            # They are not user grants and should not be copied into every row.
+            client_secret="",
             display_endpoint=state.display_endpoint,
             tool_count=state.tool_count,
         )

@@ -8,13 +8,13 @@ Completed first-party OAuth connections are encrypted with authenticated Fernet 
 
 A newly authorized connection is verified before replacing the previous committed credential. Failed reconnection leaves the last committed connection intact. An explicit Remove deletes the database credential before reporting success; persistence failure must not pretend removal succeeded. Late saves from removed connections are rejected. Concurrent refresh/commit/remove operations use the existing per-account gateway with a reentrant credential lock; normal MCP reads are not globally serialized. If token refresh succeeds but its database save fails, a subsequent request retries the save before using that refreshed credential rather than rotating the token again.
 
-On process startup, a new registry lazily reconstructs connections from the authenticated user's stored rows. The connection ID is retained. A restored connection is not falsely marked freshly probed: readiness is checked by normal discovery/probe/read operations.
+On process startup, a new registry lazily reconstructs connections from the authenticated user's stored rows. The connection ID is retained. Credentials are opened one provider at a time, so one corrupt or undecryptable grant produces a safe reconnect state for that provider without hiding other valid account connections. Expired grants without a refresh token are not presented as Connected. A restored connection is not falsely marked freshly probed: readiness is checked by normal discovery/probe/read operations. Current deployment OAuth client identity overrides retired stored client metadata, and new rows no longer duplicate the deployment client secret.
 
 ## Deployment prerequisites (not applied by this repair)
 
 The deployment needs a stable `ARCHBRO_PROVIDER_CREDENTIAL_KEY` together with its PostgreSQL `DATABASE_URL`. Main and the primary dev stack remain operator-managed and fail closed when OAuth is configured without that key. `archbro-dev2` is the exception for repeatable acceptance testing: on the first OAuth-enabled deployment only, `deploy-stack.sh` creates one root-owned Fernet key in that stack's existing `.env` and reuses it on every later release. The value is never emitted to Actions logs or passed through workflow arguments.
 
-Startup validates an encrypted key canary. A wrong key fails explicitly rather than presenting existing credentials as absent. Concurrent initializations serialize the schema/canary transaction. Losing the key prevents decrypting existing credentials; replacing it is not a supported rotation procedure.
+Startup validates an encrypted key canary. A wrong key fails explicitly rather than presenting existing credentials as absent. Concurrent initializations serialize the schema/canary transaction. Online rotation uses a comma-separated `new-key,old-key` set: the first key encrypts new data, while successful reads through an older key atomically rewrap the canary or credential with the primary key. Old keys must remain configured until migration/acceptance proves every row was rewrapped. Losing every matching key prevents decrypting existing credentials.
 
 Production first-party OAuth with no encrypted store is rejected. This does not make GitHub mandatory: a deployment without configured first-party OAuth can still create projects and run general tasks. `INITIAL_ARCHITECTURE` is excluded before provider runtime creation. The project repository setting remains optional until the user asks for repository evidence.
 
@@ -24,7 +24,7 @@ The existing single-worker OAuth transaction constraint is retained. Completed g
 
 ## User feedback and account isolation
 
-OAuth completion refreshes server status and connection metadata, updates provider cards and the connected count, opens the Connected view, and shows an accessible success notice. No tab-switch is required. Saved first-party credentials and session-only local helpers are labeled differently. Removed connections clear stale success notices.
+OAuth completion refreshes server status and connection metadata together, updates provider cards and the connected count, opens the Connected view, dispatches an account-connection change event, and shows an accessible success notice. No tab-switch is required. If the OAuth popup completion message is lost, closing the popup performs the same full reconciliation and announces success only for a real disconnected-to-connected transition. Saved first-party credentials and session-only local helpers are labeled differently. Removed connections clear stale success notices. Public builds do not probe legacy process-memory OAuth unless the backend explicitly authorizes that local-only fallback.
 
 Connection/status reads carry account-generation guards; an old account's delayed response cannot repaint another account after logout/login. Within one account, an invalidated provider status cannot overwrite a newer connect result. Frontend identity checks protect display freshness only; backend authorization remains authoritative.
 
@@ -59,9 +59,9 @@ The handoff regression tests were first run against the unfixed source: reposito
 
 ## Explicitly not performed
 
-- Production deployment, push, pull request, merge or real OAuth/secret changes.
-- Live GitHub authorization, real cross-computer login, real provider revocation and token rotation.
-- Multi-replica acceptance or encryption-key rotation.
+- This reconciliation does not perform a new real OAuth grant or provider-side secret change.
+- Live cross-computer login, real provider revocation and refresh-token rotation.
+- Multi-replica acceptance or a live production encryption-key rotation drill.
 - Linux-only deploy shell acceptance and paid-provider tests when skipped by the local platform/configuration.
 
 Local fixture verification must not be described as a deployed fix.
