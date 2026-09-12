@@ -666,6 +666,16 @@ class GeminiProvider(ModelProvider):
             raise ValueError("GEMINI_ROUTINE_MODEL_TIMEOUT_SECONDS must be greater than zero")
         self.interaction_model_timeout_seconds = float(os.getenv("GEMINI_INTERACTION_MODEL_TIMEOUT_SECONDS", "12"))
         self.interaction_total_timeout_seconds = float(os.getenv("GEMINI_INTERACTION_TOTAL_TIMEOUT_SECONDS", "36"))
+        # A Strands tool invocation can require multiple model turns: choose a
+        # tool, wait for GitHub MCP, inspect the evidence, and then emit the
+        # structured decision. The ordinary 12-second interaction budget is
+        # intentionally fast, but it is too short for that complete loop.
+        self.tool_interaction_model_timeout_seconds = float(
+            os.getenv("GEMINI_TOOL_INTERACTION_MODEL_TIMEOUT_SECONDS", "60")
+        )
+        self.tool_interaction_total_timeout_seconds = float(
+            os.getenv("GEMINI_TOOL_INTERACTION_TOTAL_TIMEOUT_SECONDS", "90")
+        )
         self.architecture_model_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_MODEL_TIMEOUT_SECONDS", "90"))
         self.architecture_phase_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_PHASE_TIMEOUT_SECONDS", "120"))
         self.architecture_total_timeout_seconds = float(os.getenv("GEMINI_ARCHITECTURE_TOTAL_TIMEOUT_SECONDS", "900"))
@@ -733,6 +743,8 @@ class GeminiProvider(ModelProvider):
         if (
             self.interaction_model_timeout_seconds <= 0
             or self.interaction_total_timeout_seconds <= 0
+            or self.tool_interaction_model_timeout_seconds <= 0
+            or self.tool_interaction_total_timeout_seconds <= 0
             or self.architecture_model_timeout_seconds <= 0
             or self.architecture_phase_timeout_seconds <= 0
             or self.architecture_total_timeout_seconds <= 0
@@ -752,6 +764,8 @@ class GeminiProvider(ModelProvider):
                 for value in (
                     self.interaction_model_timeout_seconds,
                     self.interaction_total_timeout_seconds,
+                    self.tool_interaction_model_timeout_seconds,
+                    self.tool_interaction_total_timeout_seconds,
                     self.architecture_model_timeout_seconds,
                     self.architecture_phase_timeout_seconds,
                     self.architecture_total_timeout_seconds,
@@ -1023,6 +1037,32 @@ class GeminiProvider(ModelProvider):
         http_timeout_ms = int(os.getenv("GEMINI_HTTP_TIMEOUT_MS", "12000"))
         if http_timeout_ms <= 0:
             raise ValueError("GEMINI_HTTP_TIMEOUT_MS must be greater than zero")
+        if tools:
+            tool_http_timeout_text = os.getenv("GEMINI_TOOL_HTTP_TIMEOUT_MS", "").strip()
+            if tool_http_timeout_text:
+                try:
+                    tool_http_timeout_ms = int(tool_http_timeout_text)
+                except ValueError as exc:
+                    raise ValueError("GEMINI_TOOL_HTTP_TIMEOUT_MS must be an integer") from exc
+                if tool_http_timeout_ms <= 0:
+                    raise ValueError("GEMINI_TOOL_HTTP_TIMEOUT_MS must be greater than zero")
+            else:
+                tool_http_timeout_ms = 0
+            # An individual Google request must not expire before the server-owned
+            # per-model tool-loop budget. Operators may extend this further, but
+            # cannot accidentally configure a shorter transport deadline.
+            tool_model_timeout_ms = max(
+                1,
+                round(
+                    float(getattr(self, "tool_interaction_model_timeout_seconds", 60.0))
+                    * 1000
+                ),
+            )
+            http_timeout_ms = max(
+                http_timeout_ms,
+                tool_http_timeout_ms,
+                tool_model_timeout_ms,
+            )
         client = self._client_factory_for_invocation().create_client(
             http_timeout_ms=http_timeout_ms
         )
@@ -3312,16 +3352,21 @@ class GeminiProvider(ModelProvider):
             + ("\n\n" + tool_prompt if tool_prompt else "")
         )
         candidate_chain = self.routine_model_chain if is_routine_update else self.model_chain
-        per_model_timeout = (
-            self.routine_model_timeout_seconds
-            if is_routine_update
-            else self.interaction_model_timeout_seconds
-        )
-        total_timeout = (
-            per_model_timeout * max(1, len(candidate_chain))
-            if is_routine_update
-            else max(per_model_timeout, self.interaction_total_timeout_seconds)
-        )
+        if is_routine_update:
+            per_model_timeout = self.routine_model_timeout_seconds
+            total_timeout = per_model_timeout * max(1, len(candidate_chain))
+        elif agent_tools:
+            per_model_timeout = self.tool_interaction_model_timeout_seconds
+            total_timeout = max(
+                per_model_timeout,
+                self.tool_interaction_total_timeout_seconds,
+            )
+        else:
+            per_model_timeout = self.interaction_model_timeout_seconds
+            total_timeout = max(
+                per_model_timeout,
+                self.interaction_total_timeout_seconds,
+            )
         started = time.perf_counter()
         unavailable: list[str] = []
         timed_out: list[str] = []

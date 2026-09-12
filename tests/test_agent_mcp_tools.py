@@ -222,6 +222,8 @@ def _gemini_provider() -> GeminiProvider:
     provider.routine_model_timeout_seconds = 1.0
     provider.interaction_model_timeout_seconds = 1.0
     provider.interaction_total_timeout_seconds = 3.0
+    provider.tool_interaction_model_timeout_seconds = 2.0
+    provider.tool_interaction_total_timeout_seconds = 4.0
     provider.architecture_model_timeout_seconds = 1.0
     provider.architecture_total_timeout_seconds = 2.0
     return provider
@@ -528,6 +530,53 @@ def test_gemini_invoke_passes_supplied_tools_to_agent() -> None:
     assert captured["prompt"] == "verify repository"
     assert captured["structured_output_model"] is GeminiDecisionWire
     assert wire.summary == "Verified through the supplied tool."
+
+
+def test_github_tool_loop_uses_dedicated_timeout_without_slowing_ordinary_messages() -> None:
+    provider = _gemini_provider()
+    provider.interaction_model_timeout_seconds = 0.01
+    provider.interaction_total_timeout_seconds = 0.02
+    provider.tool_interaction_model_timeout_seconds = 0.5
+    provider.tool_interaction_total_timeout_seconds = 0.75
+    session, _ = _session()
+    context = _project_context()
+    event = _verification_event(context.project.id)
+
+    async def delayed_invoke(self, model_id: str, prompt: str, *, tools=None):
+        await asyncio.sleep(0.05)
+        if tools:
+            session.call(
+                "get_file_contents",
+                {
+                    "owner": "Magic-Dala",
+                    "repo": "archbro",
+                    "path": "README.md",
+                    "ref": "refs/heads/dev2",
+                },
+            )
+        return _aligned_wire("Repository verification completed.")
+
+    provider._invoke = MethodType(delayed_invoke, provider)
+
+    decision = asyncio.run(
+        provider.generate_with_external_tools(
+            event=event,
+            context=context,
+            system_prompt="test system prompt",
+            external_tools=session,
+        )
+    )
+    assert decision.summary == "Repository verification completed."
+    assert session.successful_call_count == 1
+
+    with pytest.raises(RuntimeError, match="bounded reasoning window"):
+        asyncio.run(
+            provider.generate(
+                event=event,
+                context=context,
+                system_prompt="test system prompt",
+            )
+        )
 
 
 def test_gemini_retries_when_first_structured_answer_skips_required_mcp_call() -> None:

@@ -46,6 +46,8 @@ def _provider() -> GeminiProvider:
     provider.routine_model_timeout_seconds = 1.0
     provider.interaction_model_timeout_seconds = 1.0
     provider.interaction_total_timeout_seconds = 2.0
+    provider.tool_interaction_model_timeout_seconds = 2.0
+    provider.tool_interaction_total_timeout_seconds = 3.0
     provider.architecture_model_timeout_seconds = 1.0
     provider.architecture_total_timeout_seconds = 2.0
     return provider

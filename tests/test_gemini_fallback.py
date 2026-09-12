@@ -53,6 +53,8 @@ def _provider_with_chain() -> GeminiProvider:
     provider.routine_model_timeout_seconds = 0.5
     provider.interaction_model_timeout_seconds = 0.5
     provider.interaction_total_timeout_seconds = 2.0
+    provider.tool_interaction_model_timeout_seconds = 1.0
+    provider.tool_interaction_total_timeout_seconds = 2.0
     provider.architecture_model_timeout_seconds = 0.5
     provider.architecture_phase_timeout_seconds = 1.0
     provider.architecture_total_timeout_seconds = 2.0
@@ -273,6 +275,57 @@ def test_strands_agent_uses_prebuilt_client_and_closes_it(monkeypatch):
     assert captured["retry_options"] == {}
     assert captured["closed"] == 1
     assert "sync_closed" not in captured
+
+
+def test_tool_agent_transport_timeout_covers_the_full_tool_loop_budget(monkeypatch):
+    import strands
+    import strands.models.gemini as strands_gemini
+
+    captured: dict[str, object] = {}
+
+    class FakeAio:
+        async def aclose(self):
+            captured["closed"] = True
+
+    class FakeClient:
+        aio = FakeAio()
+
+        def close(self):
+            pass
+
+    class FakeFactory:
+        transport = "vertex"
+
+        def create_client(self, *, http_timeout_ms, **retry_options):
+            captured["http_timeout_ms"] = http_timeout_ms
+            return FakeClient()
+
+    class FakeGeminiModel:
+        def __init__(self, *, client, model_id, params):
+            pass
+
+    class FakeAgent:
+        def __init__(self, *, model, tools, callback_handler):
+            captured["tools"] = tools
+
+        async def invoke_async(self, prompt, **kwargs):
+            return "completed"
+
+    monkeypatch.setattr(strands, "Agent", FakeAgent)
+    monkeypatch.setattr(strands_gemini, "GeminiModel", FakeGeminiModel)
+    monkeypatch.setenv("GEMINI_HTTP_TIMEOUT_MS", "12000")
+    monkeypatch.delenv("GEMINI_TOOL_HTTP_TIMEOUT_MS", raising=False)
+
+    provider = object.__new__(GeminiProvider)
+    provider._google_client_factory = FakeFactory()
+    provider.tool_interaction_model_timeout_seconds = 60.0
+    sentinel_tool = object()
+    managed_agent = provider._build_agent("gemini-test", tools=[sentinel_tool])
+
+    assert asyncio.run(managed_agent.invoke_async("inspect repository")) == "completed"
+    assert captured["http_timeout_ms"] == 60000
+    assert captured["tools"] == [sentinel_tool]
+    assert captured["closed"] is True
 
 
 def test_client_cleanup_failure_does_not_mask_the_provider_error(monkeypatch):

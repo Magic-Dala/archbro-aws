@@ -2272,9 +2272,13 @@ def test_default_planner_budget_uses_bounded_phase_specific_reasoning(monkeypatc
     monkeypatch.delenv("GEMINI_ARCHITECTURE_QUEUE_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("GEMINI_INTERACTION_MODEL_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("GEMINI_INTERACTION_TOTAL_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("GEMINI_TOOL_INTERACTION_MODEL_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("GEMINI_TOOL_INTERACTION_TOTAL_TIMEOUT_SECONDS", raising=False)
     provider = GeminiProvider(model_id="gemini-test")
     assert provider.interaction_model_timeout_seconds == 12
     assert provider.interaction_total_timeout_seconds == 36
+    assert provider.tool_interaction_model_timeout_seconds == 60
+    assert provider.tool_interaction_total_timeout_seconds == 90
     assert provider.architecture_model_timeout_seconds == 90
     assert provider.architecture_phase_timeout_seconds == 120
     assert provider.architecture_total_timeout_seconds == 900
