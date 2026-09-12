@@ -12,7 +12,7 @@ On process startup, a new registry lazily reconstructs connections from the auth
 
 ## Deployment prerequisites (not applied by this repair)
 
-The deployment must provide a stable `ARCHBRO_PROVIDER_CREDENTIAL_KEY` together with its PostgreSQL `DATABASE_URL`. Keep the key in the deployment secret store, separate from application images and database backups, and retain it across ordinary deployments. Do not generate a new key on every release. No real key, OAuth configuration or production permissions were changed during this repair.
+The deployment needs a stable `ARCHBRO_PROVIDER_CREDENTIAL_KEY` together with its PostgreSQL `DATABASE_URL`. Main and the primary dev stack remain operator-managed and fail closed when OAuth is configured without that key. `archbro-dev2` is the exception for repeatable acceptance testing: on the first OAuth-enabled deployment only, `deploy-stack.sh` creates one root-owned Fernet key in that stack's existing `.env` and reuses it on every later release. The value is never emitted to Actions logs or passed through workflow arguments.
 
 Startup validates an encrypted key canary. A wrong key fails explicitly rather than presenting existing credentials as absent. Concurrent initializations serialize the schema/canary transaction. Losing the key prevents decrypting existing credentials; replacing it is not a supported rotation procedure.
 

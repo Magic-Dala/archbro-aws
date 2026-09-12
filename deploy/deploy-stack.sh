@@ -179,6 +179,64 @@ require_production_firebase() {
     require_literal_nonempty ARCHBRO_FIREBASE_AUTH_DOMAIN "$browser_auth_domain"
 }
 
+bootstrap_dev2_provider_credential_key() {
+    # dev2 is a disposable/staging stack, but OAuth authorization must survive
+    # releases so testers are not forced to reconnect after every image update.
+    # Bootstrap a dedicated encryption key exactly once on the VM. The key is
+    # generated inside this process, written only into the root-owned .env, and
+    # never emitted to Actions logs or passed through process arguments.
+    if [ "$STACK" != "archbro-dev2" ]; then
+        return 1
+    fi
+
+    local lock_dir="$DIR/.provider-credential-key.lock"
+    local lock_acquired=0
+    local attempt
+    local generated=""
+
+    for attempt in $(seq 1 100); do
+        if sudo mkdir "$lock_dir" 2>/dev/null; then
+            lock_acquired=1
+            break
+        fi
+        sleep 0.05
+    done
+    if [ "$lock_acquired" != "1" ]; then
+        contract_error "could not acquire provider credential key bootstrap lock"
+    fi
+
+    # Another deploy may have completed the bootstrap while we waited.
+    if sudo grep -Eq '^[[:space:]]*ARCHBRO_PROVIDER_CREDENTIAL_KEY[[:space:]]*=' "$ENV_FILE"; then
+        sudo rmdir "$lock_dir" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if ! generated="$(python3 - <<'PY'
+import base64
+import secrets
+print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii"))
+PY
+    )"; then
+        sudo rmdir "$lock_dir" >/dev/null 2>&1 || true
+        contract_error "could not initialize ARCHBRO_PROVIDER_CREDENTIAL_KEY"
+    fi
+    require_literal_nonempty ARCHBRO_PROVIDER_CREDENTIAL_KEY "$generated"
+
+    if ! printf '\nARCHBRO_PROVIDER_CREDENTIAL_KEY=%s\n' "$generated" | sudo tee -a "$ENV_FILE" >/dev/null; then
+        unset generated
+        sudo rmdir "$lock_dir" >/dev/null 2>&1 || true
+        contract_error "could not persist ARCHBRO_PROVIDER_CREDENTIAL_KEY"
+    fi
+    unset generated
+    if ! sudo chmod 640 "$ENV_FILE"; then
+        sudo rmdir "$lock_dir" >/dev/null 2>&1 || true
+        contract_error "could not protect provider credential key file"
+    fi
+    sudo rmdir "$lock_dir" >/dev/null 2>&1 || true
+    echo "Initialized durable provider credential encryption for $STACK." >&2
+    return 0
+}
+
 require_provider_credential_persistence() {
     local oauth_enabled=0
     local pair
@@ -219,7 +277,12 @@ require_provider_credential_persistence() {
     fi
 
     if [ "$oauth_enabled" = "1" ]; then
-        value="$(read_env_value ARCHBRO_PROVIDER_CREDENTIAL_KEY)"
+        value="$(read_env_value ARCHBRO_PROVIDER_CREDENTIAL_KEY 0)"
+        if [ -z "$value" ]; then
+            bootstrap_dev2_provider_credential_key || \
+                contract_error "must set ARCHBRO_PROVIDER_CREDENTIAL_KEY exactly once"
+            value="$(read_env_value ARCHBRO_PROVIDER_CREDENTIAL_KEY)"
+        fi
         require_literal_nonempty ARCHBRO_PROVIDER_CREDENTIAL_KEY "$value"
     fi
 }

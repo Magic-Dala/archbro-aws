@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 import re
@@ -444,13 +445,45 @@ def test_dev2_provider_oauth_requires_matching_secret(tmp_path: Path) -> None:
     assert "ARCHBRO_GITHUB_OAUTH_CLIENT_SECRET" in result.stdout + result.stderr
 
 
-def test_dev2_provider_oauth_requires_stable_credential_key(tmp_path: Path) -> None:
+def test_dev2_provider_oauth_bootstraps_stable_credential_key(tmp_path: Path) -> None:
     result = _validate(
         tmp_path,
         "archbro-dev2",
         _dev2_firebase_env(
             "ARCHBRO_GITHUB_OAUTH_CLIENT_ID=github-client",
             "ARCHBRO_GITHUB_OAUTH_CLIENT_SECRET=github-secret",
+        ),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    env_text = (tmp_path / "archbro-dev2" / ".env").read_text(encoding="utf-8")
+    key_lines = [
+        line
+        for line in env_text.splitlines()
+        if line.startswith("ARCHBRO_PROVIDER_CREDENTIAL_KEY=")
+    ]
+    assert len(key_lines) == 1
+    encoded = key_lines[0].split("=", 1)[1]
+    assert len(base64.urlsafe_b64decode(encoded.encode("ascii"))) == 32
+    assert "Initialized durable provider credential encryption for archbro-dev2." in (
+        result.stdout + result.stderr
+    )
+
+
+def test_main_provider_oauth_still_requires_operator_managed_key(tmp_path: Path) -> None:
+    result = _validate(
+        tmp_path,
+        "archbro-main",
+        chr(10).join(
+            [
+                "ARCHBRO_ENV=production",
+                "ARCHBRO_AUTH_MODE=firebase",
+                "FIREBASE_PROJECT_ID=archbro-main-example",
+                "ARCHBRO_FIREBASE_API_KEY=example-key",
+                "ARCHBRO_FIREBASE_AUTH_DOMAIN=archbro-main-example.firebaseapp.com",
+                "ARCHBRO_GITHUB_OAUTH_CLIENT_ID=github-client",
+                "ARCHBRO_GITHUB_OAUTH_CLIENT_SECRET=github-secret",
+                "",
+            ]
         ),
     )
     assert result.returncode != 0
