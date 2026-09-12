@@ -189,6 +189,8 @@ const state = {
   proposals: [],
   activity: [],
   lastRun: null,
+  lastInstruction: '',
+  instructionSubmission: null,
   plannerRecovery: null,
   agentContextManifest: null,
   agentContextKey: null,
@@ -1233,6 +1235,9 @@ async function openPersonalWorkspace({historyMode = 'push', navigationGuard = nu
   state.graphFocusMode = 'all';
   state.proposals = [];
   state.lastRun = null;
+  state.lastInstruction = '';
+  $('instruction').value = '';
+  syncInstructionTextareaRows();
   state.plannerRecovery = null;
   clearAgentContextPreview();
   state.selectedComponentId = null;
@@ -2003,6 +2008,11 @@ async function selectProject(projectId, {
     ARCHITECTURE_CANVAS_MODE = Boolean(canvas);
     syncArchitectureCanvasDomMode();
     const nextView = ROUTED_VIEWS.has(view) ? view : (canvas ? 'architecture' : 'overview');
+    if (previousProjectId !== projectId) {
+      state.lastInstruction = '';
+      $('instruction').value = '';
+      syncInstructionTextareaRows();
+    }
     Object.assign(state, context, {
       projectId,
       agentContextManifest: null,
@@ -2759,6 +2769,7 @@ function resetEphemeralSessionState() {
   state.proposalDecisionNotice = null;
   state.notificationTransientMessage = null;
   state.lastRun = null;
+  state.lastInstruction = '';
   state.plannerRecovery = null;
   clearAgentContextPreview();
   state.projects = [];
@@ -2798,7 +2809,9 @@ function resetEphemeralSessionState() {
   $('initialGoal').value = '';
   $('newProjectName').value = '';
   $('instruction').value = '';
+  syncInstructionTextareaRows();
   syncInstructionRainbowState();
+  renderAgentConversationDialog();
   $('instruction').removeAttribute('aria-invalid');
   $('instructionError').textContent = '';
 }
@@ -5710,21 +5723,158 @@ function renderLastRun() {
   el.innerHTML = `<article class="activity-row activity-last-run"><div class="activity-row-summary"><strong>${escapeHtml(goalExcerpt(summary, 96))}</strong><p>${escapeHtml(state.lastRun.provider || 'Agent')} · Latest result</p></div><details class="activity-details"><summary>View result <span aria-hidden="true">＋</span></summary><div class="activity-detail-body"><p class="muted">${ok ? 'SUCCESS' : 'ERROR'} · ${actions.length} action${actions.length === 1 ? '' : 's'} · ${escapeHtml(state.lastRun.model || 'deterministic')}</p>${displayError ? `<p class="activity-error">${escapeHtml(displayError)}</p>` : ''}<pre>${escapeHtml(details)}</pre></div></details></article>`;
 }
 
+function renderAgentInline(value) {
+  const source = String(value ?? '');
+  const tokenPattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g;
+  let cursor = 0;
+  let html = '';
+  for (const match of source.matchAll(tokenPattern)) {
+    html += escapeHtml(source.slice(cursor, match.index));
+    const token = match[0];
+    if (token.startsWith('`')) html += `<code>${escapeHtml(token.slice(1, -1))}</code>`;
+    else html += `<strong>${escapeHtml(token.slice(2, -2))}</strong>`;
+    cursor = match.index + token.length;
+  }
+  return html + escapeHtml(source.slice(cursor));
+}
+
+function markdownTableCells(line) {
+  const normalized = String(line).trim().replace(/^\|/, '').replace(/\|$/, '');
+  return normalized.split('|').map((cell) => cell.trim());
+}
+
+function markdownTableDelimiter(line) {
+  const cells = markdownTableCells(line);
+  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function renderAgentRichText(value) {
+  const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n');
+  const output = [];
+  let index = 0;
+  const isSpecial = (line, next = '') => (
+    /^\s*```/.test(line)
+    || /^\s*#{1,4}\s+/.test(line)
+    || /^\s*[-*+]\s+/.test(line)
+    || /^\s*\d+[.)]\s+/.test(line)
+    || (line.includes('|') && markdownTableDelimiter(next))
+  );
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) { index += 1; continue; }
+    if (/^\s*```/.test(line)) {
+      const language = line.trim().slice(3).trim();
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      output.push(`<pre class="agent-code"><code${language ? ` data-language="${escapeHtml(language)}"` : ''}>${escapeHtml(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+    if (line.includes('|') && index + 1 < lines.length && markdownTableDelimiter(lines[index + 1])) {
+      const header = markdownTableCells(line);
+      index += 2;
+      const rows = [];
+      while (index < lines.length && lines[index].includes('|') && lines[index].trim()) rows.push(markdownTableCells(lines[index++]));
+      output.push(`<div class="agent-table-scroll"><table><thead><tr>${header.map((cell) => `<th>${renderAgentInline(cell)}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${header.map((_, cellIndex) => `<td>${renderAgentInline(row[cellIndex] || '')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+      continue;
+    }
+    const heading = line.match(/^\s*(#{1,4})\s+(.+)$/);
+    if (heading) {
+      const level = Math.min(4, heading[1].length + 1);
+      output.push(`<h${level}>${renderAgentInline(heading[2])}</h${level}>`);
+      index += 1;
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) items.push(lines[index++].replace(/^\s*[-*+]\s+/, ''));
+      output.push(`<ul>${items.map((item) => `<li>${renderAgentInline(item)}</li>`).join('')}</ul>`);
+      continue;
+    }
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) items.push(lines[index++].replace(/^\s*\d+[.)]\s+/, ''));
+      output.push(`<ol>${items.map((item) => `<li>${renderAgentInline(item)}</li>`).join('')}</ol>`);
+      continue;
+    }
+    const paragraph = [line.trim()];
+    index += 1;
+    while (
+      index < lines.length
+      && lines[index].trim()
+      && !isSpecial(lines[index], lines[index + 1] || '')
+    ) paragraph.push(lines[index++].trim());
+    const evidence = /^(?:verified sources?|evidence|source references?)\s*:/i.test(paragraph[0]);
+    output.push(`<p${evidence ? ' class="agent-evidence-reference"' : ''}>${paragraph.map(renderAgentInline).join('<br>')}</p>`);
+  }
+  return output.join('') || '<p>No response content.</p>';
+}
+
+function agentResponseText(run = state.lastRun) {
+  if (!run) return '';
+  if (run.result !== 'SUCCESS') return friendlyAgentError(run);
+  const summary = run.summary || 'No response summary.';
+  const evidence = Array.isArray(run.evaluation?.evidence)
+    ? run.evaluation.evidence.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (!evidence.length) return summary;
+  return `${summary}\n\nEvidence:\n${evidence.map((item) => `- ${item}`).join('\n')}`;
+}
+
+function syncInstructionTextareaRows() {
+  const input = $('instruction');
+  if (!input) return;
+  // Measure actual wrapping: character counts are unreliable across fonts and widths.
+  input.rows = 2;
+  input.style.height = 'auto';
+  if (!input.clientWidth) return;
+  const style = getComputedStyle(input);
+  const lineHeight = parseFloat(style.lineHeight) || 19.5;
+  const padding = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+  const visualLines = Math.ceil((input.scrollHeight - padding) / lineHeight);
+  input.rows = Math.min(8, Math.max(2, visualLines));
+  input.classList.toggle('instruction-scrollable', visualLines > 8);
+}
+
+function renderAgentConversationDialog() {
+  const prompt = $('agentConversationPrompt');
+  const response = $('agentConversationResponse');
+  const meta = $('agentConversationResponseMeta');
+  if (!prompt || !response || !meta) return;
+  const draft = $('instruction')?.value || '';
+  prompt.textContent = draft.trim() ? draft : (state.lastInstruction || 'No instruction yet.');
+  if (!state.lastRun) {
+    response.innerHTML = '<p>No Agent response yet.</p>';
+    meta.textContent = '';
+    return;
+  }
+  const ok = state.lastRun.result === 'SUCCESS';
+  const responseText = agentResponseText(state.lastRun);
+  response.innerHTML = renderAgentRichText(responseText);
+  meta.textContent = `${ok ? 'SUCCESS' : 'ERROR'} · ${state.lastRun.provider || 'Agent'} · ${state.lastRun.model || 'unknown model'}`;
+}
+
+function openAgentConversation(trigger) {
+  renderAgentConversationDialog();
+  showDialog('agentConversationDialog', trigger || $('instruction'));
+}
+
 function renderGlobalAgentReply() {
   const reply = $('globalAgentReply');
   if (!reply) return;
   if (!state.lastRun) {
     reply.classList.add('hidden');
     reply.innerHTML = '';
+    renderAgentConversationDialog();
     return;
   }
   const ok = state.lastRun.result === 'SUCCESS';
   reply.classList.remove('hidden');
   reply.classList.toggle('error', !ok);
-  const responseText = ok
-    ? (state.lastRun.summary || 'No response summary.')
-    : friendlyAgentError(state.lastRun);
-  reply.innerHTML = `<div class="global-agent-reply-head"><span>${ok ? 'AGENT RESPONSE' : 'AGENT ERROR'}</span><small>${escapeHtml(state.lastRun.provider)} · ${escapeHtml(state.lastRun.model)}</small></div><p>${escapeHtml(responseText)}</p>`;
+  const responseText = agentResponseText(state.lastRun);
+  reply.innerHTML = `<div class="global-agent-reply-head"><span>${ok ? 'AGENT RESPONSE' : 'AGENT ERROR'}</span><div><small>${escapeHtml(state.lastRun.provider)} · ${escapeHtml(state.lastRun.model)}</small><button class="link-btn" type="button" data-expand-agent-conversation>Expand</button></div></div><div class="agent-rich-text">${renderAgentRichText(responseText)}</div>`;
+  renderAgentConversationDialog();
 }
 
 function selectedAgentContextNode() {
@@ -7944,33 +8094,46 @@ $('instructionForm').addEventListener('submit', async (e) => {
     toast('Architecture v1 must finish before normal project updates.', true);
     return;
   }
+  if (committedProjectGuardIsCurrent(state.instructionSubmission)) return;
+  const submissionGuard = captureNavigationGuard();
   const input = $('instruction');
   const message = input.value.trim();
   if (!message) return;
-  input.removeAttribute('aria-invalid');
-  $('instructionError').textContent = '';
-  const context = currentInstructionContext();
-  const payload = {message, ui_context: context.payload};
-  if (selectedAgentContextNode()) {
-    const manifest = await ensureAgentContextManifest();
-    if (!manifest) {
+  state.instructionSubmission = submissionGuard;
+  try {
+    state.lastInstruction = message;
+    renderAgentConversationDialog();
+    input.removeAttribute('aria-invalid');
+    $('instructionError').textContent = '';
+    const context = currentInstructionContext();
+    const payload = {message, ui_context: context.payload};
+    if (selectedAgentContextNode()) {
+      const manifest = await ensureAgentContextManifest();
+      if (!committedProjectGuardIsCurrent(submissionGuard)) return;
+      if (!manifest) {
+        input.setAttribute('aria-invalid', 'true');
+        $('instructionError').textContent = 'Instruction not sent. The exact bounded context preview is unavailable; retry it in the Context Tray.';
+        input.focus();
+        return;
+      }
+      payload.agent_context_request = agentContextExecutionRequest(manifest);
+    }
+    const result = await sendEvent('USER_MESSAGE', payload);
+    if (!committedProjectGuardIsCurrent(submissionGuard)) return;
+    if (result?.result === 'SUCCESS') {
+      if (input.value.trim() === message) {
+        input.value = '';
+        syncInstructionRainbowState();
+        syncInstructionTextareaRows();
+        renderAgentConversationDialog();
+      }
+    } else {
       input.setAttribute('aria-invalid', 'true');
-      $('instructionError').textContent = 'Instruction not sent. The exact bounded context preview is unavailable; retry it in the Context Tray.';
+      $('instructionError').textContent = 'Instruction not sent. Your text and context are still here—review and press Send to retry.';
       input.focus();
-      return;
     }
-    payload.agent_context_request = agentContextExecutionRequest(manifest);
-  }
-  const result = await sendEvent('USER_MESSAGE', payload);
-  if (result?.result === 'SUCCESS') {
-    if (input.value.trim() === message) {
-      input.value = '';
-      syncInstructionRainbowState();
-    }
-  } else {
-    input.setAttribute('aria-invalid', 'true');
-    $('instructionError').textContent = 'Instruction not sent. Your text and context are still here—review and press Send to retry.';
-    input.focus();
+  } finally {
+    if (state.instructionSubmission === submissionGuard) state.instructionSubmission = null;
   }
 });
 
@@ -7995,7 +8158,29 @@ $('onboardingForm').addEventListener('submit', async (e) => {
 $('onboardingAsk').addEventListener('input', () => syncOnboardingAskRainbowState({activate: true}));
 $('onboardingAsk').addEventListener('focus', syncOnboardingAskRainbowState);
 $('onboardingAsk').addEventListener('blur', syncOnboardingAskRainbowState);
-$('instruction').addEventListener('input', () => syncInstructionRainbowState({activate: true}));
+$('instruction').addEventListener('input', () => {
+  syncInstructionTextareaRows();
+  syncInstructionRainbowState({activate: true});
+  renderAgentConversationDialog();
+});
+let instructionWidth = 0;
+const instructionResizeObserver = new ResizeObserver(([entry]) => {
+  if (entry.contentRect.width === instructionWidth) return;
+  instructionWidth = entry.contentRect.width;
+  syncInstructionTextareaRows();
+});
+instructionResizeObserver.observe($('instruction'));
+$('instruction').addEventListener('keydown', (event) => {
+  if (event.isComposing) return;
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    $('instructionForm').requestSubmit();
+  }
+});
+document.addEventListener('click', (event) => {
+  const trigger = event.target.closest('[data-expand-agent-conversation]');
+  if (trigger) openAgentConversation(trigger);
+});
 $('instruction').addEventListener('focus', () => {
   if (state.taskDetailId && !$('taskDetailPanel')?.hidden) closeTaskDetails({restoreFocus:false});
   syncInstructionRainbowState();
@@ -8094,6 +8279,7 @@ projectRepositoryController = createProjectRepositoryController({
   },
 });
 $('projectRepositoryDialog').addEventListener('click', closeDialogOnBackdrop);
+$('agentConversationDialog').addEventListener('click', closeDialogOnBackdrop);
 $('editProjectForm').addEventListener('submit', async (e) => { e.preventDefault(); await saveProjectEdits(); });
 $('deleteProjectForm').addEventListener('submit', async (e) => { e.preventDefault(); await deleteCurrentProject(); });
 document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => $(button.dataset.closeDialog).close()));

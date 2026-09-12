@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Archbro</title>
   <link rel="icon" href="/static/archbro-logo.svg?v=35cea50bf08b54c3" />
-  <link rel="stylesheet" href="/static/styles.css?v=8d05b06e09bbfb1b" />
+  <link rel="stylesheet" href="/static/styles.css?v=efd61d30af212cc1" />
   <link rel="stylesheet" href="/static/progress.css?v=90e493c3fd6518b1" />
 </head>
 <body>
@@ -304,7 +304,8 @@
             <div class="instruction-input">
               <div class="instruction-context-row"><span>ASK AGENT</span><span id="instructionContext" class="instruction-context-chip">Project context</span></div>
               <label id="instructionLabel" for="instruction">Ask about this project, add a task, or describe a change</label>
-              <input id="instruction" autocomplete="off" aria-describedby="instructionError" placeholder="Describe what changed or what you want the Agent to evaluate." />
+              <textarea id="instruction" rows="2" autocomplete="off" spellcheck="true" aria-describedby="instructionShortcut instructionError" placeholder="Describe what changed or what you want the Agent to evaluate."></textarea>
+              <div class="instruction-footer"><span id="instructionShortcut">Enter adds a new line · Ctrl/⌘ + Enter sends</span><button class="link-btn" type="button" data-expand-agent-conversation>Expand conversation</button></div>
               <span id="instructionError" class="field-error" aria-live="polite"></span>
             </div>
             <button class="btn soft" type="submit">Send</button>
@@ -313,6 +314,21 @@
       </section>
     </main>
   </div>
+
+  <dialog id="agentConversationDialog" class="project-dialog agent-conversation-dialog" aria-labelledby="agentConversationDialogTitle">
+    <form method="dialog" class="agent-conversation-form">
+      <div class="dialog-head"><div><small>PROJECT AGENT</small><h3 id="agentConversationDialogTitle">Expanded conversation</h3></div><button class="dialog-close" type="button" data-close-dialog="agentConversationDialog" aria-label="Close">×</button></div>
+      <section class="agent-conversation-section" aria-labelledby="agentConversationPromptTitle">
+        <div class="agent-conversation-section-head"><h4 id="agentConversationPromptTitle">Instruction</h4><span>Line breaks and lists are preserved</span></div>
+        <pre id="agentConversationPrompt" class="agent-conversation-prompt">No instruction yet.</pre>
+      </section>
+      <section class="agent-conversation-section" aria-labelledby="agentConversationResponseTitle">
+        <div class="agent-conversation-section-head"><h4 id="agentConversationResponseTitle">Latest response</h4><span id="agentConversationResponseMeta"></span></div>
+        <div id="agentConversationResponse" class="agent-rich-text"><p>No Agent response yet.</p></div>
+      </section>
+      <div class="dialog-actions"><button class="btn primary" type="button" data-close-dialog="agentConversationDialog">Close</button></div>
+    </form>
+  </dialog>
 
   <dialog id="newProjectNameDialog" class="project-dialog" aria-labelledby="newProjectNameDialogTitle">
     <form id="newProjectNameForm" novalidate>
@@ -483,7 +499,7 @@
   <script src="/runtime-config.js"></script>
   <script src="/static/prototype.js?v=bd187140bfd50057"></script>
   <script src="/static/firebase-auth-client.js?v=20260901-auth-providers"></script>
-  <script type="module" src="/static/app.js?v=9ba397489a83f7b4"></script>
+  <script type="module" src="/static/app.js?v=503625140e918573"></script>
   <script type="module" src="/static/archbro-webmcp.js?v=78844908f59573dd"></script>
 </body>
 </html>

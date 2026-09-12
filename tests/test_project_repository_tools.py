@@ -100,6 +100,9 @@ def _event(message: str, project_id: str = 'p') -> ProjectEvent:
         ('Use GitHub MCP to read docs/README.md from the selected repository.', ()),
         ('Explain the phrase "read octocat/Hello-World".', ()),
         ('Read refs/heads/dev2 from the selected repository.', ()),
+        ('Use GitHub MCP to inspect Magic-Dala/archbro. Focus on Deployment/runtime.', ('Magic-Dala/archbro',)),
+        ('Use GitHub MCP to inspect Magic-Dala/archbro. Focus on Deployment/runtimeFor anything that differs.', ('Magic-Dala/archbro',)),
+        ('Use GitHub MCP to inspect Magic-Dala/archbro. Focus on feature/login, report/status, and Agent/runtime.', ('Magic-Dala/archbro',)),
     ],
 )
 def test_requested_repository_parser_ignores_paths_and_quoted_examples(message, expected):

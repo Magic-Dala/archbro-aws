@@ -579,6 +579,216 @@ def test_github_tool_loop_uses_dedicated_timeout_without_slowing_ordinary_messag
         )
 
 
+def test_tool_timeout_synthesizes_from_unique_collected_evidence_without_rebrowsing() -> None:
+    provider = _gemini_provider()
+    provider.tool_interaction_model_timeout_seconds = 0.04
+    provider.tool_interaction_total_timeout_seconds = 0.30
+    session, gateway = _session()
+    context = _project_context()
+    event = _verification_event(context.project.id)
+    invocations: list[tuple[bool, bool]] = []
+
+    async def fake_invoke(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        tools=None,
+        evidence_completion=False,
+    ):
+        invocations.append((bool(tools), evidence_completion))
+        if tools:
+            session.call(
+                "get_file_contents",
+                {
+                    "owner": "Magic-Dala",
+                    "repo": "archbro",
+                    "path": "README.md",
+                    "ref": "dev2",
+                },
+            )
+            await asyncio.sleep(0.08)
+            raise AssertionError("tool turn should be canceled by its bounded deadline")
+        assert evidence_completion is True
+        assert "EVIDENCE COLLECTION COMPLETE" in prompt
+        assert PRIVATE_MARKER in prompt
+        return _aligned_wire("Completed from already collected GitHub evidence.")
+
+    provider._invoke = MethodType(fake_invoke, provider)
+    decision = asyncio.run(
+        provider.generate_with_external_tools(
+            event=event,
+            context=context,
+            system_prompt="test system prompt",
+            external_tools=session,
+        )
+    )
+
+    assert decision.summary == "Completed from already collected GitHub evidence."
+    assert invocations == [(True, False), (False, True)]
+    assert len(gateway.calls) == 1
+    assert session.distinct_evidence_count == 1
+
+
+def test_tool_call_budget_exhaustion_after_evidence_uses_synthesis_instead_of_error() -> None:
+    provider = _gemini_provider()
+    session, gateway = _session()
+    session.max_calls = 1
+    context = _project_context()
+    event = _verification_event(context.project.id)
+    invocations: list[tuple[bool, bool]] = []
+
+    async def fake_invoke(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        tools=None,
+        evidence_completion=False,
+    ):
+        invocations.append((bool(tools), evidence_completion))
+        if tools:
+            session.call(
+                "get_file_contents",
+                {
+                    "owner": "Magic-Dala",
+                    "repo": "archbro",
+                    "path": "README.md",
+                    "ref": "dev2",
+                },
+            )
+            session.call(
+                "issue_read",
+                {
+                    "owner": "Magic-Dala",
+                    "repo": "archbro",
+                    "issue_number": 68,
+                },
+            )
+            raise AssertionError("call budget should fail before this line")
+        assert evidence_completion is True
+        return _aligned_wire("Synthesized after the bounded evidence budget was reached.")
+
+    provider._invoke = MethodType(fake_invoke, provider)
+    decision = asyncio.run(
+        provider.generate_with_external_tools(
+            event=event,
+            context=context,
+            system_prompt="test system prompt",
+            external_tools=session,
+        )
+    )
+
+    assert decision.summary == "Synthesized after the bounded evidence budget was reached."
+    assert invocations == [(True, False), (False, True)]
+    assert len(gateway.calls) == 1
+
+
+def test_evidence_completion_can_create_a_real_architecture_review_proposal() -> None:
+    provider = _gemini_provider()
+    provider.tool_interaction_model_timeout_seconds = 0.04
+    provider.tool_interaction_total_timeout_seconds = 0.30
+    session, gateway = _session()
+    from archbro.backend.core.contracts import Component
+    from test_agent_evidence_acceptance import drift_wire
+
+    context = _project_context()
+    context.architecture.components = [Component(id="database", name="SQLite", type="database", responsibility="Persist project state.")]
+    event = _verification_event(context.project.id)
+
+    async def fake_invoke(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        tools=None,
+        evidence_completion=False,
+    ):
+        if tools:
+            session.call(
+                "get_file_contents",
+                {
+                    "owner": "Magic-Dala",
+                    "repo": "archbro",
+                    "path": "README.md",
+                    "ref": "dev2",
+                },
+            )
+            await asyncio.sleep(0.08)
+            raise AssertionError("tool turn should be canceled by its bounded deadline")
+        assert evidence_completion is True
+        assert PRIVATE_MARKER in prompt
+        return drift_wire()
+
+    provider._invoke = MethodType(fake_invoke, provider)
+    decision = asyncio.run(
+        provider.generate_with_external_tools(
+            event=event,
+            context=context,
+            system_prompt="test system prompt",
+            external_tools=session,
+        )
+    )
+
+    assert len(gateway.calls) == 1
+    assert decision.architecture_review_required is True
+    proposal_actions = [
+        action
+        for action in decision.actions
+        if action.type == AgentActionType.PROPOSE_ARCHITECTURE_CHANGE
+    ]
+    assert len(proposal_actions) == 1
+    proposal = proposal_actions[0].payload["proposal"]
+    assert proposal["project_id"] == context.project.id
+    assert proposal["proposed_changes"][0]["operation"] == "replace_component"
+    assert proposal["status"] == "PENDING"
+
+
+def test_evidence_completion_fails_safe_as_unverified_not_missing() -> None:
+    provider = _gemini_provider()
+    provider.tool_interaction_model_timeout_seconds = 0.03
+    provider.tool_interaction_total_timeout_seconds = 0.08
+    session, _ = _session()
+    context = _project_context()
+    event = _verification_event(context.project.id)
+
+    async def fake_invoke(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        tools=None,
+        evidence_completion=False,
+    ):
+        if tools:
+            session.call(
+                "get_file_contents",
+                {
+                    "owner": "Magic-Dala",
+                    "repo": "archbro",
+                    "path": "README.md",
+                    "ref": "dev2",
+                },
+            )
+        await asyncio.sleep(0.06)
+        raise AssertionError("bounded invocation should be canceled")
+
+    provider._invoke = MethodType(fake_invoke, provider)
+    decision = asyncio.run(
+        provider.generate_with_external_tools(
+            event=event,
+            context=context,
+            system_prompt="test system prompt",
+            external_tools=session,
+        )
+    )
+
+    assert decision.evaluation is not None
+    assert decision.evaluation.classification == DriftClassification.INSUFFICIENT_EVIDENCE
+    assert "UNVERIFIED, not MISSING" in decision.summary
+    assert decision.actions == [AgentAction(type=AgentActionType.NO_ACTION)]
+
+
 def test_gemini_retries_when_first_structured_answer_skips_required_mcp_call() -> None:
     provider = _gemini_provider()
     session, gateway = _session()

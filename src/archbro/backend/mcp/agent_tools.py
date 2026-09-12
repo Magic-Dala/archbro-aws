@@ -101,6 +101,41 @@ _LIKELY_FILE_SUFFIXES = (
     ".yml",
 )
 
+_ARCHITECTURE_SLASH_SEGMENTS = frozenset({
+    "agent", "agents", "api", "architecture", "auth", "authentication",
+    "backend", "build", "code", "component", "components", "data",
+    "database", "deploy", "deployment", "domain", "domains", "evidence",
+    "feature", "flow", "flows", "frontend", "infrastructure", "integration",
+    "login", "mcp", "operations", "ops", "persistence", "provider", "qa",
+    "release", "report", "review", "runtime", "security", "service",
+    "services", "status", "system", "systems", "task", "tasks", "test",
+    "testing", "ui", "web", "workspace",
+})
+_ARCHITECTURE_SLASH_GLUE = ("for", "and", "or", "with", "to", "from", "by")
+_BROAD_REPOSITORY_VERIFICATION_KINDS = frozenset(
+    {"ARCHITECTURE_ALIGNMENT", "IMPLEMENTATION_PROGRESS"}
+)
+
+
+def _slash_segment_is_architecture_term(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    if normalized in _ARCHITECTURE_SLASH_SEGMENTS:
+        return True
+    return any(
+        normalized == term + suffix
+        for term in _ARCHITECTURE_SLASH_SEGMENTS
+        for suffix in _ARCHITECTURE_SLASH_GLUE
+    )
+
+
+def _looks_like_non_repository_slash(candidate: str) -> bool:
+    owner, separator, repo = candidate.partition("/")
+    return bool(
+        separator
+        and _slash_segment_is_architecture_term(owner)
+        and _slash_segment_is_architecture_term(repo)
+    )
+
 
 def _bounded_int(env_name: str, default: int, *, minimum: int, maximum: int) -> int:
     raw = os.getenv(env_name, "").strip()
@@ -178,6 +213,35 @@ def _repository_request_text(event: ProjectEvent) -> str:
     return re.sub(r"(?m)^\s*>.*$", "", text).strip()
 
 
+def _repository_verification_kind(event: ProjectEvent) -> str:
+    text = _repository_request_text(event).casefold()
+    if not text:
+        return "GENERAL_REPOSITORY"
+    if re.search(
+        r"\b(?:implementation|development)\s+(?:progress|status)\b|"
+        r"(?:implementation|implement(?:ed|ation)?|progress|status).{0,80}"
+        r"(?:verified|partial|missing|unverified|complete|incomplete)|"
+        r"(?:verified|partial|missing|unverified).{0,80}(?:component|architecture|implementation)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    ) or any(marker in text for marker in ("實作進度", "開發進度", "已實作", "未驗證")):
+        return "IMPLEMENTATION_PROGRESS"
+    if (
+        re.search(r"\barchitecture\b|架構", text, re.IGNORECASE)
+        and re.search(
+            r"\b(?:verify|check|inspect|match|align|drift|compare|audit)\b|核對|驗證|比對",
+            text,
+            re.IGNORECASE,
+        )
+    ):
+        return "ARCHITECTURE_ALIGNMENT"
+    if re.search(r"\b(?:commit|branch|revision|tag|pull request|pr\s*#)\b", text, re.IGNORECASE):
+        return "REVISION_STATUS"
+    if re.search(r"\breadme(?:\.md)?\b|\b(?:file|path)\b|檔案|路徑", text, re.IGNORECASE):
+        return "FILE_READ"
+    return "GENERAL_REPOSITORY"
+
+
 def requested_github_repositories(event: ProjectEvent) -> tuple[str, ...]:
     """Extract repository identities without treating branch/path operands as repos.
 
@@ -219,6 +283,8 @@ def requested_github_repositories(event: ProjectEvent) -> tuple[str, ...]:
             continue
         owner, _, repo = candidate.partition("/")
         if not explicit_repo and not location_repo:
+            if _looks_like_non_repository_slash(candidate):
+                continue
             if owner.casefold() in _LIKELY_PATH_OWNERS or repo.casefold().endswith(_LIKELY_FILE_SUFFIXES):
                 continue
         add_candidate(candidate)
@@ -433,6 +499,7 @@ class AgentMcpToolSession:
         scope_check: Callable[[], None] | None = None,
         scope_mode: str | None = None,
         requested_repositories: tuple[str, ...] = (),
+        verification_kind: str = "GENERAL_REPOSITORY",
     ) -> None:
         self.gateway = gateway
         self.project_id = project_id
@@ -442,13 +509,23 @@ class AgentMcpToolSession:
             "PROJECT_REPOSITORY" if repository_scope else "PROJECT_REPOSITORY_REQUIRED"
         )
         self.requested_repositories = tuple(requested_repositories)
+        self.verification_kind = verification_kind
         self.connection = dict(connection)
         self.descriptors = tuple(descriptors)
         self.discovered_tool_count = max(0, int(discovered_tool_count))
         self.verification_required = verification_required
         self.discovery_error = discovery_error[:500] if discovery_error else None
-        self.max_calls = _bounded_int(
+        configured_max_calls = _bounded_int(
             "ARCHBRO_AGENT_MCP_MAX_CALLS", 6, minimum=1, maximum=12
+        )
+        self.max_calls = (
+            min(configured_max_calls, 4)
+            if self.verification_kind in _BROAD_REPOSITORY_VERIFICATION_KINDS
+            else configured_max_calls
+        )
+        self.evidence_soft_limit = min(
+            self.max_calls,
+            3 if self.verification_kind in _BROAD_REPOSITORY_VERIFICATION_KINDS else self.max_calls,
         )
         self.max_result_chars = _bounded_int(
             "ARCHBRO_AGENT_MCP_MAX_RESULT_CHARS", 12000, minimum=1000, maximum=30000
@@ -456,6 +533,8 @@ class AgentMcpToolSession:
         self.max_total_result_chars = _bounded_int(
             "ARCHBRO_AGENT_MCP_MAX_TOTAL_RESULT_CHARS", 30000, minimum=2000, maximum=60000
         )
+        if self.verification_kind in _BROAD_REPOSITORY_VERIFICATION_KINDS:
+            self.max_total_result_chars = min(self.max_total_result_chars, 24000)
         self._lock = threading.RLock()
         self._calls: list[dict[str, Any]] = []
         self._dispatched_call_count = 0
@@ -483,6 +562,7 @@ class AgentMcpToolSession:
         if not required:
             return None
         requested_repositories = requested_github_repositories(event)
+        verification_kind = _repository_verification_kind(event)
         default_scope_mode = (
             "PROJECT_REPOSITORY" if repository_scope else "PROJECT_REPOSITORY_REQUIRED"
         )
@@ -493,6 +573,7 @@ class AgentMcpToolSession:
                 scope_check=scope_check,
                 scope_mode=kwargs.pop("scope_mode", default_scope_mode),
                 requested_repositories=requested_repositories,
+                verification_kind=verification_kind,
                 **kwargs,
             )
 
@@ -620,7 +701,10 @@ class AgentMcpToolSession:
                 "ARCHBRO_AGENT_MCP_MAX_TOOLS", 12, minimum=1, maximum=16
             )
             descriptors: list[AgentMcpToolDescriptor] = []
-            for name in GITHUB_AGENT_TOOL_PRIORITY:
+            tool_priority = GITHUB_AGENT_TOOL_PRIORITY
+            if verification_kind in _BROAD_REPOSITORY_VERIFICATION_KINDS:
+                tool_priority = ("get_file_contents", "search_code", "list_commits")
+            for name in tool_priority:
                 if repository_scope and name not in REPOSITORY_TOOLS:
                     continue
                 item = by_name.get(name)
@@ -684,12 +768,110 @@ class AgentMcpToolSession:
                 return 0
             return sum(1 for call in self._calls if call.get("status") == "SUCCESS")
 
+    @property
+    def has_successful_evidence(self) -> bool:
+        with self._lock:
+            return not self._scope_failure and bool(self._cache)
+
+    @property
+    def distinct_evidence_count(self) -> int:
+        with self._lock:
+            return 0 if self._scope_failure else len(self._cache)
+
+    def _evidence_collection_guidance(self) -> dict[str, Any]:
+        with self._lock:
+            dispatched = self._dispatched_call_count
+        remaining = max(0, self.max_calls - dispatched)
+        synthesize_now = (
+            self.verification_kind in _BROAD_REPOSITORY_VERIFICATION_KINDS
+            and dispatched >= self.evidence_soft_limit
+        )
+        return {
+            "request_kind": self.verification_kind,
+            "remaining_dispatches": remaining,
+            "synthesize_now": synthesize_now,
+            "instruction": (
+                "Use the evidence already returned and produce the final structured decision now. Do not continue recursively enumerating directories."
+                if synthesize_now
+                else "Use the smallest sufficient call set and synthesize as soon as the request can be answered."
+            ),
+        }
+
+    def ensure_evidence_scope(self) -> None:
+        """Fail closed if previously collected evidence is no longer authorized."""
+        with self._lock:
+            if self._scope_failure:
+                raise PermissionError(self._scope_failure)
+        try:
+            if self.scope_check:
+                self.scope_check()
+        except Exception:
+            # Do not expose provider/account details from the scope checker.
+            with self._lock:
+                self._scope_failure = "Repository evidence scope changed; retry in the current project context."
+                self._cache.clear()
+                self.discovery_error = self._scope_failure
+            raise PermissionError(self._scope_failure) from None
+
+    def completion_evidence_context(self, *, max_chars: int = 24000) -> dict[str, Any]:
+        """Return unique, currently authorized evidence for a synthesis-only turn."""
+        self.ensure_evidence_scope()
+        with self._lock:
+            sources = [] if self._scope_failure else [
+                dict(entry["response"]) for entry in self._cache.values()
+            ]
+        result: dict[str, Any] = {
+            "schema": "archbro.agent_mcp_completion_evidence.v1",
+            "repository_scope": (
+                self.repository_scope.model_dump(mode="json")
+                if self.repository_scope
+                else None
+            ),
+            "verification_kind": self.verification_kind,
+            "sources": [],
+            "coverage_rule": (
+                "Classify an area as MISSING only when evidence explicitly proves absence or removal. "
+                "When bounded evidence did not cover an area, use UNVERIFIED rather than MISSING."
+            ),
+        }
+        if max_chars < len(_json_text(result)):
+            raise ValueError("completion evidence budget cannot fit its scope envelope")
+        for source in sources:
+            record = {
+                "source": source.get("source"),
+                "tool_name": source.get("tool_name"),
+                "external_evidence": source.get("external_evidence"),
+                "evidence_sha256": source.get("evidence_sha256"),
+                "truncated": source.get("truncated", False),
+            }
+            result["sources"].append(record)
+            if len(_json_text(result)) <= max_chars:
+                continue
+            text = _json_text(record["external_evidence"])
+            record["external_evidence"] = ""
+            record["truncated_for_completion"] = True
+            if len(_json_text(result)) >= max_chars:
+                result["sources"].pop()
+                break
+            low, high = 0, len(text)
+            while low < high:
+                middle = (low + high + 1) // 2
+                record["external_evidence"] = text[:middle]
+                if len(_json_text(result)) <= max_chars:
+                    low = middle
+                else:
+                    high = middle - 1
+            record["external_evidence"] = text[:low]
+            break
+        return result
+
     def context_facts(self) -> dict[str, Any]:
         return {
             "provider": "github",
             "repository_scope": self.repository_scope.model_dump(mode="json") if self.repository_scope else None,
             "scope_mode": self.scope_mode,
             "requested_repositories": list(self.requested_repositories),
+            "verification_kind": self.verification_kind,
             "connection_name": str(self.connection.get("name") or "GitHub")[:100],
             "discovery_status": "READY" if self.has_tools else "UNAVAILABLE",
             "discovered_tool_count": self.discovered_tool_count,
@@ -705,6 +887,8 @@ class AgentMcpToolSession:
             "- provider: GitHub",
             f"- discovery_status: {facts['discovery_status']}",
             f"- verification_required_for_this_message: {str(self.verification_required).lower()}",
+            f"- verification_kind: {self.verification_kind}",
+            f"- distinct_call_budget: {self.max_calls}",
         ]
         if self.repository_scope:
             lines.append(f"- repository: {self.repository_scope.full_name}")
@@ -717,6 +901,16 @@ class AgentMcpToolSession:
         if self.discovery_error:
             lines.append(f"- discovery_error: {self.discovery_error}")
         lines.append("- Use the smallest sufficient GitHub read-only call set.")
+        if self.verification_kind in _BROAD_REPOSITORY_VERIFICATION_KINDS:
+            lines.extend(
+                [
+                    "- Do not recursively walk the repository directory tree.",
+                    "- Prefer high-signal project documentation plus targeted search_code queries over repeated directory listings.",
+                    f"- After at most {self.evidence_soft_limit} useful distinct reads, synthesize the answer unless one clearly named gap remains.",
+                    "- For progress classification, VERIFIED requires direct evidence; PARTIAL requires positive implementation evidence plus a bounded gap.",
+                    "- Use UNVERIFIED, not MISSING, when bounded evidence did not cover an area. MISSING requires explicit evidence of absence or removal.",
+                ]
+            )
         if self.has_tools:
             lines.append(
                 "- A successful supplied GitHub tool call is mandatory before answering this verification request."
@@ -829,6 +1023,8 @@ class AgentMcpToolSession:
                 raise ValueError(self._scope_failure)
             cached = self._cache.get(cache_key)
             if cached is not None:
+                cached_response = dict(cached["response"])
+                cached_response["evidence_collection"] = self._evidence_collection_guidance()
                 self._calls.append(
                     {
                         "tool_name": tool_name,
@@ -843,7 +1039,7 @@ class AgentMcpToolSession:
                         "latency_ms": 0,
                     }
                 )
-                return dict(cached["response"])
+                return cached_response
             if self._dispatched_call_count >= self.max_calls:
                 raise RuntimeError(
                     f"GitHub MCP call budget exhausted ({self.max_calls} calls per request)"
@@ -895,6 +1091,7 @@ class AgentMcpToolSession:
                 "evidence_sha256": digest,
                 "truncated": truncated,
                 "canonical_state_mutated": False,
+                "evidence_collection": self._evidence_collection_guidance(),
             }
             record = {
                 "tool_name": tool_name,

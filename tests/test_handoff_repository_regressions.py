@@ -73,3 +73,44 @@ def test_initial_architecture_remains_github_optional():
     event.payload['intent'] = 'INITIAL_ARCHITECTURE'
     assert AgentMcpToolSession.discover(gateway, project_id='p', event=event) is None
     assert gateway.list_connections_calls == gateway.list_tools_calls == 0
+
+
+def test_original_multiline_demo_prompt_names_only_the_bound_repository():
+    prompt = """Use GitHub MCP to inspect the bound Magic-Dala/archbro repository on the dev2 branch.
+
+Verify whether the current Archbro Architecture matches the actual implementation.
+
+Focus only on these major runtime boundaries:
+- Web frontend and workspace UI
+- Backend project / architecture / task domain
+- Built-in Strands agent runtime
+- Project-scoped MCP and provider integrations
+- GitHub repository binding and evidence flow
+- Persistence
+- Deployment/runtime
+
+For anything that does not match the current Architecture, propose the smallest architecture changes needed.
+
+Do not modify code."""
+    event = _event(prompt)
+    assert requested_github_repositories(event) == ('Magic-Dala/archbro',)
+    gateway = _FakeGitHubGateway()
+    session = AgentMcpToolSession.discover(
+        gateway,
+        project_id='p',
+        event=event,
+        repository_scope=binding(),
+    )
+    assert session is not None and session.has_tools
+    assert session.verification_kind == 'ARCHITECTURE_ALIGNMENT'
+    assert [item.name for item in session.descriptors] == ['get_file_contents']
+    assert gateway.list_connections_calls == 1
+    assert gateway.list_tools_calls == 1
+
+
+def test_flattened_demo_prompt_does_not_treat_runtime_category_as_repository():
+    prompt = (
+        'Use GitHub MCP to inspect the bound Magic-Dala/archbro repository on the dev2 branch.'
+        'Focus only on Web frontend - Persistence - Deployment/runtimeFor anything that does not match, propose the smallest change.'
+    )
+    assert requested_github_repositories(_event(prompt)) == ('Magic-Dala/archbro',)
