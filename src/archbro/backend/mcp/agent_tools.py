@@ -13,7 +13,10 @@ from typing import Any, Callable
 from archbro.backend.core.contracts import ProjectEvent, ProjectEventType
 from archbro.backend.mcp.provider_policy import ReadOnlyExternalMcpGateway
 
-from archbro.backend.core.github_repository import GitHubRepositoryBinding
+from archbro.backend.core.github_repository import (
+    GitHubRepositoryBinding,
+    normalize_github_repository,
+)
 from archbro.backend.mcp.github_project_scope import REPOSITORY_TOOLS, scope_github_arguments, scoped_tool_schema
 
 logger = logging.getLogger("archbro")
@@ -44,6 +47,57 @@ _SECRET_KEY = re.compile(
 _SECRET_VALUE = re.compile(
     r"(?:github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._~+/=-]{12,})",
     re.IGNORECASE,
+)
+_GITHUB_REPOSITORY_URL = re.compile(
+    r"https://github\.com/(?P<repository>[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}?)(?:\.git)?(?=$|[\s?#),;!])",
+    re.IGNORECASE,
+)
+_GITHUB_REPOSITORY_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?P<repository>[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,104})(?![A-Za-z0-9_.-/])"
+)
+_LIKELY_PATH_OWNERS = frozenset(
+    {
+        ".github",
+        "app",
+        "apps",
+        "backend",
+        "config",
+        "docs",
+        "frontend",
+        "lib",
+        "packages",
+        "qa",
+        "refs",
+        "scripts",
+        "src",
+        "test",
+        "tests",
+    }
+)
+_LIKELY_FILE_SUFFIXES = (
+    ".c",
+    ".cc",
+    ".cpp",
+    ".css",
+    ".go",
+    ".h",
+    ".html",
+    ".java",
+    ".js",
+    ".json",
+    ".jsx",
+    ".md",
+    ".mjs",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".yaml",
+    ".yml",
 )
 
 
@@ -99,18 +153,65 @@ def _mcp_tool_error_detail(value: Any) -> str | None:
     return _SECRET_VALUE.sub("<redacted>", normalized) or "MCP tool returned isError=true"
 
 
+def _repository_request_text(event: ProjectEvent) -> str:
+    if event.type != ProjectEventType.USER_MESSAGE:
+        return ""
+    text = str(event.payload.get("message") or "").strip()
+    if not text:
+        return ""
+    # Quoted examples, code blocks, and quoted prior messages are descriptions,
+    # not repository execution targets.
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r'"[^"\n]*"|“[^”\n]*”|「[^」\n]*」', "", text)
+    return re.sub(r"(?m)^\s*>.*$", "", text).strip()
+
+
+def requested_github_repositories(event: ProjectEvent) -> tuple[str, ...]:
+    """Extract explicit high-confidence owner/repo targets from a request.
+
+    File paths such as ``docs/README.md`` and Git refs such as ``refs/heads``
+    must not be mistaken for repository identities. The result is used only as
+    a deterministic pre-discovery boundary; tool arguments remain guarded too.
+    """
+
+    text = _repository_request_text(event)
+    if not text:
+        return ()
+    repositories: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(candidate: str) -> None:
+        candidate = candidate.rstrip(".,;:!?)]}")
+        owner, _, repo = candidate.partition("/")
+        lowered_owner = owner.casefold()
+        lowered_repo = repo.casefold()
+        if lowered_owner in _LIKELY_PATH_OWNERS:
+            return
+        if lowered_repo.endswith(_LIKELY_FILE_SUFFIXES):
+            return
+        try:
+            normalized = normalize_github_repository(candidate)
+        except ValueError:
+            return
+        key = normalized.casefold()
+        if key not in seen:
+            seen.add(key)
+            repositories.append(normalized)
+
+    for match in _GITHUB_REPOSITORY_URL.finditer(text):
+        add_candidate(match.group("repository"))
+    text_without_urls = _GITHUB_REPOSITORY_URL.sub(" ", text)
+    for match in _GITHUB_REPOSITORY_TOKEN.finditer(text_without_urls):
+        add_candidate(match.group("repository"))
+    return tuple(repositories)
+
+
 def repository_evidence_requested(event: ProjectEvent) -> bool:
     """Conservatively identify an explicit repository/MCP verification request."""
 
-    if event.type != ProjectEventType.USER_MESSAGE:
-        return False
-    text = str(event.payload.get("message") or "").strip()
+    text = _repository_request_text(event)
     if not text:
         return False
-    # Quoted examples and capability descriptions are not execution requests.
-    text = re.sub(r"```[\s\S]*?```", "", text)
-    text = re.sub(r'"[^"\n]*"|“[^”\n]*”|「[^」\n]*」', "", text)
-    text = re.sub(r"(?m)^\s*>.*$", "", text)
     lowered = text.casefold()
     lowered = re.sub(
         r"github(?:[ -]+mcp)?\s*(?:is\s+)?(?:optional|not\s+required|unnecessary|是可選的|可選|非必要)",
@@ -284,11 +385,17 @@ class AgentMcpToolSession:
         discovery_error: str | None = None,
         repository_scope: GitHubRepositoryBinding | None = None,
         scope_check: Callable[[], None] | None = None,
+        scope_mode: str | None = None,
+        requested_repositories: tuple[str, ...] = (),
     ) -> None:
         self.gateway = gateway
         self.project_id = project_id
         self.repository_scope = repository_scope
         self.scope_check = scope_check
+        self.scope_mode = scope_mode or (
+            "PROJECT_REPOSITORY" if repository_scope else "PROJECT_REPOSITORY_REQUIRED"
+        )
+        self.requested_repositories = tuple(requested_repositories)
         self.connection = dict(connection)
         self.descriptors = tuple(descriptors)
         self.discovered_tool_count = max(0, int(discovered_tool_count))
@@ -328,11 +435,82 @@ class AgentMcpToolSession:
         required = repository_evidence_requested(event)
         if not required:
             return None
+        requested_repositories = requested_github_repositories(event)
+        default_scope_mode = (
+            "PROJECT_REPOSITORY" if repository_scope else "PROJECT_REPOSITORY_REQUIRED"
+        )
+
         def session(**kwargs):
-            return cls(repository_scope=repository_scope, scope_check=scope_check, **kwargs)
+            return cls(
+                repository_scope=repository_scope,
+                scope_check=scope_check,
+                scope_mode=kwargs.pop("scope_mode", default_scope_mode),
+                requested_repositories=requested_repositories,
+                **kwargs,
+            )
+
         try:
             if scope_check:
                 scope_check()
+        except Exception as exc:  # noqa: BLE001 - canonical project scope must fail closed
+            return session(
+                gateway=gateway,
+                project_id=project_id,
+                connection={},
+                descriptors=[],
+                discovered_tool_count=0,
+                verification_required=True,
+                discovery_error=f"Project repository scope check failed: {_safe_error(exc)}",
+                scope_mode="PROJECT_REPOSITORY_UNAVAILABLE",
+            )
+        if repository_scope is None:
+            return session(
+                gateway=gateway,
+                project_id=project_id,
+                connection={},
+                descriptors=[],
+                discovered_tool_count=0,
+                verification_required=True,
+                discovery_error=(
+                    "Select a GitHub repository from this project's ... menu before "
+                    "requesting repository evidence."
+                ),
+                scope_mode="PROJECT_REPOSITORY_REQUIRED",
+            )
+        if len(requested_repositories) > 1:
+            return session(
+                gateway=gateway,
+                project_id=project_id,
+                connection={},
+                descriptors=[],
+                discovered_tool_count=0,
+                verification_required=True,
+                discovery_error=(
+                    "The request names more than one GitHub repository. Use this project's "
+                    f"selected repository ({repository_scope.full_name}) only."
+                ),
+                scope_mode="PROJECT_REPOSITORY_AMBIGUOUS",
+            )
+        if (
+            requested_repositories
+            and requested_repositories[0].casefold()
+            != repository_scope.full_name.casefold()
+        ):
+            return session(
+                gateway=gateway,
+                project_id=project_id,
+                connection={},
+                descriptors=[],
+                discovered_tool_count=0,
+                verification_required=True,
+                discovery_error=(
+                    f"This project is connected to {repository_scope.full_name}, but the "
+                    f"request targets {requested_repositories[0]}. Change the project "
+                    "repository before reading it."
+                ),
+                scope_mode="PROJECT_REPOSITORY_MISMATCH",
+            )
+        try:
             connections = [
                 connection
                 for connection in gateway.list_connections()
@@ -461,7 +639,8 @@ class AgentMcpToolSession:
         return {
             "provider": "github",
             "repository_scope": self.repository_scope.model_dump(mode="json") if self.repository_scope else None,
-            "scope_mode": "PROJECT_REPOSITORY" if self.repository_scope else "EXPLICIT_TARGET_LEGACY",
+            "scope_mode": self.scope_mode,
+            "requested_repositories": list(self.requested_repositories),
             "connection_name": str(self.connection.get("name") or "GitHub")[:100],
             "discovery_status": "READY" if self.has_tools else "UNAVAILABLE",
             "discovered_tool_count": self.discovered_tool_count,

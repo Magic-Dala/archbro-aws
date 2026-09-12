@@ -190,6 +190,60 @@ def test_snapshot_scope_and_rebinding_hide_old_implementation_evidence(setup):
             repo.save_event(stale)
 
 
+def test_event_repository_scope_blocks_foreign_and_unbound_before_provider_discovery(setup):
+    repo,p,reg,gw=setup
+    repo.save_architecture(p.id, Architecture(version=1, summary='Accepted architecture'))
+    with client_for(repo,registry=reg) as client:
+        assert save(client,p.id,branch='dev2').status_code==200
+        gw.calls.clear()
+        gw.list_connections_calls = 0
+        gw.list_tools_calls = 0
+
+        foreign=client.post(
+            f'/projects/{p.id}/events',
+            json={
+                'type':'USER_MESSAGE',
+                'payload':{'message':'Use GitHub MCP to read README.md from octocat/Hello-World.'},
+            },
+        )
+        assert foreign.status_code==200,foreign.text
+        foreign_body=foreign.json()
+        assert foreign_body['result']=='SUCCESS'
+        assert foreign_body['provider']=='deterministic'
+        assert 'targets octocat/Hello-World' in foreign_body['summary']
+        foreign_mcp=foreign_body['context_telemetry']['external_mcp']
+        assert foreign_mcp['scope_mode']=='PROJECT_REPOSITORY_MISMATCH'
+        assert foreign_mcp['dispatched_call_count']==0
+        assert gw.list_connections_calls==0
+        assert gw.list_tools_calls==0
+        assert gw.calls==[]
+
+        removed=client.delete(f'/projects/{p.id}/repository?expected_revision=1')
+        assert removed.status_code==200,removed.text
+        gw.calls.clear()
+        gw.list_connections_calls = 0
+        gw.list_tools_calls = 0
+
+        unbound=client.post(
+            f'/projects/{p.id}/events',
+            json={
+                'type':'USER_MESSAGE',
+                'payload':{'message':'Use GitHub MCP to read Magic-Dala/archbro README.md.'},
+            },
+        )
+        assert unbound.status_code==200,unbound.text
+        unbound_body=unbound.json()
+        assert unbound_body['result']=='SUCCESS'
+        assert unbound_body['provider']=='deterministic'
+        assert 'Select a GitHub repository' in unbound_body['summary']
+        unbound_mcp=unbound_body['context_telemetry']['external_mcp']
+        assert unbound_mcp['scope_mode']=='PROJECT_REPOSITORY_REQUIRED'
+        assert unbound_mcp['dispatched_call_count']==0
+        assert gw.list_connections_calls==0
+        assert gw.list_tools_calls==0
+        assert gw.calls==[]
+
+
 def test_settings_do_not_enable_github_for_initial_or_ordinary_tasks(setup):
     repo,p,reg,gw=setup
     with client_for(repo,registry=reg) as client:

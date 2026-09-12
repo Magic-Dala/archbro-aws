@@ -20,6 +20,7 @@ from archbro.backend.core.contracts import (
     ProjectEvent,
     ProjectEventType,
 )
+from archbro.backend.core.github_repository import GitHubRepositoryBinding
 from archbro.backend.core.evaluation import (
     DriftClassification,
     DriftEvaluation,
@@ -38,9 +39,11 @@ PRIVATE_MARKER = "PRIVATE_REPOSITORY_SENTINEL"
 class _FakeGitHubGateway:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
+        self.list_connections_calls = 0
         self.list_tools_calls = 0
 
     def list_connections(self):
+        self.list_connections_calls += 1
         return [
             {
                 "id": "mcp_private",
@@ -144,6 +147,14 @@ class _MalformedConnectionGateway:
         ]
 
 
+def _binding(name: str = "Magic-Dala/archbro", branch: str | None = "dev2") -> GitHubRepositoryBinding:
+    return GitHubRepositoryBinding(
+        full_name=name,
+        branch=branch,
+        selected_by_user_id="owner",
+    )
+
+
 def _verification_event(project_id: str = "project_test") -> ProjectEvent:
     return ProjectEvent(
         project_id=project_id,
@@ -163,6 +174,7 @@ def _session(project_id: str = "project_test") -> tuple[AgentMcpToolSession, _Fa
         gateway,
         project_id=project_id,
         event=_verification_event(project_id),
+        repository_scope=_binding(),
     )
     assert session is not None
     return session, gateway
@@ -318,8 +330,8 @@ def test_session_discovers_bounded_read_only_tools_calls_private_evidence_and_re
         },
     )
 
-    with pytest.raises(ValueError, match="missing required parameter.*owner"):
-        tool(arguments={"repo": "archbro", "path": "README.md"})
+    with pytest.raises(ValueError, match="scope_mismatch"):
+        tool(arguments={"repo": "other", "path": "README.md"})
     assert len(gateway.calls) == 2
 
     session.call(
@@ -359,6 +371,7 @@ def test_provider_runtime_registry_reuses_only_the_authenticated_principals_gate
         owner,
         project_id="project_test",
         event=_verification_event(),
+        repository_scope=_binding(),
     )
 
     assert session is not None
@@ -367,6 +380,7 @@ def test_provider_runtime_registry_reuses_only_the_authenticated_principals_gate
         other,
         project_id="project_test",
         event=_verification_event(),
+        repository_scope=_binding(),
     )
     assert other_session is not None
     assert other_session.gateway is not owner_gateway
@@ -399,6 +413,7 @@ def test_mcp_is_error_result_is_not_successful_cached_or_usable_as_evidence() ->
         gateway,
         project_id="project_test",
         event=_verification_event(),
+        repository_scope=_binding(),
     )
     assert session is not None
     arguments = {
@@ -458,6 +473,7 @@ def test_discovery_failures_stay_fail_closed_and_redact_secrets(monkeypatch) -> 
         _BrokenDiscoveryGateway(),
         project_id="project_test",
         event=_verification_event(),
+        repository_scope=_binding(),
     )
     assert broken is not None
     assert broken.has_tools is False
@@ -468,6 +484,7 @@ def test_discovery_failures_stay_fail_closed_and_redact_secrets(monkeypatch) -> 
         _MalformedConnectionGateway(),
         project_id="project_test",
         event=_verification_event(),
+        repository_scope=_binding(),
     )
     assert malformed is not None
     assert malformed.has_tools is False
@@ -665,6 +682,7 @@ def test_orchestrator_fails_closed_without_a_ready_github_connection() -> None:
         _NoConnectionGateway(),
         project_id=context.project.id,
         event=_verification_event(context.project.id),
+        repository_scope=_binding(),
     )
     assert session is not None
     assert session.has_tools is False

@@ -10,7 +10,11 @@ from strands.models.model import Model
 
 from archbro.backend.core.contracts import ProjectEvent, ProjectEventType
 from archbro.backend.core.github_repository import GitHubRepositoryBinding, normalize_github_repository
-from archbro.backend.mcp.agent_tools import AgentMcpToolSession, repository_evidence_requested
+from archbro.backend.mcp.agent_tools import (
+    AgentMcpToolSession,
+    repository_evidence_requested,
+    requested_github_repositories,
+)
 from archbro.backend.mcp.github_project_scope import scope_github_arguments, ready_github_connection, mcp_payload
 from test_agent_mcp_tools import _FakeGitHubGateway, _verification_event, _session, PRIVATE_MARKER
 
@@ -37,7 +41,7 @@ def test_flat_and_legacy_wrapped_real_stream_reach_gateway(wrapped):
 
 
 @pytest.mark.parametrize('args', [
-    {}, {'repo':'archbro','path':'README.md'},
+    {}, {'repo':'other','path':'README.md'},
     {'owner':25,'repo':'archbro','path':'README.md'},
     {'owner':'Magic-Dala','repo':'archbro','path':[]},
     {'arguments':{'owner':'Magic-Dala','repo':'archbro','path':'README.md'},'repo':'other'},
@@ -75,6 +79,99 @@ def test_repository_intent_regressions(message, expected):
         assert gateway.list_tools_calls == 0
 
 
+def _event(message: str, project_id: str = 'p') -> ProjectEvent:
+    return ProjectEvent(
+        project_id=project_id,
+        type=ProjectEventType.USER_MESSAGE,
+        payload={'message': message},
+    )
+
+
+@pytest.mark.parametrize(
+    ('message', 'expected'),
+    [
+        ('Use GitHub MCP to read Magic-Dala/archbro README.md.', ('Magic-Dala/archbro',)),
+        ('Use GitHub MCP to read README.md from octocat/Hello-World.', ('octocat/Hello-World',)),
+        ('Read https://github.com/Magic-Dala/archbro.git on dev2.', ('Magic-Dala/archbro',)),
+        ('Use GitHub MCP to read docs/README.md from the selected repository.', ()),
+        ('Explain the phrase "read octocat/Hello-World".', ()),
+        ('Read refs/heads/dev2 from the selected repository.', ()),
+    ],
+)
+def test_requested_repository_parser_ignores_paths_and_quoted_examples(message, expected):
+    assert requested_github_repositories(_event(message)) == expected
+
+
+def test_foreign_repository_target_is_blocked_before_any_provider_discovery():
+    gateway = _FakeGitHubGateway()
+    session = AgentMcpToolSession.discover(
+        gateway,
+        project_id='p',
+        event=_event('Use GitHub MCP to read README.md from octocat/Hello-World.'),
+        repository_scope=binding(),
+    )
+    assert session is not None and not session.has_tools
+    assert session.context_facts()['scope_mode'] == 'PROJECT_REPOSITORY_MISMATCH'
+    assert session.context_facts()['requested_repositories'] == ['octocat/Hello-World']
+    assert 'targets octocat/Hello-World' in str(session.discovery_error)
+    assert gateway.list_connections_calls == 0
+    assert gateway.list_tools_calls == 0
+    assert gateway.calls == []
+
+
+def test_unbound_project_requires_binding_before_any_provider_discovery():
+    gateway = _FakeGitHubGateway()
+    session = AgentMcpToolSession.discover(
+        gateway,
+        project_id='p',
+        event=_event('Use GitHub MCP to read Magic-Dala/archbro README.md.'),
+    )
+    assert session is not None and not session.has_tools
+    assert session.context_facts()['scope_mode'] == 'PROJECT_REPOSITORY_REQUIRED'
+    assert 'Select a GitHub repository' in str(session.discovery_error)
+    assert gateway.list_connections_calls == 0
+    assert gateway.list_tools_calls == 0
+    assert gateway.calls == []
+
+
+def test_matching_explicit_target_and_selected_repository_still_discover_tools():
+    gateway = _FakeGitHubGateway()
+    session = AgentMcpToolSession.discover(
+        gateway,
+        project_id='p',
+        event=_event('Use GitHub MCP to read Magic-Dala/archbro README.md.'),
+        repository_scope=binding(),
+    )
+    assert session is not None and session.has_tools
+    assert session.context_facts()['scope_mode'] == 'PROJECT_REPOSITORY'
+    assert gateway.list_connections_calls == 1
+    assert gateway.list_tools_calls == 1
+
+
+def test_multiple_explicit_targets_are_blocked_before_discovery():
+    gateway = _FakeGitHubGateway()
+    session = AgentMcpToolSession.discover(
+        gateway,
+        project_id='p',
+        event=_event('Use GitHub MCP to compare Magic-Dala/archbro and octocat/Hello-World.'),
+        repository_scope=binding(),
+    )
+    assert session is not None and not session.has_tools
+    assert session.context_facts()['scope_mode'] == 'PROJECT_REPOSITORY_AMBIGUOUS'
+    assert gateway.list_connections_calls == 0
+    assert gateway.list_tools_calls == 0
+    assert gateway.calls == []
+
+
+def test_argument_scope_requires_project_repository_even_if_called_directly():
+    with pytest.raises(ValueError, match='repository_binding_required'):
+        scope_github_arguments(
+            'get_file_contents',
+            {'owner':'Magic-Dala','repo':'archbro','path':'README.md'},
+            None,
+        )
+
+
 def test_bound_stream_supplies_repo_and_default_branch():
     gateway = _FakeGitHubGateway()
     session = AgentMcpToolSession.discover(gateway,project_id='p',event=_verification_event('p'),repository_scope=binding())
@@ -87,8 +184,19 @@ def test_bound_stream_supplies_repo_and_default_branch():
 
 def test_shared_connection_keeps_two_project_scopes_separate():
     gateway = _FakeGitHubGateway()
-    sessions = [AgentMcpToolSession.discover(gateway,project_id=p,event=_verification_event(p),repository_scope=binding(r))
-                for p,r in [('a','Magic-Dala/archbro'),('b','Magic-Dala/other')]]
+    sessions = [
+        AgentMcpToolSession.discover(
+            gateway,
+            project_id=p,
+            event=ProjectEvent(
+                project_id=p,
+                type=ProjectEventType.USER_MESSAGE,
+                payload={'message':'Read the selected repository README.'},
+            ),
+            repository_scope=binding(r),
+        )
+        for p,r in [('a','Magic-Dala/archbro'),('b','Magic-Dala/other')]
+    ]
     sessions[0].call('get_file_contents', {'path':'README.md'})
     sessions[1].call('get_file_contents', {'path':'README.md'})
     assert [c[2]['repo'] for c in gateway.calls] == ['archbro','other']
@@ -149,7 +257,12 @@ def test_ambiguous_connections_are_not_guessed():
     gateway.list_connections = lambda: original() + [{**original()[0],'id':'other'}]
     with pytest.raises(RuntimeError, match='More than one'):
         ready_github_connection(gateway)
-    session = AgentMcpToolSession.discover(gateway,project_id='p',event=_verification_event('p'))
+    session = AgentMcpToolSession.discover(
+        gateway,
+        project_id='p',
+        event=_verification_event('p'),
+        repository_scope=binding(),
+    )
     assert not session.has_tools
 
 

@@ -51,7 +51,9 @@ def scope_github_arguments(tool_name: str, arguments: dict[str, Any], binding: G
         raise ValueError('GitHub MCP arguments must be an object')
     args = copy.deepcopy(arguments)
     if binding is None:
-        return args
+        raise ValueError(
+            "repository_binding_required: select a GitHub repository for this project first"
+        )
     if tool_name not in REPOSITORY_TOOLS:
         raise ValueError('This tool is not available inside a repository-bound project. Use the project repository picker to change repositories.')
     def reject_nested_targets(value: Any, depth: int = 0) -> None:
