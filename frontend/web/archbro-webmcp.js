@@ -343,13 +343,22 @@ async function agentSurfaceApi(path, {method = 'GET', body, signal, projectBindi
   return response.status === 204 ? null : response.json();
 }
 
+function providerConnectionIsDiscoverable(connection) {
+  if (!connection?.id || connection.authorization_pending) return false;
+  if (connection.last_probe_ok === true) return true;
+  return (
+    connection.last_probe_ok !== false
+    && !connection.last_error
+    && connection.restored === true
+    && connection.persistent === true
+    && connection.has_credentials === true
+    && ['oauth', 'microsoft_teams_oauth'].includes(connection.auth_type)
+  );
+}
+
 async function listAuthorizedProviderConnections({signal} = {}) {
   const connections = await agentSurfaceApi('/mcp/connections', {signal});
-  return (connections || []).filter((connection) => (
-    connection?.id
-    && !connection.authorization_pending
-    && connection.last_probe_ok === true
-  ));
+  return (connections || []).filter(providerConnectionIsDiscoverable);
 }
 
 function providerConnectionAsServer(connection) {
