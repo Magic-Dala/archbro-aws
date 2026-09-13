@@ -56,3 +56,32 @@ test('static asset query hashes match the multiline composer bundle', async () =
     assert.ok(page.includes(`/static/${asset}?v=${hash}`), `${asset} must use its current content hash`);
   }
 });
+
+async function render(value) {
+  const app = await readFile(new URL('app.js', webRoot), 'utf8');
+  const renderer = app.slice(app.indexOf('function renderAgentInline('), app.indexOf('function syncInstructionTextareaRows('));
+  return runInNewContext(`${renderer};renderAgentRichText(value)`, {value, escapeHtml});
+}
+
+test('live progress response preserves seven section numbers and their nested evidence', async () => {
+  const value = Array.from({length: 7}, (_, index) => `${index + 1}. **Boundary ${index + 1}**: PARTIAL\n   - Evidence: \`src/${index + 1}\`\n`).join('\n');
+  const html = await render(value);
+  assert.deepEqual([...html.matchAll(/<li value="(\d+)">/g)].map(match => Number(match[1])), [1, 2, 3, 4, 5, 6, 7]);
+  assert.equal((html.match(/<ol>/g) || []).length, 1);
+  for (let number = 1; number <= 7; number++) {
+    assert.ok(html.includes(`<li value="${number}"><strong>Boundary ${number}</strong>: PARTIAL<ul><li>Evidence: <code>src/${number}</code></li></ul></li>`));
+  }
+});
+
+test('list numbering survives intervening paragraphs and mixed nested lists remain escaped', async () => {
+  const html = await render('4. First\n   More context.\n   - Evidence <script>bad()</script>\n     2. Nested step\n\nIndependent paragraph.\n\n7) Last');
+  assert.match(html, /<li value="4">First<p>More context\.<\/p><ul><li>Evidence &lt;script&gt;bad\(\)&lt;\/script&gt;<ol><li value="2">Nested step<\/li><\/ol><\/li><\/ul><\/li>/);
+  assert.match(html, /<p>Independent paragraph\.<\/p><ol><li value="7">Last<\/li><\/ol>/);
+  assert.doesNotMatch(html, /<script>/);
+});
+
+test('deeply nested untrusted lists remain bounded and escaped', async () => {
+  const html = await render(Array.from({length: 100}, (_, index) => `${'  '.repeat(index)}- <script>nested</script>`).join('\n'));
+  assert.match(html, /<pre>/);
+  assert.doesNotMatch(html, /<script>/);
+});

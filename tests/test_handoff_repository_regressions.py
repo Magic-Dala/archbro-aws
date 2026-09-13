@@ -20,6 +20,9 @@ def test_quoted_execution_target_denied_before_discovery(target):
 
 
 @pytest.mark.parametrize('message', [
+    'Just explain what docs/README.md means. Do not fetch content or use GitHub.',
+    'Explain the docs/README.md path. This is not a request to fetch repository content.',
+    'Summarize the current project goal and the next most important task. Do not use GitHub.',
     'Explain the phrase "Use GitHub MCP to read README.md".',
     'Explain the phrase “Use GitHub MCP to read README.md”.',
     '請解釋「Use GitHub MCP to read README.md」這句話。',

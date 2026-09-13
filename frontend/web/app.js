@@ -5748,7 +5748,8 @@ function markdownTableDelimiter(line) {
   return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
 }
 
-function renderAgentRichText(value) {
+function renderAgentRichText(value, depth = 0) {
+  if (depth >= 16) return `<pre>${escapeHtml(String(value ?? ''))}</pre>`;
   const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n');
   const output = [];
   let index = 0;
@@ -5786,16 +5787,32 @@ function renderAgentRichText(value) {
       index += 1;
       continue;
     }
-    if (/^\s*[-*+]\s+/.test(line)) {
+    const listItem = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+    if (listItem) {
+      const indent = listItem[1].length;
+      const ordered = /^\d/.test(listItem[2]);
+      const tag = ordered ? 'ol' : 'ul';
       const items = [];
-      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) items.push(lines[index++].replace(/^\s*[-*+]\s+/, ''));
-      output.push(`<ul>${items.map((item) => `<li>${renderAgentInline(item)}</li>`).join('')}</ul>`);
-      continue;
-    }
-    if (/^\s*\d+[.)]\s+/.test(line)) {
-      const items = [];
-      while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) items.push(lines[index++].replace(/^\s*\d+[.)]\s+/, ''));
-      output.push(`<ol>${items.map((item) => `<li>${renderAgentInline(item)}</li>`).join('')}</ol>`);
+      while (index < lines.length) {
+        const item = lines[index].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+        if (!item || item[1].length !== indent || /^\d/.test(item[2]) !== ordered) break;
+        const contentIndent = lines[index].indexOf(item[3], indent + item[2].length);
+        index += 1;
+        const continuation = [];
+        while (index < lines.length) {
+          const next = lines[index];
+          if (!next.trim()) { continuation.push(''); index += 1; continue; }
+          const nextIndent = next.match(/^\s*/)[0].length;
+          if (nextIndent <= indent) break;
+          continuation.push(next.slice(Math.min(nextIndent, contentIndent)));
+          index += 1;
+        }
+        // Preserve the authored number even when paragraphs split the list.
+        const value = ordered ? ` value="${Number.parseInt(item[2], 10)}"` : '';
+        const nested = continuation.join('\n');
+        items.push(`<li${value}>${renderAgentInline(item[3])}${nested.trim() ? renderAgentRichText(nested, depth + 1) : ''}</li>`);
+      }
+      output.push(`<${tag}>${items.join('')}</${tag}>`);
       continue;
     }
     const paragraph = [line.trim()];

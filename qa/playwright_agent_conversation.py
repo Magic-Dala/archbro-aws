@@ -47,6 +47,15 @@ RICH_RESPONSE = """## Architecture verification
 
 Evidence: GitHub MCP read `Magic-Dala/archbro` on `dev2`.
 
+1. **Web frontend**: PARTIAL
+   - Evidence: `frontend/`
+
+2. **Backend domain**: PARTIAL
+   - Evidence: `src/`
+
+3. **Persistence**: UNVERIFIED
+   - Not inspected.
+
 <script>unsafe()</script>"""
 
 
@@ -161,6 +170,11 @@ def test_multiline_prompt_expand_keyboard_and_rich_response():
             expect(rich).to_contain_text("GitHub MCP get_file_contents")
             assert "<script>" not in rich.inner_html()
             expect(rich).to_contain_text("<script>unsafe()</script>")
+            for container in [rich, page.locator("#globalAgentReply")]:
+                numbered = container.locator("ol > li")
+                expect(numbered).to_have_count(3)
+                assert numbered.evaluate_all("items => items.map(item => item.value)") == [1, 2, 3]
+                expect(numbered.nth(1).locator("ul > li")).to_contain_text("src/")
             page.screenshot(path=str(ART / "expanded-conversation.png"), full_page=True)
             assert not errors, errors
         finally:

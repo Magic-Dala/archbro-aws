@@ -490,8 +490,16 @@ class GeminiArchitectureWire(BaseModel):
 class GeminiDecisionWire(BaseModel):
     """Provider-only structured output. It is converted into the shared AgentDecision contract."""
 
-    summary: str
-    evaluation: DriftEvaluation
+    summary: str = Field(description=(
+        "User-facing response. For a user question, directly answer or explain the requested "
+        "subject using available facts, even when actions are NO_ACTION. Do not substitute "
+        "a restatement of the request or an architecture-state assessment for the answer. "
+        "For other events, summarize the observed outcome."
+    ))
+    evaluation: DriftEvaluation = Field(description=(
+        "Separate architecture assessment and mutation recommendation. Its summary explains "
+        "whether the event affects the accepted architecture; it is not the user-facing answer."
+    ))
     architecture_review_required: bool = False
     architecture_proposal: GeminiArchitectureProposalWire | None = None
     actions: list[AgentAction] = Field(default_factory=list)

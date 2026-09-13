@@ -427,6 +427,48 @@ def _context_and_event(event_type: ProjectEventType = ProjectEventType.MANUAL_NO
     return context, event
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("message", [
+    "Just explain what docs/README.md means. Do not fetch content or use GitHub.",
+    "Explain the docs/README.md path. This is not a request to fetch repository content.",
+    "Explain what an architecture boundary means. Do not use GitHub.",
+])
+def test_explanation_answer_contract_reaches_primary_and_fallback_without_tools(message, fallback):
+    from archbro.backend.agent.prompts import SYSTEM_PROMPT
+
+    provider = _provider_with_chain()
+    context, event = _context_and_event(ProjectEventType.USER_MESSAGE)
+    event.payload["message"] = message
+    prompts = []
+    answer = "A README in a docs directory commonly introduces and indexes the documentation."
+    assessment = "The user requested an explanation. No architecture changes are needed."
+
+    # No tools parameter: an accidental tools invocation fails this boundary.
+    async def fake_invoke(self, model_id, prompt):
+        prompts.append(prompt)
+        assert "USER MESSAGE ANSWER CONTRACT" in prompt
+        assert "NO_ACTION means no state mutation, not no answer" in prompt
+        assert "Respect explicit instructions not to fetch content or use GitHub" in prompt
+        assert message in prompt
+        schema = GeminiDecisionWire.model_json_schema()["properties"]
+        assert "directly answer or explain" in schema["summary"]["description"]
+        assert "not the user-facing answer" in schema["evaluation"]["description"]
+        if fallback and len(prompts) == 1:
+            raise RuntimeError("503 UNAVAILABLE: temporary provider failure")
+        evaluation = _aligned_evaluation().model_copy(update={"summary": assessment})
+        return GeminiDecisionWire(summary=answer, evaluation=evaluation,
+                                  actions=[AgentAction(type=AgentActionType.NO_ACTION)])
+
+    provider._invoke = MethodType(fake_invoke, provider)
+    decision = asyncio.run(provider.generate(event=event, context=context, system_prompt=SYSTEM_PROMPT))
+    assert len(prompts) == (2 if fallback else 1)
+    assert len(set(prompts)) == 1
+    assert decision.summary == answer
+    assert decision.evaluation.summary == assessment
+    assert [action.type for action in decision.actions] == [AgentActionType.NO_ACTION]
+    assert not decision.architecture_review_required
+
+
 def test_503_falls_through_full_real_gemini_chain():
     provider = _provider_with_chain()
     attempts: list[str] = []
