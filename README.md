@@ -6,7 +6,7 @@
 
 **Archbro is a human-governed Strands agent that keeps software architecture, execution work, and implementation evidence aligned as a project changes. It completes the repetitive project-reasoning loop for engineering teams and pauses only when a consequential architecture decision needs human approval.**
 
-[Live Demo](https://archbro.magicdala.com/) · [Demo Flow](#demo-flow) · [Quick Start](#quick-start) · [Technical Reference](#technical-reference)
+[Live Demo](https://archbro-dev2.magicdala.com/) · [Demo Flow](#demo-flow) · [Quick Start](#quick-start) · [Technical Reference](#technical-reference)
 
 Built for the [Agents for Humans Hackathon](https://agentsforhumans.devpost.com/) — **Professional Agents**
 
@@ -196,7 +196,7 @@ WebMCP gives external agents structured Site Tools instead of DOM guessing, but 
 
 Open the public deployment:
 
-**https://archbro.magicdala.com/**
+**https://archbro-dev2.magicdala.com/**
 
 A concise end-to-end demonstration can follow this path:
 
@@ -410,7 +410,7 @@ docs/INFRASTRUCTURE.md          Deployment architecture and recovery instruction
 
 A production-oriented `Dockerfile` listens on `$PORT` with a default of `8080`. GitHub Actions builds and deploys protected branches as isolated Compose stacks, each with its own PostgreSQL database.
 
-- **Public live application:** https://archbro.magicdala.com/
+- **Public live application:** https://archbro-dev2.magicdala.com/
 - **Main stack:** `/opt/archbro/main`
 - **Development stack:** `/opt/archbro/dev`
 
