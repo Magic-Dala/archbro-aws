@@ -1,0 +1,1066 @@
+{
+  "schema": "archbro.reference-project.v1",
+  "sample_id": "03-manufacturing",
+  "corpus_version": 1,
+  "source_requirement": "設計跨客戶訂單、產品工程、需求預測、採購、產能排程、現場製造、品質、倉儲物流、數位分身與設備營運的智慧工廠平台。訂單與受控 BOM 驅動物料與生產規劃，工單串起補料、設備執行及品質放行，成品物流回填客戶交付。現場事件進入時間序列、數位分身與追溯分析，設備可用性反饋排程。設備身分、憑證、本地安全互鎖及平台監控均應有具體連線；雲端分析不能取代本地安全控制。使用六個責任域與可獨立驗收的子系統邊界，所有最小責任單位均參與實際流程。 固定 v1 使用 40 個架構節點；相同執行責任下的 UI、快取、引擎與設備細節寫入子系統責任，不另當可獨立部署的節點。",
+  "expected_node_count": 40,
+  "expected_relationship_count": 76,
+  "scenarios": [
+    {
+      "name": "排程到現場設備執行",
+      "focus": "mes_dispatch",
+      "path": [
+        "scheduler",
+        "mes_dispatch",
+        "edge_gateway",
+        "plc"
+      ],
+      "acceptance": "可追蹤排程、工單、補料、品質與設備邊界，現場互鎖獨立存在"
+    },
+    {
+      "name": "品质放行到客戶交付",
+      "focus": "shipping",
+      "path": [
+        "quality_gate",
+        "shipping",
+        "carrier"
+      ],
+      "acceptance": "出貨能連回批次品質、庫存、承運商及原始訂單"
+    },
+    {
+      "name": "設備實績到數位分身回饋",
+      "focus": "twin_engine",
+      "path": [
+        "edge_gateway",
+        "stream_ingest",
+        "twin_engine",
+        "scheduler",
+        "simulation"
+      ],
+      "acceptance": "設備事件進入資料域後回饋排程；信任、監控與安全域沒有孤島"
+    }
+  ],
+  "payload": {
+    "name": "參考樣本 03｜智慧製造與供應鏈 · v1",
+    "goal": "設計跨客戶訂單、產品工程、需求預測、採購、產能排程、現場製造、品質、倉儲物流、數位分身與設備營運的智慧工廠平台。訂單與受控 BOM 驅動物料與生產規劃，工單串起補料、設備執行及品質放行，成品物流回填客戶交付。現場事件進入時間序列、數位分身與追溯分析，設備可用性反饋排程。設備身分、憑證、本地安全互鎖及平台監控均應有具體連線；雲端分析不能取代本地安全控制。使用六個責任域與可獨立驗收的子系統邊界，所有最小責任單位均參與實際流程。 固定 v1 使用 40 個架構節點；相同執行責任下的 UI、快取、引擎與設備細節寫入子系統責任，不另當可獨立部署的節點。",
+    "architecture_summary": "六個責任域形成從需求到交付、從現場到資料、再從設備狀態回到規劃的迴路。箭頭同時區分商務資料、現場任務、事件、查詢與本地安全訊號。",
+    "components": [
+      {
+        "id": "business",
+        "name": "產品與需求",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "把客戶訂單、工程定義與需求預測轉成可規劃的製造輸入。",
+        "children": [
+          {
+            "id": "order_intake",
+            "name": "客戶訂單入口與受理",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "驗證客戶與產品修訂，建立交付需求並回填生產進度。 內含客戶訂單入口：提交產品、數量與交期需求，查詢生產及交付進度。"
+          },
+          {
+            "id": "order_book",
+            "name": "需求訂單庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存需求數量、承諾交期、產品修訂及交付狀態。"
+          },
+          {
+            "id": "bom_service",
+            "name": "產品工程與 BOM 服務",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "解析產品修訂、物料用量與替代料規則，提供規劃用 BOM。 內含工程設計工作台：建立產品設計與物料變更，提交受控修訂供排程使用。"
+          },
+          {
+            "id": "revision_store",
+            "name": "工程修訂庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存已接受的產品版本、工藝與物料清單快照。"
+          },
+          {
+            "id": "forecast_engine",
+            "name": "需求規劃與預測",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "結合歷史交付與訂單計算分期需求，保留假設與版本。 內含需求規劃工作台：檢視訂單與預測差異，確認送往物料規劃的需求期間。"
+          },
+          {
+            "id": "demand_store",
+            "name": "需求計畫庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存已確認的需求版本、期間與產品數量。"
+          }
+        ]
+      },
+      {
+        "id": "planning",
+        "name": "供應與生產規劃",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "把產品需求、供應條件與產能限制轉成採購和生產計畫。",
+        "children": [
+          {
+            "id": "mrp",
+            "name": "物料規劃與採購需求",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "按 BOM、需求與庫存計算淨需求、缺料時間及替代料選項。 內含採購需求服務：讀取缺料計畫，建立可追蹤且不重複的採購需求。"
+          },
+          {
+            "id": "material_plan",
+            "name": "物料計畫庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存運算版本、淨需求、預計到貨與缺料項目。"
+          },
+          {
+            "id": "procurement",
+            "name": "供應商與採購協調",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "把採購需求送往企業系統，對齊供應商承諾與到貨預告。 內含供應商入口：提交交期承諾、出貨預告與供應異常。"
+          },
+          {
+            "id": "erp",
+            "name": "企業資源系統",
+            "type": "EXTERNAL_SERVICE",
+            "kind": "EXTERNAL_SERVICE",
+            "status": "PLANNED",
+            "responsibility": "保存正式採購單、供應商、財務入帳與供貨承諾。"
+          },
+          {
+            "id": "scheduler",
+            "name": "生產排程與約束求解",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "協調需求、物料與設備可用性，發布具版本的生產順序。 內含產能約束求解器：計算換線、工時、設備與交期條件下的可行排程。"
+          },
+          {
+            "id": "production_plan",
+            "name": "生產計畫庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存已接受的批次順序、工站安排、時間窗與計画版本。"
+          }
+        ]
+      },
+      {
+        "id": "factory",
+        "name": "現場製造與品質",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "把排程轉成工單、设备任務與可追蹤品質結果。",
+        "children": [
+          {
+            "id": "mes_dispatch",
+            "name": "製造執行與現場工作台",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "依生產計畫建立工單，安排現場任務並回收數量與耗時。 內含操作員終端：顯示當前工序與作業指引，回報開始、完工與異常。"
+          },
+          {
+            "id": "work_order",
+            "name": "製造工單庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存批次、工序、物料批號、實績及工單版本。"
+          },
+          {
+            "id": "edge_gateway",
+            "name": "工廠邊緣閘道",
+            "type": "INFRASTRUCTURE",
+            "kind": "INFRASTRUCTURE",
+            "status": "PLANNED",
+            "responsibility": "映射工單到設備任務，收集設備狀態並隔離工廠與平台連線。"
+          },
+          {
+            "id": "plc",
+            "name": "產線與機器人控制",
+            "type": "INFRASTRUCTURE",
+            "kind": "INFRASTRUCTURE",
+            "status": "PLANNED",
+            "responsibility": "執行本地設備順序與互鎖，回報週期狀態及故障訊號。 內含機器人控制單元：接受既定作業任務並回報完成、耗時及設備異常。"
+          },
+          {
+            "id": "quality_gate",
+            "name": "品質判定與影像檢測",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "綜合影像與製程結果判定批次放行、返工或隔離。 內含影像檢測服務：對指定批次影像推論缺陷類別、位置與可信度。"
+          },
+          {
+            "id": "quality_store",
+            "name": "品質追溯庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存批號、檢測證據、放行結果與返工處置關聯。"
+          }
+        ]
+      },
+      {
+        "id": "logistics",
+        "name": "倉儲與物流",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "處理原料入庫、線邊補料及已放行成品交付。",
+        "children": [
+          {
+            "id": "wms",
+            "name": "收料與倉儲服務",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "管理入庫、儲位、保留與出庫，提供規劃與製造可用量。 內含收料工作台：核對到貨預告，登記原料批號、數量及收料異常。"
+          },
+          {
+            "id": "inventory_ledger",
+            "name": "批次庫存帳本",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "記錄原料與成品的批號、儲位、保留及移動歷程。"
+          },
+          {
+            "id": "agv_controller",
+            "name": "廠內搬運系統",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "安排物料搬運與避讓，依工單追蹤配送到線狀態。 內含自動搬運車隊：執行核准搬運任務並回報位置、載物與完成狀態。"
+          },
+          {
+            "id": "line_buffer",
+            "name": "線邊物料狀態庫",
+            "type": "STATE",
+            "kind": "STATE",
+            "status": "PLANNED",
+            "responsibility": "保存各工站已到料、待補料與批號使用狀態。"
+          },
+          {
+            "id": "shipping",
+            "name": "成品出貨與運輸規劃",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "核對品質放行與客戶交期，安排成品出庫並更新訂單。 內含運輸規劃服務：選擇路線、車次與承運商，建立貨運託單並追蹤到貨。"
+          },
+          {
+            "id": "carrier",
+            "name": "外部物流承運商",
+            "type": "EXTERNAL_SERVICE",
+            "kind": "EXTERNAL_SERVICE",
+            "status": "PLANNED",
+            "responsibility": "接收成品運輸任務，回報取貨、運送與簽收。"
+          }
+        ]
+      },
+      {
+        "id": "digital",
+        "name": "工業資料與數位分身",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "彙整現場資料以建立設備狀態、模擬及追溯分析。",
+        "children": [
+          {
+            "id": "stream_ingest",
+            "name": "製程事件與追溯資料管線",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "驗證設備識別、時間與序號，正規化並去重製程事件。 內含設備事件代理：按設備與工廠隔離主題，接收狀態、實績及品質事件。 內含製造資料彙整器：整合工單、品質與設備事實，保存來源版本與擷取水位。"
+          },
+          {
+            "id": "twin_engine",
+            "name": "設備資產與數位分身",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "將製程事件映射到設備與產線狀態，提供可用性模型。 內含設備資產登錄庫：保存設備識別、工站關係、能力與維護版本。"
+          },
+          {
+            "id": "simulation",
+            "name": "產能模擬服務",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "依設備狀態推演瓶頸與換線方案，回傳排程評估結果。"
+          },
+          {
+            "id": "data_lake",
+            "name": "製程時序與分析資料平台",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存分區化生產與品質分析資料、来源識別及保留政策。 內含製程時間序列庫：保存設備量測、工序週期與運轉狀態的時序事實。"
+          },
+          {
+            "id": "bi",
+            "name": "製造分析工作台",
+            "type": "UI",
+            "kind": "UI",
+            "status": "PLANNED",
+            "responsibility": "呈現良率、交期、設備效率及缺料分析並追溯原始批次。"
+          }
+        ]
+      },
+      {
+        "id": "operations",
+        "name": "設備信任與營運",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "讓裝置信任、現場安全與跨平台監控有獨立且相連的責任。",
+        "children": [
+          {
+            "id": "device_identity",
+            "name": "設備身分與憑證服務",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "驗證設備註冊、租約與撤銷狀態，授權工廠資料連線。 內含裝置憑證服務：依設備身分發行與輪替憑證，維護撤銷紀錄。"
+          },
+          {
+            "id": "key_vault",
+            "name": "工廠金鑰保管庫",
+            "type": "INFRASTRUCTURE",
+            "kind": "INFRASTRUCTURE",
+            "status": "PLANNED",
+            "responsibility": "保護簽章金鑰並提供可稽核的裝置信任加密操作。"
+          },
+          {
+            "id": "interlock",
+            "name": "本地安全互鎖",
+            "type": "INFRASTRUCTURE",
+            "kind": "INFRASTRUCTURE",
+            "status": "PLANNED",
+            "responsibility": "由本地認證安全設備執行既定互鎖，獨立於雲端分析運作。"
+          },
+          {
+            "id": "incident",
+            "name": "現場安全監測與事件處理",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "保存異常責任人、處理記錄及恢復條件，通知製造執行。 內含現場安全監測器：彙整現場安全狀態與互鎖結果，將事故送交人員處理。"
+          },
+          {
+            "id": "telemetry",
+            "name": "營運遙測與告警平台",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "收集排程、製造、物流與資料處理的服務追蹤及指標。 內含平台營運指標庫：保存服務錯誤率、工單延遲、設備連線與資料管線積壓。 內含平台告警服務：偵測服務門檻與資料中斷，建立具來源關聯的營運事件。"
+          }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "source": "order_intake",
+        "target": "order_book",
+        "type": "保存訂單需求 · SQL"
+      },
+      {
+        "source": "order_intake",
+        "target": "bom_service",
+        "type": "驗證產品修訂 · RPC"
+      },
+      {
+        "source": "bom_service",
+        "target": "revision_store",
+        "type": "保存及讀取工程版本 · SQL"
+      },
+      {
+        "source": "forecast_engine",
+        "target": "order_book",
+        "type": "讀取確認訂單 · SQL"
+      },
+      {
+        "source": "forecast_engine",
+        "target": "demand_store",
+        "type": "保存需求計畫 · SQL"
+      },
+      {
+        "source": "forecast_engine",
+        "target": "data_lake",
+        "type": "取得歷史交付彙總 · Query"
+      },
+      {
+        "source": "mrp",
+        "target": "demand_store",
+        "type": "讀取指定需求版本 · SQL"
+      },
+      {
+        "source": "mrp",
+        "target": "bom_service",
+        "type": "展開物料用量 · RPC"
+      },
+      {
+        "source": "mrp",
+        "target": "wms",
+        "type": "查詢可用庫存 · HTTPS"
+      },
+      {
+        "source": "mrp",
+        "target": "material_plan",
+        "type": "保存淨需求與缺料 · SQL"
+      },
+      {
+        "source": "mrp",
+        "target": "material_plan",
+        "type": "讀取缺料計畫 · SQL"
+      },
+      {
+        "source": "mrp",
+        "target": "procurement",
+        "type": "提交採購需求 · HTTPS"
+      },
+      {
+        "source": "procurement",
+        "target": "erp",
+        "type": "建立正式採購單 · HTTPS"
+      },
+      {
+        "source": "erp",
+        "target": "procurement",
+        "type": "回報採購及供貨承諾 · Event"
+      },
+      {
+        "source": "procurement",
+        "target": "material_plan",
+        "type": "回填預計到貨 · SQL"
+      },
+      {
+        "source": "procurement",
+        "target": "wms",
+        "type": "發送到貨預告 · Event"
+      },
+      {
+        "source": "scheduler",
+        "target": "material_plan",
+        "type": "讀取可用物料時窗 · SQL"
+      },
+      {
+        "source": "scheduler",
+        "target": "demand_store",
+        "type": "讀取交付需求 · SQL"
+      },
+      {
+        "source": "scheduler",
+        "target": "simulation",
+        "type": "評估產能與換線方案 · RPC"
+      },
+      {
+        "source": "scheduler",
+        "target": "production_plan",
+        "type": "保存核准排程版本 · SQL"
+      },
+      {
+        "source": "scheduler",
+        "target": "mes_dispatch",
+        "type": "發佈生產計畫 · Event"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "production_plan",
+        "type": "讀取指定排程 · SQL"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "work_order",
+        "type": "建立工單與實績 · SQL"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "bom_service",
+        "type": "取得工藝及物料版本 · RPC"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "edge_gateway",
+        "type": "下發核准設備任務 · 工廠協定"
+      },
+      {
+        "source": "edge_gateway",
+        "target": "plc",
+        "type": "轉交既定產線任務 · OPC UA"
+      },
+      {
+        "source": "plc",
+        "target": "edge_gateway",
+        "type": "回報週期及故障 · OPC UA"
+      },
+      {
+        "source": "edge_gateway",
+        "target": "mes_dispatch",
+        "type": "回填工序執行結果 · Event"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "quality_gate",
+        "type": "提交批次檢測需求 · HTTPS"
+      },
+      {
+        "source": "quality_gate",
+        "target": "quality_store",
+        "type": "保存缺陷證據 · SQL"
+      },
+      {
+        "source": "quality_gate",
+        "target": "quality_store",
+        "type": "保存放行或隔離結果 · SQL"
+      },
+      {
+        "source": "quality_gate",
+        "target": "mes_dispatch",
+        "type": "回報放行或返工 · Event"
+      },
+      {
+        "source": "quality_gate",
+        "target": "shipping",
+        "type": "通知可出貨批次 · Event"
+      },
+      {
+        "source": "wms",
+        "target": "inventory_ledger",
+        "type": "記錄批次庫存移動 · SQL"
+      },
+      {
+        "source": "wms",
+        "target": "procurement",
+        "type": "確認到貨或差異 · Event"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "wms",
+        "type": "保留工單所需物料 · HTTPS"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "agv_controller",
+        "type": "請求工站補料 · HTTPS"
+      },
+      {
+        "source": "agv_controller",
+        "target": "wms",
+        "type": "確認取料儲位 · HTTPS"
+      },
+      {
+        "source": "agv_controller",
+        "target": "line_buffer",
+        "type": "更新到線物料狀態 · State"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "line_buffer",
+        "type": "確認批號已到工站 · Query"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "wms",
+        "type": "回報物料消耗與成品入庫 · Event"
+      },
+      {
+        "source": "shipping",
+        "target": "quality_store",
+        "type": "驗證批次放行證據 · SQL"
+      },
+      {
+        "source": "shipping",
+        "target": "wms",
+        "type": "請求成品揀貨與出庫 · HTTPS"
+      },
+      {
+        "source": "shipping",
+        "target": "carrier",
+        "type": "委託成品運輸 · HTTPS"
+      },
+      {
+        "source": "carrier",
+        "target": "shipping",
+        "type": "回報取貨與簽收 · Webhook"
+      },
+      {
+        "source": "shipping",
+        "target": "order_intake",
+        "type": "回填交付狀態 · Event"
+      },
+      {
+        "source": "edge_gateway",
+        "target": "stream_ingest",
+        "type": "發佈設備狀態與實績 · MQTT"
+      },
+      {
+        "source": "quality_gate",
+        "target": "stream_ingest",
+        "type": "發佈批次品質結果 · MQTT"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "data_lake",
+        "type": "寫入去重時間序列 · Write"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "twin_engine",
+        "type": "更新產線即時狀態 · Event"
+      },
+      {
+        "source": "twin_engine",
+        "target": "data_lake",
+        "type": "讀取設備歷史狀態 · Query"
+      },
+      {
+        "source": "simulation",
+        "target": "twin_engine",
+        "type": "取得版本化設備模型 · RPC"
+      },
+      {
+        "source": "twin_engine",
+        "target": "scheduler",
+        "type": "通知設備可用性改變 · Event"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "data_lake",
+        "type": "擷取製程事實 · Query"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "work_order",
+        "type": "擷取工單實績 · SQL"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "quality_store",
+        "type": "擷取品質與批號證據 · SQL"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "data_lake",
+        "type": "寫入追溯分析分區 · S3"
+      },
+      {
+        "source": "bi",
+        "target": "data_lake",
+        "type": "查詢良率與交付分析 · SQL"
+      },
+      {
+        "source": "bi",
+        "target": "twin_engine",
+        "type": "檢視產線當前狀態 · HTTPS"
+      },
+      {
+        "source": "edge_gateway",
+        "target": "device_identity",
+        "type": "驗證裝置註冊與租約 · mTLS"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "device_identity",
+        "type": "驗證設備主題權限 · RPC"
+      },
+      {
+        "source": "device_identity",
+        "target": "twin_engine",
+        "type": "核對設備資產歸屬 · SQL"
+      },
+      {
+        "source": "device_identity",
+        "target": "key_vault",
+        "type": "簽發裝置憑證 · KMS"
+      },
+      {
+        "source": "edge_gateway",
+        "target": "device_identity",
+        "type": "輪替設備憑證 · mTLS"
+      },
+      {
+        "source": "plc",
+        "target": "interlock",
+        "type": "回報現場互鎖輸入 · 安全匯流排"
+      },
+      {
+        "source": "interlock",
+        "target": "plc",
+        "type": "執行本地互鎖結果 · 安全匯流排"
+      },
+      {
+        "source": "interlock",
+        "target": "incident",
+        "type": "回報互鎖狀態 · 唯讀遙測"
+      },
+      {
+        "source": "incident",
+        "target": "mes_dispatch",
+        "type": "通知異常與恢復条件 · Event"
+      },
+      {
+        "source": "incident",
+        "target": "stream_ingest",
+        "type": "發佈安全狀態摘要 · MQTT"
+      },
+      {
+        "source": "scheduler",
+        "target": "telemetry",
+        "type": "送出排程耗時 · OTLP"
+      },
+      {
+        "source": "mes_dispatch",
+        "target": "telemetry",
+        "type": "送出工單服務指標 · OTLP"
+      },
+      {
+        "source": "wms",
+        "target": "telemetry",
+        "type": "送出庫存服務指標 · OTLP"
+      },
+      {
+        "source": "stream_ingest",
+        "target": "telemetry",
+        "type": "送出資料延遲與積壓 · OTLP"
+      },
+      {
+        "source": "device_identity",
+        "target": "telemetry",
+        "type": "送出裝置驗證指標 · OTLP"
+      },
+      {
+        "source": "telemetry",
+        "target": "incident",
+        "type": "建立具來源的營運事件 · Event"
+      },
+      {
+        "source": "incident",
+        "target": "mes_dispatch",
+        "type": "通知工站待處理事件 · UI notification"
+      }
+    ],
+    "tasks": [
+      {
+        "title": "固定情境 1：排程到現場設備執行（可追蹤排程、工單、補料、品質與設備邊界，現場互鎖獨立存在）",
+        "component": "mes_dispatch"
+      },
+      {
+        "title": "固定情境 2：品质放行到客戶交付（出貨能連回批次品質、庫存、承運商及原始訂單）",
+        "component": "shipping"
+      },
+      {
+        "title": "固定情境 3：設備實績到數位分身回饋（設備事件進入資料域後回饋排程；信任、監控與安全域沒有孤島）",
+        "component": "twin_engine"
+      }
+    ],
+    "planning_trace": {
+      "system_map_root_ids": [
+        "business",
+        "planning",
+        "factory",
+        "logistics",
+        "digital",
+        "operations"
+      ],
+      "scope_evaluations": [
+        {
+          "scope_component_id": "business",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "order_intake",
+            "order_book",
+            "bom_service",
+            "revision_store",
+            "forecast_engine",
+            "demand_store"
+          ]
+        },
+        {
+          "scope_component_id": "order_intake",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "客戶訂單入口與受理的邊界是：驗證客戶與產品修訂，建立交付需求並回填生產進度。 內含客戶訂單入口：提交產品、數量與交期需求，查詢生產及交付進度。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "order_book",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "需求訂單庫的邊界是：保存需求數量、承諾交期、產品修訂及交付狀態。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "bom_service",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "產品工程與 BOM 服務的邊界是：解析產品修訂、物料用量與替代料規則，提供規劃用 BOM。 內含工程設計工作台：建立產品設計與物料變更，提交受控修訂供排程使用。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "revision_store",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工程修訂庫的邊界是：保存已接受的產品版本、工藝與物料清單快照。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "forecast_engine",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "需求規劃與預測的邊界是：結合歷史交付與訂單計算分期需求，保留假設與版本。 內含需求規劃工作台：檢視訂單與預測差異，確認送往物料規劃的需求期間。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "demand_store",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "需求計畫庫的邊界是：保存已確認的需求版本、期間與產品數量。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "planning",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "mrp",
+            "material_plan",
+            "procurement",
+            "erp",
+            "scheduler",
+            "production_plan"
+          ]
+        },
+        {
+          "scope_component_id": "mrp",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "物料規劃與採購需求的邊界是：按 BOM、需求與庫存計算淨需求、缺料時間及替代料選項。 內含採購需求服務：讀取缺料計畫，建立可追蹤且不重複的採購需求。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "material_plan",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "物料計畫庫的邊界是：保存運算版本、淨需求、預計到貨與缺料項目。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "procurement",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "供應商與採購協調的邊界是：把採購需求送往企業系統，對齊供應商承諾與到貨預告。 內含供應商入口：提交交期承諾、出貨預告與供應異常。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "erp",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "企業資源系統的邊界是：保存正式採購單、供應商、財務入帳與供貨承諾。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "scheduler",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "生產排程與約束求解的邊界是：協調需求、物料與設備可用性，發布具版本的生產順序。 內含產能約束求解器：計算換線、工時、設備與交期條件下的可行排程。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "production_plan",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "生產計畫庫的邊界是：保存已接受的批次順序、工站安排、時間窗與計画版本。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "factory",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "mes_dispatch",
+            "work_order",
+            "edge_gateway",
+            "plc",
+            "quality_gate",
+            "quality_store"
+          ]
+        },
+        {
+          "scope_component_id": "mes_dispatch",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "製造執行與現場工作台的邊界是：依生產計畫建立工單，安排現場任務並回收數量與耗時。 內含操作員終端：顯示當前工序與作業指引，回報開始、完工與異常。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "work_order",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "製造工單庫的邊界是：保存批次、工序、物料批號、實績及工單版本。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "edge_gateway",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工廠邊緣閘道的邊界是：映射工單到設備任務，收集設備狀態並隔離工廠與平台連線。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "plc",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "產線與機器人控制的邊界是：執行本地設備順序與互鎖，回報週期狀態及故障訊號。 內含機器人控制單元：接受既定作業任務並回報完成、耗時及設備異常。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "quality_gate",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "品質判定與影像檢測的邊界是：綜合影像與製程結果判定批次放行、返工或隔離。 內含影像檢測服務：對指定批次影像推論缺陷類別、位置與可信度。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "quality_store",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "品質追溯庫的邊界是：保存批號、檢測證據、放行結果與返工處置關聯。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "logistics",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "wms",
+            "inventory_ledger",
+            "agv_controller",
+            "line_buffer",
+            "shipping",
+            "carrier"
+          ]
+        },
+        {
+          "scope_component_id": "wms",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "收料與倉儲服務的邊界是：管理入庫、儲位、保留與出庫，提供規劃與製造可用量。 內含收料工作台：核對到貨預告，登記原料批號、數量及收料異常。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "inventory_ledger",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "批次庫存帳本的邊界是：記錄原料與成品的批號、儲位、保留及移動歷程。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "agv_controller",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "廠內搬運系統的邊界是：安排物料搬運與避讓，依工單追蹤配送到線狀態。 內含自動搬運車隊：執行核准搬運任務並回報位置、載物與完成狀態。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "line_buffer",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "線邊物料狀態庫的邊界是：保存各工站已到料、待補料與批號使用狀態。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "shipping",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "成品出貨與運輸規劃的邊界是：核對品質放行與客戶交期，安排成品出庫並更新訂單。 內含運輸規劃服務：選擇路線、車次與承運商，建立貨運託單並追蹤到貨。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "carrier",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "外部物流承運商的邊界是：接收成品運輸任務，回報取貨、運送與簽收。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "digital",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "stream_ingest",
+            "twin_engine",
+            "simulation",
+            "data_lake",
+            "bi"
+          ]
+        },
+        {
+          "scope_component_id": "stream_ingest",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "製程事件與追溯資料管線的邊界是：驗證設備識別、時間與序號，正規化並去重製程事件。 內含設備事件代理：按設備與工廠隔離主題，接收狀態、實績及品質事件。 內含製造資料彙整器：整合工單、品質與設備事實，保存來源版本與擷取水位。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "twin_engine",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "設備資產與數位分身的邊界是：將製程事件映射到設備與產線狀態，提供可用性模型。 內含設備資產登錄庫：保存設備識別、工站關係、能力與維護版本。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "simulation",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "產能模擬服務的邊界是：依設備狀態推演瓶頸與換線方案，回傳排程評估結果。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "data_lake",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "製程時序與分析資料平台的邊界是：保存分區化生產與品質分析資料、来源識別及保留政策。 內含製程時間序列庫：保存設備量測、工序週期與運轉狀態的時序事實。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "bi",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "製造分析工作台的邊界是：呈現良率、交期、設備效率及缺料分析並追溯原始批次。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "operations",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "device_identity",
+            "key_vault",
+            "interlock",
+            "incident",
+            "telemetry"
+          ]
+        },
+        {
+          "scope_component_id": "device_identity",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "設備身分與憑證服務的邊界是：驗證設備註冊、租約與撤銷狀態，授權工廠資料連線。 內含裝置憑證服務：依設備身分發行與輪替憑證，維護撤銷紀錄。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "key_vault",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工廠金鑰保管庫的邊界是：保護簽章金鑰並提供可稽核的裝置信任加密操作。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "interlock",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "本地安全互鎖的邊界是：由本地認證安全設備執行既定互鎖，獨立於雲端分析運作。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "incident",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "現場安全監測與事件處理的邊界是：保存異常責任人、處理記錄及恢復條件，通知製造執行。 內含現場安全監測器：彙整現場安全狀態與互鎖結果，將事故送交人員處理。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "telemetry",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "營運遙測與告警平台的邊界是：收集排程、製造、物流與資料處理的服務追蹤及指標。 內含平台營運指標庫：保存服務錯誤率、工單延遲、設備連線與資料管線積壓。 內含平台告警服務：偵測服務門檻與資料中斷，建立具來源關聯的營運事件。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        }
+      ],
+      "reconciled": true
+    },
+    "reasoning": "ArchBro 固定參考樣本 v1。依版本化需求人工編寫責任邊界、分解與互動，不呼叫付費模型。箭頭表示標示動作的發起者到接收者；包含關係由階層表達。這是長期比較用的假想專案，不是正式业务系統或使用者專案的架構批准。"
+  }
+}

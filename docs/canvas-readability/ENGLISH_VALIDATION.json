@@ -1,0 +1,56 @@
+{
+  "scope": "ENGLISH_CANVAS_OFFLINE",
+  "base_head": "6849917dc76389fb8837cd8fc3e3a2549af9aca9",
+  "layout_version": "archbro.canvas-layout.v3",
+  "python_passed": 40,
+  "node_passed": 4,
+  "journeys_passed": 9,
+  "collapse_groups_passed": 27,
+  "viewports": [
+    {
+      "width": 1426,
+      "height": 837
+    },
+    {
+      "width": 760,
+      "height": 837
+    },
+    {
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "accepted_corpus_unchanged": true,
+  "node_counts": [
+    36,
+    40,
+    40
+  ],
+  "relationship_counts": [
+    42,
+    63,
+    76
+  ],
+  "real_auth": "NOT_RUN",
+  "provider": "NOT_RUN",
+  "deployment": "NOT_RUN",
+  "artifact_directory": "C:\\AI\\temp\\archbro\\2609051136\\results\\final-consolidated-20260905T0932\\canvas-english-20260906",
+  "source_file_sha256": {
+    "frontend/web/app.js": "72757edf5297a40d5e9897de91e53fadd8293fa27270b030cc8746bc5c87fd85",
+    "frontend/web/styles.css": "00bc1a1ed6c67e2ccdda7e92b03935f5af0095270a36729752e752667631406e",
+    "frontend/web/index.html": "2fd8f1e2745819b53dc236ecfe3788cbf36f88c8880c02d5244679e4a9c11371",
+    "pyproject.toml": "3e09fb5739abc33dff766b4ffac67fcbb8078ac5d5b3729b0693ac887e47fa9e",
+    "qa/canvas_readability_fixtures.py": "7c0d88725ce078057a4325cd6d5538dceb49f6995da91cb4bc04f5176ee345f8",
+    "qa/canvas_readability_views.py": "85c72753567f93768094b13991965a984d466eac62d4b8b352d7f5e597f4d71d",
+    "qa/export_canvas_showcase.py": "3520062c07da291776b127e054dce094dc86937e1990210258233c11cbd62172",
+    "src/archbro/backend/api/routes.py": "1a4f8782aea829854185002e112cf70864e8f5de39a1468415a8398e1760fb8f",
+    "src/archbro/backend/core/diagram_layout.py": "3879531dfc9a0434c41acda3c6b8420daa7e2dd4f11012298366a4ac127924a8",
+    "src/archbro/backend/core/canvas_routing.py": "2e60bfeed4fde57b0c35d8d17e3cd36bf202b8248bac5abd6ade7d597b9467e9",
+    "src/archbro/backend/core/canvas_presentation.py": "ddf79374452c1805df32208a18870f89e8ea5348f20afc2efef35e0ec7c8cd59",
+    "src/archbro/backend/core/canvas_reference_en.json": "cdc3527e1baf2058a67a33c4eb90387a3cc69ea44f6c8c380998f4349b79dedc",
+    "tests/test_canvas_api_unit.py": "ebc2dd08a2e756d575f230baaeb75f7f348e618dc3248ceee803408603c8ecc6",
+    "tests/test_canvas_presentation.py": "3c589ee8db43ed85153004120a3a26fac6bd4c30247b637b19264482b513cd3e"
+  },
+  "reader_sha256": "3b142b21d0badc83f72a520c2ec15904e0f44d909cf40db65fe5adcdae73fd8c",
+  "known_limit": "Dense all-relationship views retain crossings and shared routes; layout metrics are mixed, not a universal improvement claim."
+}

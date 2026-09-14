@@ -1,0 +1,381 @@
+# Tiered CI keeps PR feedback cheap while preserving full deployment gates.
+# The stable required check is the aggregate `Python` job at the bottom.
+name: CI
+
+on:
+  push:
+    branches: [main, dev, dev2]
+  pull_request:
+    branches: [main, dev, dev2]
+  workflow_dispatch:
+  schedule:
+    # 02:17 Asia/Taipei. Scheduled/manual runs always test the current dev ref.
+    - cron: '17 18 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  classify:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      target_sha: ${{ steps.profile.outputs.target_sha }}
+      full: ${{ steps.profile.outputs.full }}
+      smoke: ${{ steps.profile.outputs.smoke }}
+      frontend: ${{ steps.profile.outputs.frontend }}
+      backend_core: ${{ steps.profile.outputs.backend_core }}
+      persistence: ${{ steps.profile.outputs.persistence }}
+      integrations: ${{ steps.profile.outputs.integrations }}
+      release: ${{ steps.profile.outputs.release }}
+    steps:
+      - name: Checkout current dev for compatibility runs
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout event revision
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select CI profile
+        id: profile
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed="$RUNNER_TEMP/changed-paths.txt"
+          if [ "$EVENT_NAME" = "pull_request" ] && { [ "$BASE_REF" = "dev" ] || [ "$BASE_REF" = "dev2" ]; }; then
+            git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA" > "$changed"
+          else
+            : > "$changed"
+          fi
+          python scripts/ci_profile.py classify \
+            --event-name "$EVENT_NAME" --base-ref "$BASE_REF" \
+            < "$changed" | tee "$RUNNER_TEMP/ci-profile.txt"
+          cat "$RUNNER_TEMP/ci-profile.txt" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  node-qa:
+    name: Node QA
+    needs: classify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the classified dev revision for compatibility runs
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.classify.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Checkout event revision
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run all low-cost Node QA
+        shell: bash
+        run: |
+          suites=(qa/test_*.mjs)
+          if [ ! -e "${suites[0]}" ]; then
+            echo "::error::No qa/test_*.mjs suites found"
+            exit 1
+          fi
+          node --test "${suites[@]}"
+
+  python-pr:
+    name: PR Python 3.13
+    if: github.event_name == 'pull_request' && (github.base_ref == 'dev' || github.base_ref == 'dev2')
+    needs: classify
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: archbro
+          POSTGRES_PASSWORD: archbro
+          POSTGRES_DB: archbro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U archbro -d archbro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://archbro:archbro@localhost:5432/archbro
+      ARCHBRO_PROVIDER: fake
+      ARCHBRO_ENV: local
+      ARCHBRO_AUTH_MODE: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install
+        run: python -m pip install ".[test]"
+
+      - name: Fail-closed dependency preflight
+        run: python scripts/ci_profile.py preflight
+
+      - name: Run selected Python tests
+        shell: bash
+        env:
+          FULL: ${{ needs.classify.outputs.full }}
+          FRONTEND: ${{ needs.classify.outputs.frontend }}
+          BACKEND_CORE: ${{ needs.classify.outputs.backend_core }}
+          PERSISTENCE: ${{ needs.classify.outputs.persistence }}
+          INTEGRATIONS: ${{ needs.classify.outputs.integrations }}
+          RELEASE: ${{ needs.classify.outputs.release }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$FULL" = "true" ]; then
+            python -m pytest
+            exit 0
+          fi
+
+          groups=(smoke)
+          [ "$FRONTEND" = "true" ] && groups+=(frontend)
+          [ "$BACKEND_CORE" = "true" ] && groups+=(backend-core)
+          [ "$PERSISTENCE" = "true" ] && groups+=(persistence)
+          [ "$INTEGRATIONS" = "true" ] && groups+=(integrations)
+          [ "$RELEASE" = "true" ] && groups+=(release)
+
+          selector_args=()
+          for group in "${groups[@]}"; do
+            selector_args+=(--group "$group")
+          done
+
+          git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA" | \
+            python scripts/ci_profile.py targets "${selector_args[@]}" \
+            > "$RUNNER_TEMP/pytest-targets.txt"
+          mapfile -t targets < "$RUNNER_TEMP/pytest-targets.txt"
+          printf 'Selected pytest targets:\n - %s\n' "${targets[@]}"
+          python -m pytest "${targets[@]}"
+
+  python-full:
+    name: Full Python
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'main')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON((github.event_name == 'pull_request' || github.ref_name == 'main') && '["3.11","3.13"]' || '["3.13"]') }}
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: archbro
+          POSTGRES_PASSWORD: archbro
+          POSTGRES_DB: archbro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U archbro -d archbro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://archbro:archbro@localhost:5432/archbro
+      ARCHBRO_PROVIDER: fake
+      ARCHBRO_ENV: local
+      ARCHBRO_AUTH_MODE: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install
+        run: python -m pip install ".[test]"
+
+      - name: Fail-closed dependency preflight
+        run: python scripts/ci_profile.py preflight
+
+      - name: Full pytest
+        # Includes persistence, browser-auth and release/deployment contract tests
+        # once; the preflight above makes their required dependencies fail closed.
+        run: python -m pytest
+
+  python-compat:
+    name: Dev compatibility Python
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: classify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: archbro
+          POSTGRES_PASSWORD: archbro
+          POSTGRES_DB: archbro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U archbro -d archbro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://archbro:archbro@localhost:5432/archbro
+      ARCHBRO_PROVIDER: fake
+      ARCHBRO_ENV: local
+      ARCHBRO_AUTH_MODE: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.classify.outputs.target_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install
+        run: python -m pip install ".[test]"
+
+      - name: Fail-closed dependency preflight
+        run: python scripts/ci_profile.py preflight
+
+      - name: Full compatibility pytest
+        run: python -m pytest
+
+  image:
+    name: Image build and boot
+    needs: classify
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.base_ref == 'main') ||
+      (github.event_name == 'pull_request' && (github.base_ref == 'dev' || github.base_ref == 'dev2') && needs.classify.outputs.full == 'true')
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: archbro
+          POSTGRES_PASSWORD: archbro
+          POSTGRES_DB: archbro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U archbro -d archbro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the deployment image
+        run: docker build -t archbro:ci .
+
+      - name: Boot it and check liveness
+        shell: bash
+        run: |
+          trap 'docker rm -f archbro-ci >/dev/null 2>&1 || true' EXIT
+          docker run -d --name archbro-ci --network host \
+            -e PORT=8080 \
+            -e ARCHBRO_PROVIDER=fake \
+            -e ARCHBRO_PERSISTENCE=postgres \
+            -e DATABASE_URL=postgresql://archbro:archbro@localhost:5432/archbro \
+            archbro:ci
+          curl --retry 40 --retry-delay 1 --retry-all-errors --max-time 90 \
+            --fail -s http://localhost:8080/healthz
+
+  python-gate:
+    # Compatibility runs test dev while GitHub associates the check with the
+    # dispatch/default-branch revision. Keep them from masquerading as the
+    # exact-SHA deployment or required check.
+    name: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Python compatibility' || 'Python' }}
+    if: always()
+    needs: [classify, node-qa, python-pr, python-full, python-compat, image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the classified dev revision for compatibility runs
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.classify.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Checkout event revision
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Require the jobs for this CI profile
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          FULL_SENSITIVE: ${{ needs.classify.outputs.full }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          NODE_RESULT: ${{ needs.node-qa.result }}
+          PR_PYTHON_RESULT: ${{ needs.python-pr.result }}
+          FULL_PYTHON_RESULT: ${{ needs.python-full.result }}
+          COMPAT_PYTHON_RESULT: ${{ needs.python-compat.result }}
+          IMAGE_RESULT: ${{ needs.image.result }}
+        run: |
+          extra=()
+          [ "$FULL_SENSITIVE" = "true" ] && extra+=(--full-sensitive)
+          python scripts/ci_profile.py gate \
+            --event-name "$EVENT_NAME" \
+            --base-ref "$BASE_REF" \
+            --classify "$CLASSIFY_RESULT" \
+            --node "$NODE_RESULT" \
+            --pr-python "$PR_PYTHON_RESULT" \
+            --full-python "$FULL_PYTHON_RESULT" \
+            --compat-python "$COMPAT_PYTHON_RESULT" \
+            --image "$IMAGE_RESULT" \
+            "${extra[@]}"

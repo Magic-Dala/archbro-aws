@@ -1,0 +1,45 @@
+{
+  "schema": "archbro.reference-corpus-lock.v1",
+  "corpus_version": 1,
+  "samples": {
+    "01-commerce": {
+      "sample_id": "01-commerce",
+      "definition_sha256": "b1bb53c8a4820a93c681126a8b74a510c032416d88509d9cdbf733246a0d6a17",
+      "payload_sha256": "6d11a037442a51a9b99c4892864b4cc27f9edd9bf79a8ca2dd54b544d60e788e",
+      "architecture_sha256": "22b3cb6e15718150b01195d69143140b21b157f24e350b6fccd058b8328d85b1",
+      "roots": 4,
+      "nodes": 36,
+      "leaves": 24,
+      "relationships": 42,
+      "cross_root_relationships": 17,
+      "weakly_connected": true,
+      "directed_scenarios": 3
+    },
+    "02-ai-workspace": {
+      "sample_id": "02-ai-workspace",
+      "definition_sha256": "b44de7a6a08cdcd10758319868d0cf89188827ed7d94eaa50646865c22799d78",
+      "payload_sha256": "8ae6232d2cc70d4a6c26968ff8f9e5b0538f5d1bb90ce68dc703ba6b15606b59",
+      "architecture_sha256": "4a36e5171628c9bf074906e24a07c7ebb1a731bde1f2816df0060400254ec19c",
+      "roots": 5,
+      "nodes": 40,
+      "leaves": 31,
+      "relationships": 63,
+      "cross_root_relationships": 29,
+      "weakly_connected": true,
+      "directed_scenarios": 3
+    },
+    "03-manufacturing": {
+      "sample_id": "03-manufacturing",
+      "definition_sha256": "4a4a5ad9fcdc1d8a31c9df8b4e77f9d4062cd59807bf4bc7379b0699c5676c7f",
+      "payload_sha256": "c61b3d11b94668f0c48cd777ce4256061a16e2daa77fd0ab4cbd7506295bc2c5",
+      "architecture_sha256": "ce5551f7ec816d8b1ba3d162241de944cbeda4f2ebf8ce6b6744da4d60804a80",
+      "roots": 6,
+      "nodes": 40,
+      "leaves": 34,
+      "relationships": 76,
+      "cross_root_relationships": 36,
+      "weakly_connected": true,
+      "directed_scenarios": 3
+    }
+  }
+}

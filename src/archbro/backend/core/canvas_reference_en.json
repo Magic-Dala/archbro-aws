@@ -1,0 +1,689 @@
+{
+  "22b3cb6e15718150b01195d69143140b21b157f24e350b6fccd058b8328d85b1": {
+    "sample_id": "01-commerce",
+    "title": "Commerce & fulfillment",
+    "subtitle": "From checkout to the customer doorstep.",
+    "nodes": {
+      "node:experience": {
+        "label": "Customer experience",
+        "responsibility": "Browse products, maintain shopping state and submit checkout requests securely."
+      },
+      "node:shopping": {
+        "label": "Shopping & sessions",
+        "responsibility": "Handle storefront interactions and short-lived shopping state."
+      },
+      "node:storefront": {
+        "label": "Storefront",
+        "responsibility": "Display products, cart entry and order progress through the storefront API."
+      },
+      "node:bff": {
+        "label": "Storefront API",
+        "responsibility": "Combine order and stock information, validate sessions and forward checkout requests."
+      },
+      "node:session": {
+        "label": "Session cache",
+        "responsibility": "Store expiring cart and session references without payment card numbers."
+      },
+      "node:checkout": {
+        "label": "Checkout",
+        "responsibility": "Collect delivery and payment choices; coordinate stock, risk and payment."
+      },
+      "node:cart_ui": {
+        "label": "Checkout page",
+        "responsibility": "Show purchase and delivery options; submit checkout after customer confirmation."
+      },
+      "node:checkout_api": {
+        "label": "Checkout service",
+        "responsibility": "Validate prices and risk, reserve stock, and create orders and payment operations."
+      },
+      "node:fraud_rules": {
+        "label": "Risk rules",
+        "responsibility": "Evaluate transaction value, frequency and delivery anomalies for approval, rejection or review."
+      },
+      "node:transactions": {
+        "label": "Orders & payments",
+        "responsibility": "Manage order lifecycles and payment authorization; publish reliable state changes."
+      },
+      "node:orders": {
+        "label": "Order management",
+        "responsibility": "Maintain order facts and publish order status events."
+      },
+      "node:order_service": {
+        "label": "Order service",
+        "responsibility": "Create orders, accept payment and delivery results, and validate state transitions."
+      },
+      "node:order_db": {
+        "label": "Order database",
+        "responsibility": "Store order items, delivery details and state versions with idempotent creation."
+      },
+      "node:order_outbox": {
+        "label": "Order outbox",
+        "responsibility": "Read transactionally recorded events, retry delivery and track publication progress."
+      },
+      "node:payments": {
+        "label": "Payment processing",
+        "responsibility": "Isolate the payment provider and retain authorization and refund audit records."
+      },
+      "node:payment_router": {
+        "label": "Payment router",
+        "responsibility": "Request authorizations and refunds, validate callbacks and report payment outcomes."
+      },
+      "node:payment_ledger": {
+        "label": "Payment ledger",
+        "responsibility": "Record payment identifiers, authorizations, refunds and reconciliation differences."
+      },
+      "node:psp": {
+        "label": "Payment provider",
+        "responsibility": "Process tokenized authorizations, captures and refunds; send signed callbacks."
+      },
+      "node:fulfillment": {
+        "label": "Inventory & fulfillment",
+        "responsibility": "Turn paid orders into traceable picking, shipping and delivery workflows."
+      },
+      "node:inventory": {
+        "label": "Stock & picking",
+        "responsibility": "Maintain available quantities and warehouse picking outcomes."
+      },
+      "node:stock_service": {
+        "label": "Inventory service",
+        "responsibility": "Atomically reserve and release stock; coordinate picking and report shortages."
+      },
+      "node:stock_db": {
+        "label": "Inventory ledger",
+        "responsibility": "Record SKU quantities, reservation expiry, stock differences and debit versions."
+      },
+      "node:warehouse": {
+        "label": "Warehouse system",
+        "responsibility": "Accept pick lists and return picking, packing and dispatched quantities."
+      },
+      "node:shipping": {
+        "label": "Delivery coordination",
+        "responsibility": "Arrange carriers and normalize delivery progress."
+      },
+      "node:shipping_service": {
+        "label": "Shipping service",
+        "responsibility": "Consume eligible orders and create shipments after picking completes."
+      },
+      "node:carrier": {
+        "label": "Carrier network",
+        "responsibility": "Accept shipment details and report pickup, transit and delivery."
+      },
+      "node:delivery_events": {
+        "label": "Delivery webhooks",
+        "responsibility": "Verify and deduplicate carrier callbacks into standard delivery events."
+      },
+      "node:platform": {
+        "label": "Events & operations",
+        "responsibility": "Share reliable business events, customer notifications and observability."
+      },
+      "node:messaging": {
+        "label": "Events & notifications",
+        "responsibility": "Distribute business state changes and notify customers."
+      },
+      "node:event_bus": {
+        "label": "Business event bus",
+        "responsibility": "Partition and distribute payment, picking and delivery events by order."
+      },
+      "node:notification": {
+        "label": "Notification service",
+        "responsibility": "Select templates, deduplicate and schedule customer notifications."
+      },
+      "node:email": {
+        "label": "Email provider",
+        "responsibility": "Send transactional email and report delivery or bounce outcomes."
+      },
+      "node:operations": {
+        "label": "Monitoring & alerts",
+        "responsibility": "Combine service signals and surface payment and fulfillment anomalies."
+      },
+      "node:telemetry": {
+        "label": "Telemetry collector",
+        "responsibility": "Collect checkout, payment and shipping traces and metrics; remove sensitive data."
+      },
+      "node:metrics": {
+        "label": "Metrics store",
+        "responsibility": "Store success rates, authorization latency and fulfillment backlog time series."
+      },
+      "node:alerts": {
+        "label": "Alert service",
+        "responsibility": "Query metrics and escalate delayed payments, shortages and delivery anomalies."
+      }
+    },
+    "relationship_types": {
+      "瀏覽與查詢訂單 · HTTPS": "Browse and query orders · HTTPS",
+      "開啟結帳 · UI": "Open checkout · UI",
+      "讀寫工作階段 · Redis": "Read and write sessions · Redis",
+      "查詢可售量 · HTTPS": "Query available stock · HTTPS",
+      "查詢訂單進度 · HTTPS": "Query order progress · HTTPS",
+      "確認購買 · HTTPS": "Confirm purchase · HTTPS",
+      "轉交結帳 · HTTPS": "Forward checkout · HTTPS",
+      "檢查交易風險 · RPC": "Evaluate transaction risk · RPC",
+      "保留庫存 · HTTPS": "Reserve inventory · HTTPS",
+      "建立待付款訂單 · HTTPS": "Create unpaid order · HTTPS",
+      "請求付款授權 · HTTPS": "Request authorization · HTTPS",
+      "寫入訂單與 outbox · SQL": "Write order and outbox · SQL",
+      "讀取未發佈事件 · SQL": "Read unpublished events · SQL",
+      "發佈訂單狀態 · Event": "Publish order status · Event",
+      "授權或退款 · HTTPS": "Authorize or refund · HTTPS",
+      "付款結果 · Webhook": "Payment outcome · Webhook",
+      "追加付款流水 · SQL": "Append payment entry · SQL",
+      "確認付款結果 · HTTPS": "Confirm payment result · HTTPS",
+      "發佈付款結果 · Event": "Publish payment result · Event",
+      "保留或扣減數量 · SQL": "Reserve or debit stock · SQL",
+      "下發揀貨單 · HTTPS": "Issue pick list · HTTPS",
+      "回報揀貨結果 · Webhook": "Report picking result · Webhook",
+      "發佈揀貨或缺貨結果 · Event": "Publish stock outcome · Event",
+      "配送完成或取消 · Event": "Delivery or cancellation · Event",
+      "已付款與可出庫訂單 · Event": "Paid orders ready to ship · Event",
+      "取得揀貨狀態 · HTTPS": "Read picking status · HTTPS",
+      "建立託運單 · HTTPS": "Create shipment · HTTPS",
+      "物流進度 · Webhook": "Delivery progress · Webhook",
+      "發佈配送狀態 · Event": "Publish delivery status · Event",
+      "回填配送狀態 · Event": "Update delivery status · Event",
+      "觸發顧客通知 · Event": "Trigger notification · Event",
+      "寄送交易郵件 · HTTPS": "Send transaction email · HTTPS",
+      "投遞或退信結果 · Webhook": "Delivery or bounce · Webhook",
+      "讀取通知用訂單摘要 · HTTPS": "Read order summary · HTTPS",
+      "送出請求追蹤 · OTLP": "Request traces · OTLP",
+      "送出結帳延遲 · OTLP": "Checkout latency · OTLP",
+      "送出授權指標 · OTLP": "Authorization metrics · OTLP",
+      "送出履約指標 · OTLP": "Fulfillment metrics · OTLP",
+      "送出消費積壓指標 · OTLP": "Consumer backlog · OTLP",
+      "寫入時間序列 · Remote write": "Write time series · Remote write",
+      "查詢告警門檻 · Query": "Query alert threshold · Query",
+      "送交營運告警 · HTTPS": "Escalate operations alert · HTTPS"
+    },
+    "journeys": [
+      "Checkout & payment",
+      "Shipment & notification",
+      "Payment exception monitoring"
+    ]
+  },
+  "4a36e5171628c9bf074906e24a07c7ebb1a731bde1f2816df0060400254ec19c": {
+    "sample_id": "02-ai-workspace",
+    "title": "Collaborative AI workspace",
+    "subtitle": "Shared knowledge. Controlled execution.",
+    "nodes": {
+      "node:entry": {
+        "label": "Access & identity",
+        "responsibility": "Unify application entry, rate limits and enterprise sign-in."
+      },
+      "node:web": {
+        "label": "Workspace client",
+        "responsibility": "Display projects, documents and AI jobs through the shared gateway; guide enterprise sign-in."
+      },
+      "node:gateway": {
+        "label": "Application gateway",
+        "responsibility": "Validate sessions, route requests and atomically enforce tenant rate and job quotas."
+      },
+      "node:auth_broker": {
+        "label": "Identity broker",
+        "responsibility": "Handle sign-in, verify identity claims and establish tenant member sessions."
+      },
+      "node:idp": {
+        "label": "Enterprise identity",
+        "responsibility": "Authenticate enterprise users with MFA and issue verifiable identity claims."
+      },
+      "node:collaboration": {
+        "label": "Projects & collaboration",
+        "responsibility": "Maintain project knowledge, shared editing and collaborator activity."
+      },
+      "node:project": {
+        "label": "Projects & documents",
+        "responsibility": "Store project membership, work state and document revisions; publish activity."
+      },
+      "node:project_api": {
+        "label": "Project service",
+        "responsibility": "Manage members, tasks and file indexes while enforcing tenant isolation."
+      },
+      "node:metadata_db": {
+        "label": "Project database",
+        "responsibility": "Store authoritative project, role, task and document metadata versions."
+      },
+      "node:activity_bus": {
+        "label": "Activity event bus",
+        "responsibility": "Partition task, document and AI job state changes by project."
+      },
+      "node:editor": {
+        "label": "Document editor",
+        "responsibility": "Show shared documents, cursors and revision hints; submit edits and receive remote changes."
+      },
+      "node:document_service": {
+        "label": "Document service",
+        "responsibility": "Authorize documents, merge edits and preserve traceable revisions."
+      },
+      "node:doc_store": {
+        "label": "Document storage",
+        "responsibility": "Store snapshots, operations and authorized attachments for restore and knowledge indexing."
+      },
+      "node:realtime": {
+        "label": "Realtime sync",
+        "responsibility": "Deliver accepted updates to collaborators who are currently online."
+      },
+      "node:sync_service": {
+        "label": "Sync & presence",
+        "responsibility": "Distribute versioned activity updates and manage expiring connection, cursor and subscription leases."
+      },
+      "node:websocket": {
+        "label": "Realtime gateway",
+        "responsibility": "Maintain authenticated bidirectional connections for edits, cursors and job progress."
+      },
+      "node:ai": {
+        "label": "AI orchestration",
+        "responsibility": "Schedule traceable AI work using permissions, context and review decisions."
+      },
+      "node:jobs": {
+        "label": "Scheduling & governance",
+        "responsibility": "Accept jobs, apply tenant quotas, enforce policy and preserve review and execution evidence."
+      },
+      "node:job_api": {
+        "label": "AI job API",
+        "responsibility": "Accept instructions and explicit context; create job identities and expose progress."
+      },
+      "node:job_queue": {
+        "label": "Job queue",
+        "responsibility": "Reliably retain pending jobs, retry counts and cancellation signals."
+      },
+      "node:scheduler": {
+        "label": "Job scheduler",
+        "responsibility": "Dispatch jobs by quota, tenant and state while preventing duplicate execution."
+      },
+      "node:policy_engine": {
+        "label": "Policy engine",
+        "responsibility": "Evaluate tenant, data classification and action risk to allow, block or request review."
+      },
+      "node:approval_service": {
+        "label": "Human review",
+        "responsibility": "Hold pending proposals and record authenticated decisions before releasing approved steps."
+      },
+      "node:run_store": {
+        "label": "Run evidence store",
+        "responsibility": "Preserve job state, context versions, tool results, provider usage and review links."
+      },
+      "node:execution": {
+        "label": "Controlled execution",
+        "responsibility": "Run agents, authorized tools and external model requests."
+      },
+      "node:agent_worker": {
+        "label": "Agent worker",
+        "responsibility": "Execute work using authorized context and record tool results and actual model usage."
+      },
+      "node:tool_gateway": {
+        "label": "Tool gateway",
+        "responsibility": "Validate each tool call's scope and permission before forwarding project or document actions."
+      },
+      "node:model_gateway": {
+        "label": "Model provider",
+        "responsibility": "Receive approved prompts and return model output with actual provider usage."
+      },
+      "node:data": {
+        "label": "Knowledge & analytics",
+        "responsibility": "Turn documents into searchable knowledge and project usage analytics."
+      },
+      "node:ingest": {
+        "label": "Knowledge ingestion",
+        "responsibility": "Read accepted revisions, chunk content and synchronize search and source attachments."
+      },
+      "node:vector_index": {
+        "label": "Vector index",
+        "responsibility": "Store searchable content and citations with tenant, document permission and version boundaries."
+      },
+      "node:stream_processor": {
+        "label": "Activity processor",
+        "responsibility": "Deduplicate collaboration and job events and calculate tenant aggregates."
+      },
+      "node:analytics_warehouse": {
+        "label": "Analytics warehouse",
+        "responsibility": "Store anonymized activity, job duration and model usage reporting data."
+      },
+      "node:report_api": {
+        "label": "Reporting API",
+        "responsibility": "Return tenant usage trends, job success rates and cost summaries by period."
+      },
+      "node:trust": {
+        "label": "Trust & operations",
+        "responsibility": "Provide cross-service telemetry, immutable audits and protected keys."
+      },
+      "node:otel": {
+        "label": "Telemetry & alerts",
+        "responsibility": "Collect redacted gateway, sync and agent signals; detect abnormal usage and publish workspace alerts."
+      },
+      "node:metrics": {
+        "label": "Service metrics",
+        "responsibility": "Store error rates, queue waits, sync latency and model usage metrics."
+      },
+      "node:audit_writer": {
+        "label": "Audit writer",
+        "responsibility": "Append request-linked sign-in, tool authorization and human review events."
+      },
+      "node:audit_store": {
+        "label": "Immutable audit log",
+        "responsibility": "Retain tenant actions, review decisions and integrity digests under retention policy."
+      },
+      "node:key_store": {
+        "label": "Key management",
+        "responsibility": "Provide permission-controlled, rotated encryption, signing and service credential references."
+      }
+    },
+    "relationship_types": {
+      "操作專案與 AI 工作 · HTTPS": "Manage projects and AI jobs · HTTPS",
+      "提交登入往返 · HTTPS": "Submit sign-in exchange · HTTPS",
+      "驗證企業身分 · OIDC": "Verify enterprise identity · OIDC",
+      "驗證工作階段 · RPC": "Validate session · RPC",
+      "查詢與管理專案 · HTTPS": "Query and manage projects · HTTPS",
+      "提交 AI 工作 · HTTPS": "Submit AI job · HTTPS",
+      "查詢使用報表 · HTTPS": "Query usage reports · HTTPS",
+      "開啟專案文件 · UI": "Open project document · UI",
+      "提交文件操作 · HTTPS": "Submit document edits · HTTPS",
+      "連線並接收增量 · WebSocket": "Connect and receive updates · WebSocket",
+      "檢查文件成員權限 · RPC": "Check document membership · RPC",
+      "保存文件修訂 · SQL": "Save document revision · SQL",
+      "發佈文件修訂 · Event": "Publish document revision · Event",
+      "保存專案與任務 · SQL": "Save projects and tasks · SQL",
+      "發佈專案活動 · Event": "Publish project activity · Event",
+      "分发文件與工作進度 · Event": "Distribute edits and progress · Event",
+      "續租連線與游標 · Redis": "Renew connection and cursor · Redis",
+      "推送已接受的更新 · Stream": "Push accepted updates · Stream",
+      "驗證連線身分 · RPC": "Authenticate connection · RPC",
+      "確認工作與上下文歸屬 · RPC": "Verify job and context scope · RPC",
+      "檢查提交權限 · RPC": "Check submission permission · RPC",
+      "加入待執行工作 · Queue": "Enqueue job · Queue",
+      "建立工作記錄 · SQL": "Create job record · SQL",
+      "交付待排工作 · Queue": "Deliver pending job · Queue",
+      "取得租戶執行配額 · Redis": "Get tenant execution quota · Redis",
+      "派送可執行工作 · RPC": "Dispatch executable job · RPC",
+      "檢查每一步驟 · RPC": "Check each step · RPC",
+      "檢索授權知識 · Search": "Search authorized knowledge · Search",
+      "請求模型推論與用量 · HTTPS": "Request inference and usage · HTTPS",
+      "請求受控工具動作 · RPC": "Request controlled action · RPC",
+      "驗證工具範圍 · RPC": "Validate tool scope · RPC",
+      "執行獲准任務操作 · HTTPS": "Execute approved task action · HTTPS",
+      "讀取獲准文件修訂 · HTTPS": "Read approved revision · HTTPS",
+      "建立待審高風險動作 · HTTPS": "Request high-risk review · HTTPS",
+      "提交明確審查決定 · HTTPS": "Submit explicit decision · HTTPS",
+      "釋放核准工作步驟 · Event": "Release approved step · Event",
+      "關聯審查與工作證據 · SQL": "Link review and run evidence · SQL",
+      "保存結果與真實用量 · SQL": "Save results and actual usage · SQL",
+      "發佈工作進度 · Event": "Publish job progress · Event",
+      "通知已接受文件修訂 · Event": "Notify accepted revision · Event",
+      "讀取指定文件版本 · SQL": "Read pinned revision · SQL",
+      "保存或讀取附件 · S3": "Read or store attachments · S3",
+      "更新版本化知識索引 · Upsert": "Update versioned index · Upsert",
+      "讀取授權附件 · S3": "Read authorized attachment · S3",
+      "交付協作與工作事件 · Event": "Deliver activity events · Event",
+      "寫入去重彙總 · SQL": "Write deduplicated aggregates · SQL",
+      "查詢租戶使用趨勢 · SQL": "Query tenant usage · SQL",
+      "對帳工作用量 · SQL": "Reconcile run usage · SQL",
+      "送出 API 追蹤 · OTLP": "API traces · OTLP",
+      "送出同步延遲 · OTLP": "Sync latency · OTLP",
+      "送出工作耗時與用量 · OTLP": "Job duration and usage · OTLP",
+      "送出排程水位 · OTLP": "Scheduler capacity · OTLP",
+      "寫入服務時間序列 · Remote write": "Write service time series · Remote write",
+      "查詢異常門檻 · Query": "Query anomaly thresholds · Query",
+      "發佈工作區營運告警 · Event": "Publish operations alert · Event",
+      "記錄登入決策 · Event": "Record sign-in decision · Event",
+      "記錄工具授權 · Event": "Record tool authorization · Event",
+      "記錄人工審查 · Event": "Record human review · Event",
+      "追加不可覆寫記錄 · Append": "Append immutable record · Append",
+      "簽章稽核摘要 · KMS": "Sign audit digest · KMS",
+      "取得簽章能力 · KMS": "Access signing capability · KMS",
+      "引用模型服務憑證 · KMS": "Reference model credential · KMS",
+      "執行附件加密 · KMS": "Encrypt attachments · KMS"
+    },
+    "journeys": [
+      "Enterprise sign-in to AI execution",
+      "Document editing to realtime sync",
+      "High-risk tool to human review"
+    ]
+  },
+  "ce5551f7ec816d8b1ba3d162241de944cbeda4f2ebf8ce6b6744da4d60804a80": {
+    "sample_id": "03-manufacturing",
+    "title": "Connected manufacturing",
+    "subtitle": "From customer demand to factory delivery.",
+    "nodes": {
+      "node:business": {
+        "label": "Product & demand",
+        "responsibility": "Turn customer orders, engineering definitions and forecasts into manufacturing inputs."
+      },
+      "node:order_intake": {
+        "label": "Customer orders",
+        "responsibility": "Validate customers and product revisions, accept quantity and due-date requirements, and report progress."
+      },
+      "node:order_book": {
+        "label": "Order book",
+        "responsibility": "Store quantities, promised dates, product revisions and delivery status."
+      },
+      "node:bom_service": {
+        "label": "Product engineering",
+        "responsibility": "Resolve revisions, BOM quantities and substitutions; author controlled engineering changes."
+      },
+      "node:revision_store": {
+        "label": "Engineering revisions",
+        "responsibility": "Retain accepted product versions, process definitions and BOM snapshots."
+      },
+      "node:forecast_engine": {
+        "label": "Demand planning",
+        "responsibility": "Combine orders and delivery history into versioned period demand; review forecast differences."
+      },
+      "node:demand_store": {
+        "label": "Demand plans",
+        "responsibility": "Store confirmed demand versions, periods and product quantities."
+      },
+      "node:planning": {
+        "label": "Supply & production",
+        "responsibility": "Turn demand, supply conditions and capacity constraints into purchasing and production plans."
+      },
+      "node:mrp": {
+        "label": "Material planning",
+        "responsibility": "Calculate net demand, shortages and substitutions; create traceable, deduplicated purchase requirements."
+      },
+      "node:material_plan": {
+        "label": "Material plans",
+        "responsibility": "Store calculation versions, net demand, expected arrivals and shortages."
+      },
+      "node:procurement": {
+        "label": "Procurement",
+        "responsibility": "Coordinate purchase requests, supplier commitments, shipment notices and supply exceptions with ERP."
+      },
+      "node:erp": {
+        "label": "Enterprise ERP",
+        "responsibility": "Maintain official purchase orders, suppliers, financial postings and delivery commitments."
+      },
+      "node:scheduler": {
+        "label": "Production scheduler",
+        "responsibility": "Solve material, equipment, changeover and due-date constraints; publish versioned production sequences."
+      },
+      "node:production_plan": {
+        "label": "Production plans",
+        "responsibility": "Store accepted batch sequences, stations, time windows and plan versions."
+      },
+      "node:factory": {
+        "label": "Factory & quality",
+        "responsibility": "Translate schedules into work orders, equipment tasks and traceable quality outcomes."
+      },
+      "node:mes_dispatch": {
+        "label": "Manufacturing execution",
+        "responsibility": "Create work orders and operator instructions; dispatch tasks and collect quantity, duration and exception results."
+      },
+      "node:work_order": {
+        "label": "Work orders",
+        "responsibility": "Store batches, operations, material lots, actual results and work-order versions."
+      },
+      "node:edge_gateway": {
+        "label": "Factory edge gateway",
+        "responsibility": "Map work orders to equipment tasks, collect status and isolate factory connections from the platform."
+      },
+      "node:plc": {
+        "label": "Line & robot control",
+        "responsibility": "Execute local equipment sequences and robot tasks with interlocks; report cycles, completion and faults."
+      },
+      "node:quality_gate": {
+        "label": "Quality inspection",
+        "responsibility": "Combine vision and process evidence to release, rework or quarantine batches."
+      },
+      "node:quality_store": {
+        "label": "Quality records",
+        "responsibility": "Preserve lot identifiers, inspection evidence, release outcomes and rework links."
+      },
+      "node:logistics": {
+        "label": "Warehouse & logistics",
+        "responsibility": "Receive materials, replenish production lines and deliver released finished goods."
+      },
+      "node:wms": {
+        "label": "Warehouse service",
+        "responsibility": "Manage receipt, locations, reservations and dispatch; reconcile arrivals and record material lots."
+      },
+      "node:inventory_ledger": {
+        "label": "Lot inventory ledger",
+        "responsibility": "Track material and finished-goods lots, locations, reservations and movements."
+      },
+      "node:agv_controller": {
+        "label": "Material transport",
+        "responsibility": "Coordinate approved vehicle tasks and line delivery; track location, loads and completion."
+      },
+      "node:line_buffer": {
+        "label": "Lineside inventory",
+        "responsibility": "Store station arrivals, replenishment needs and material-lot usage."
+      },
+      "node:shipping": {
+        "label": "Outbound shipping",
+        "responsibility": "Verify release and due dates, arrange picking and carrier routes, and update customer orders."
+      },
+      "node:carrier": {
+        "label": "Logistics carriers",
+        "responsibility": "Accept finished-goods transport and report pickup, transit and delivery."
+      },
+      "node:digital": {
+        "label": "Industrial data & twin",
+        "responsibility": "Combine factory facts into equipment state, simulation and traceability analytics."
+      },
+      "node:stream_ingest": {
+        "label": "Industrial event pipeline",
+        "responsibility": "Validate device identity, time and sequence; deduplicate equipment, work-order and quality facts with source versions."
+      },
+      "node:twin_engine": {
+        "label": "Asset digital twin",
+        "responsibility": "Map process events to equipment and line state; retain asset identity, station relationships and capability versions."
+      },
+      "node:simulation": {
+        "label": "Capacity simulation",
+        "responsibility": "Evaluate bottlenecks and changeovers against equipment state for scheduling decisions."
+      },
+      "node:data_lake": {
+        "label": "Industrial data platform",
+        "responsibility": "Store partitioned process time series and production and quality analytics with source identity and retention."
+      },
+      "node:bi": {
+        "label": "Manufacturing analytics",
+        "responsibility": "Explore yield, delivery, equipment efficiency and shortages back to original lots."
+      },
+      "node:operations": {
+        "label": "Device trust & operations",
+        "responsibility": "Connect independent device identity, local safety and platform monitoring responsibilities."
+      },
+      "node:device_identity": {
+        "label": "Device identity",
+        "responsibility": "Verify device registration, leases and revocation; issue and rotate device certificates."
+      },
+      "node:key_vault": {
+        "label": "Factory key vault",
+        "responsibility": "Protect signing keys and provide auditable device-trust cryptographic operations."
+      },
+      "node:interlock": {
+        "label": "Local safety interlock",
+        "responsibility": "Execute predefined interlocks on locally certified safety equipment, independently of cloud analytics."
+      },
+      "node:incident": {
+        "label": "Safety & incidents",
+        "responsibility": "Collect safety signals, retain owners and recovery conditions, and notify manufacturing execution."
+      },
+      "node:telemetry": {
+        "label": "Operations telemetry",
+        "responsibility": "Collect service signals, track errors and backlog, and create source-linked incidents for threshold breaches."
+      }
+    },
+    "relationship_types": {
+      "保存訂單需求 · SQL": "Save order demand · SQL",
+      "驗證產品修訂 · RPC": "Validate product revision · RPC",
+      "保存及讀取工程版本 · SQL": "Read and save engineering revision · SQL",
+      "讀取確認訂單 · SQL": "Read confirmed orders · SQL",
+      "保存需求計畫 · SQL": "Save demand plan · SQL",
+      "取得歷史交付彙總 · Query": "Get delivery history · Query",
+      "讀取指定需求版本 · SQL": "Read demand version · SQL",
+      "展開物料用量 · RPC": "Expand material quantities · RPC",
+      "查詢可用庫存 · HTTPS": "Query available inventory · HTTPS",
+      "保存淨需求與缺料 · SQL": "Save net demand and shortages · SQL",
+      "讀取缺料計畫 · SQL": "Read shortage plan · SQL",
+      "提交採購需求 · HTTPS": "Submit purchase requirement · HTTPS",
+      "建立正式採購單 · HTTPS": "Create purchase order · HTTPS",
+      "回報採購及供貨承諾 · Event": "Report supply commitments · Event",
+      "回填預計到貨 · SQL": "Update expected arrivals · SQL",
+      "發送到貨預告 · Event": "Send arrival notice · Event",
+      "讀取可用物料時窗 · SQL": "Read material availability · SQL",
+      "讀取交付需求 · SQL": "Read delivery demand · SQL",
+      "評估產能與換線方案 · RPC": "Evaluate capacity and changeovers · RPC",
+      "保存核准排程版本 · SQL": "Save approved schedule · SQL",
+      "發佈生產計畫 · Event": "Publish production plan · Event",
+      "讀取指定排程 · SQL": "Read pinned schedule · SQL",
+      "建立工單與實績 · SQL": "Create work orders and results · SQL",
+      "取得工藝及物料版本 · RPC": "Get process and material revision · RPC",
+      "下發核准設備任務 · 工廠協定": "Dispatch approved equipment task · Factory protocol",
+      "轉交既定產線任務 · OPC UA": "Forward line task · OPC UA",
+      "回報週期及故障 · OPC UA": "Report cycles and faults · OPC UA",
+      "回填工序執行結果 · Event": "Report execution results · Event",
+      "提交批次檢測需求 · HTTPS": "Request batch inspection · HTTPS",
+      "保存缺陷證據 · SQL": "Save defect evidence · SQL",
+      "保存放行或隔離結果 · SQL": "Save release or quarantine · SQL",
+      "回報放行或返工 · Event": "Report release or rework · Event",
+      "通知可出貨批次 · Event": "Notify released batches · Event",
+      "記錄批次庫存移動 · SQL": "Record lot movement · SQL",
+      "確認到貨或差異 · Event": "Confirm arrival or variance · Event",
+      "保留工單所需物料 · HTTPS": "Reserve work-order materials · HTTPS",
+      "請求工站補料 · HTTPS": "Request station replenishment · HTTPS",
+      "確認取料儲位 · HTTPS": "Confirm pickup location · HTTPS",
+      "更新到線物料狀態 · State": "Update lineside material state · State",
+      "確認批號已到工站 · Query": "Verify lot at station · Query",
+      "回報物料消耗與成品入庫 · Event": "Report consumption and receipt · Event",
+      "驗證批次放行證據 · SQL": "Verify batch release · SQL",
+      "請求成品揀貨與出庫 · HTTPS": "Request picking and dispatch · HTTPS",
+      "委託成品運輸 · HTTPS": "Arrange finished-goods transport · HTTPS",
+      "回報取貨與簽收 · Webhook": "Report pickup and delivery · Webhook",
+      "回填交付狀態 · Event": "Update delivery status · Event",
+      "發佈設備狀態與實績 · MQTT": "Publish device state and results · MQTT",
+      "發佈批次品質結果 · MQTT": "Publish batch quality · MQTT",
+      "寫入去重時間序列 · Write": "Write deduplicated time series · Write",
+      "更新產線即時狀態 · Event": "Update live line state · Event",
+      "讀取設備歷史狀態 · Query": "Read equipment history · Query",
+      "取得版本化設備模型 · RPC": "Get versioned equipment model · RPC",
+      "通知設備可用性改變 · Event": "Notify availability change · Event",
+      "擷取製程事實 · Query": "Extract process facts · Query",
+      "擷取工單實績 · SQL": "Extract work-order results · SQL",
+      "擷取品質與批號證據 · SQL": "Extract quality and lot evidence · SQL",
+      "寫入追溯分析分區 · S3": "Write traceability partition · S3",
+      "查詢良率與交付分析 · SQL": "Query yield and delivery · SQL",
+      "檢視產線當前狀態 · HTTPS": "View current line state · HTTPS",
+      "驗證裝置註冊與租約 · mTLS": "Verify device registration and lease · mTLS",
+      "驗證設備主題權限 · RPC": "Authorize device topic · RPC",
+      "核對設備資產歸屬 · SQL": "Verify asset ownership · SQL",
+      "簽發裝置憑證 · KMS": "Issue device certificate · KMS",
+      "輪替設備憑證 · mTLS": "Rotate device certificate · mTLS",
+      "回報現場互鎖輸入 · 安全匯流排": "Report interlock inputs · Safety bus",
+      "執行本地互鎖結果 · 安全匯流排": "Apply local interlock result · Safety bus",
+      "回報互鎖狀態 · 唯讀遙測": "Report interlock state · Read-only telemetry",
+      "通知異常與恢復条件 · Event": "Notify anomaly and recovery · Event",
+      "發佈安全狀態摘要 · MQTT": "Publish safety summary · MQTT",
+      "送出排程耗時 · OTLP": "Scheduling duration · OTLP",
+      "送出工單服務指標 · OTLP": "Work-order service metrics · OTLP",
+      "送出庫存服務指標 · OTLP": "Inventory service metrics · OTLP",
+      "送出資料延遲與積壓 · OTLP": "Pipeline latency and backlog · OTLP",
+      "送出裝置驗證指標 · OTLP": "Device authentication metrics · OTLP",
+      "建立具來源的營運事件 · Event": "Create source-linked incident · Event",
+      "通知工站待處理事件 · UI notification": "Notify station incident · UI notification"
+    },
+    "journeys": [
+      "Schedule to factory execution",
+      "Quality release to delivery",
+      "Equipment feedback to digital twin"
+    ]
+  }
+}

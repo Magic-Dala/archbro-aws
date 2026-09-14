@@ -1,0 +1,1013 @@
+{
+  "schema": "archbro.reference-project.v1",
+  "sample_id": "02-ai-workspace",
+  "corpus_version": 1,
+  "source_requirement": "設計多租戶協作與 AI 工作平台。企業使用者登入後管理專案並共同編輯文件；文件修訂透過即時連線同步，並更新權限感知知識索引。AI 工作經配額排程，代理使用具明確範圍的文件與工具，呼叫真實外部模型並保存用量。高風險動作必須等待人工審查。共同保留租戶隔離、工作證據、不可覆寫稽核、金鑰管理、營運監控與使用分析。用五個責任域、三層階層表達跨域資料與控制流，不讓治理或監控成為孤立裝飾。 固定 v1 視圖把入口、知識與營運的細節直接放在責任域內；文件和 AI 執行保留第三層。相關快取及附件由所屬服務或儲存邊界負責。",
+  "expected_node_count": 40,
+  "expected_relationship_count": 63,
+  "scenarios": [
+    {
+      "name": "企業登入後執行 AI 工作",
+      "focus": "agent_worker",
+      "path": [
+        "web",
+        "gateway",
+        "job_api",
+        "job_queue",
+        "scheduler",
+        "agent_worker",
+        "model_gateway"
+      ],
+      "acceptance": "代理可看見政策、知識、工具、用量保存與外部模型邊界"
+    },
+    {
+      "name": "文件修訂到即時同步",
+      "focus": "document_service",
+      "path": [
+        "editor",
+        "document_service",
+        "activity_bus",
+        "sync_service",
+        "websocket"
+      ],
+      "acceptance": "同一修訂事件串起多人同步與知識擷取，資料庫責任清楚"
+    },
+    {
+      "name": "高風險工具到人工審查",
+      "focus": "approval_service",
+      "path": [
+        "agent_worker",
+        "tool_gateway",
+        "policy_engine",
+        "approval_service",
+        "audit_writer",
+        "audit_store"
+      ],
+      "acceptance": "人類決定、待審工作與不可覆寫稽核有明確關聯"
+    }
+  ],
+  "payload": {
+    "name": "參考樣本 02｜協作與 AI 工作平台 · v1",
+    "goal": "設計多租戶協作與 AI 工作平台。企業使用者登入後管理專案並共同編輯文件；文件修訂透過即時連線同步，並更新權限感知知識索引。AI 工作經配額排程，代理使用具明確範圍的文件與工具，呼叫真實外部模型並保存用量。高風險動作必須等待人工審查。共同保留租戶隔離、工作證據、不可覆寫稽核、金鑰管理、營運監控與使用分析。用五個責任域、三層階層表達跨域資料與控制流，不讓治理或監控成為孤立裝飾。 固定 v1 視圖把入口、知識與營運的細節直接放在責任域內；文件和 AI 執行保留第三層。相關快取及附件由所屬服務或儲存邊界負責。",
+    "architecture_summary": "五個責任域共同完成企業登入、即時協作、受控 AI 工作、知識檢索及稽核；工作狀態事件同時驅動使用者畫面、索引與分析。",
+    "components": [
+      {
+        "id": "entry",
+        "name": "入口與身分",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "統一網頁入口、流量限制與企業登入邊界。",
+        "children": [
+          {
+            "id": "web",
+            "name": "工作區與登入前台",
+            "type": "UI",
+            "kind": "UI",
+            "status": "PLANNED",
+            "responsibility": "呈現專案、協作文檔與 AI 工作狀態，透過共用閘道存取服務。 內含登入頁面：引導使用者選擇企業登入並接收登入完成或失敗結果。"
+          },
+          {
+            "id": "gateway",
+            "name": "應用閘道與租戶配額",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "驗證使用者工作階段、套用流量限制並路由至專案與 AI 服務。 內含租戶配額快取：保存每租戶的請求速率與工作配額計數，支援原子限流。"
+          },
+          {
+            "id": "auth_broker",
+            "name": "身分整合服務",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "處理登入往返、驗證身分宣告並建立租戶成員工作階段。"
+          },
+          {
+            "id": "idp",
+            "name": "企業身分提供者",
+            "type": "EXTERNAL_SERVICE",
+            "kind": "EXTERNAL_SERVICE",
+            "status": "PLANNED",
+            "responsibility": "驗證企業使用者與多因素條件，簽發可驗證身分宣告。"
+          }
+        ]
+      },
+      {
+        "id": "collaboration",
+        "name": "專案與即時協作",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "維護專案知識、共同編輯與協作者活動。",
+        "children": [
+          {
+            "id": "project",
+            "name": "專案與文件管理",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "保存專案成員與工作狀態，發佈活動事件。 承接編輯並保存文件修訂。",
+            "children": [
+              {
+                "id": "project_api",
+                "name": "專案服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "管理專案成員、任務與檔案索引，確認租戶資料隔離。"
+              },
+              {
+                "id": "metadata_db",
+                "name": "專案資料庫",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "保存專案、成員角色、任務與文件中繼資料的權威版本。"
+              },
+              {
+                "id": "activity_bus",
+                "name": "協作活動匯流排",
+                "type": "INFRASTRUCTURE",
+                "kind": "INFRASTRUCTURE",
+                "status": "PLANNED",
+                "responsibility": "依專案分流任務、文件與 AI 工作的狀態變更。"
+              },
+              {
+                "id": "editor",
+                "name": "多人文件編輯器",
+                "type": "UI",
+                "kind": "UI",
+                "status": "PLANNED",
+                "responsibility": "呈現文件、游標與修訂提示，提交編輯操作並接收遠端更新。"
+              },
+              {
+                "id": "document_service",
+                "name": "文件服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "驗證文件權限、合併操作並保存可追蹤的修訂版本。"
+              },
+              {
+                "id": "doc_store",
+                "name": "文件修訂與附件庫",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "保存文件快照與操作記錄，供重建、還原與知識索引使用。 內含附件物件庫：保存文件附件與擷取原檔，以專案授權控制讀取。"
+              }
+            ]
+          },
+          {
+            "id": "realtime",
+            "name": "即時同步",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "把已接受的更新傳遞給目前在線的協作者。",
+            "children": [
+              {
+                "id": "sync_service",
+                "name": "即時同步與在線狀態服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "接收專案活動，依在線訂閱與文件版本分發增量更新。 內含在線狀態快取：保存使用者連線、游標與訂閱租約，到期自動移除。"
+              },
+              {
+                "id": "websocket",
+                "name": "即時連線閘道",
+                "type": "INFRASTRUCTURE",
+                "kind": "INFRASTRUCTURE",
+                "status": "PLANNED",
+                "responsibility": "維持已驗證的雙向連線，傳遞文件更新、游標及工作進度。"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ai",
+        "name": "AI 工作執行",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "依權限、上下文與審查結果排程可追蹤的 AI 工作。",
+        "children": [
+          {
+            "id": "jobs",
+            "name": "工作排程與治理",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "接受工作並按租戶配額調度。 執行政策、顯式人工審查與工作證據保存。",
+            "children": [
+              {
+                "id": "job_api",
+                "name": "AI 工作 API",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "接收使用者指令與明確上下文，建立工作識別並提供進度查詢。"
+              },
+              {
+                "id": "job_queue",
+                "name": "AI 工作佇列",
+                "type": "INFRASTRUCTURE",
+                "kind": "INFRASTRUCTURE",
+                "status": "PLANNED",
+                "responsibility": "可靠保存待執行工作、重試次數與取消訊號。"
+              },
+              {
+                "id": "scheduler",
+                "name": "工作排程器",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "依配額、租戶與工作狀態安排執行，避免重複派工。"
+              },
+              {
+                "id": "policy_engine",
+                "name": "執行政策服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "依租戶、資料等級及動作風險判定允許、阻擋或需要審查。"
+              },
+              {
+                "id": "approval_service",
+                "name": "人工審查服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "保留待審建議，接收具身分的審查決定並解鎖核准步驟。"
+              },
+              {
+                "id": "run_store",
+                "name": "工作證據庫",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "保存工作狀態、上下文版本、工具結果、模型用量及審查關聯。"
+              }
+            ]
+          },
+          {
+            "id": "execution",
+            "name": "受控執行",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "執行代理、工具呼叫及外部模型請求。",
+            "children": [
+              {
+                "id": "agent_worker",
+                "name": "代理執行器",
+                "type": "AGENT",
+                "kind": "AGENT",
+                "status": "PLANNED",
+                "responsibility": "取得授權上下文後逐步執行工作，保存工具結果與模型用量。"
+              },
+              {
+                "id": "tool_gateway",
+                "name": "工具授權閘道",
+                "type": "TOOL",
+                "kind": "TOOL",
+                "status": "PLANNED",
+                "responsibility": "驗證每次工具的範圍與許可，轉交文件或專案操作。"
+              },
+              {
+                "id": "model_gateway",
+                "name": "外部模型端點",
+                "type": "EXTERNAL_SERVICE",
+                "kind": "EXTERNAL_SERVICE",
+                "status": "PLANNED",
+                "responsibility": "接收已核准的提示內容並回傳模型輸出與真實用量。"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "data",
+        "name": "知識與分析",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "把文件變為可檢索知識，並產生專案使用分析。",
+        "children": [
+          {
+            "id": "ingest",
+            "name": "知識擷取服務",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "讀取已接受文件修訂，切分內容並同步檢索與原始附件。"
+          },
+          {
+            "id": "vector_index",
+            "name": "知識向量索引",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "依租戶、文件權限與版本保存可檢索內容及引用位置。"
+          },
+          {
+            "id": "stream_processor",
+            "name": "活動分析處理器",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "去重處理協作與工作事件，計算每租戶的彙總指標。"
+          },
+          {
+            "id": "analytics_warehouse",
+            "name": "分析資料倉",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存匿名化活動彙總、工作耗時與模型用量報表資料。"
+          },
+          {
+            "id": "report_api",
+            "name": "分析報表 API",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "依租戶與時間區間回傳使用趨勢、工作成功率及費用彙總。"
+          }
+        ]
+      },
+      {
+        "id": "trust",
+        "name": "營運與信任",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "提供跨域遙測、不可覆寫稽核與金鑰保護。",
+        "children": [
+          {
+            "id": "otel",
+            "name": "服務遙測與告警",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "接收閘道、同步與代理的追蹤及計量，遮蔽內容與身分敏感資料。 內含營運告警器：偵測服務水位與異常用量，將告警發佈至工作區活动。"
+          },
+          {
+            "id": "metrics",
+            "name": "服務指標庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "保存錯誤率、工作等待時間、同步延遲與模型用量指標。"
+          },
+          {
+            "id": "audit_writer",
+            "name": "稽核寫入服務",
+            "type": "SERVICE",
+            "kind": "SERVICE",
+            "status": "PLANNED",
+            "responsibility": "接收具請求關聯的登入、工具及審查事件，追加不可覆寫記錄。"
+          },
+          {
+            "id": "audit_store",
+            "name": "不可覆寫稽核庫",
+            "type": "DATA_STORE",
+            "kind": "DATA_STORE",
+            "status": "PLANNED",
+            "responsibility": "以保留政策保存租戶操作記錄、審查決定與完整性摘要。"
+          },
+          {
+            "id": "key_store",
+            "name": "金鑰管理服務",
+            "type": "INFRASTRUCTURE",
+            "kind": "INFRASTRUCTURE",
+            "status": "PLANNED",
+            "responsibility": "提供受權限與輪替政策管理的加密、簽章及外部服務憑證引用。"
+          }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "source": "web",
+        "target": "gateway",
+        "type": "操作專案與 AI 工作 · HTTPS"
+      },
+      {
+        "source": "web",
+        "target": "auth_broker",
+        "type": "提交登入往返 · HTTPS"
+      },
+      {
+        "source": "auth_broker",
+        "target": "idp",
+        "type": "驗證企業身分 · OIDC"
+      },
+      {
+        "source": "gateway",
+        "target": "auth_broker",
+        "type": "驗證工作階段 · RPC"
+      },
+      {
+        "source": "gateway",
+        "target": "project_api",
+        "type": "查詢與管理專案 · HTTPS"
+      },
+      {
+        "source": "gateway",
+        "target": "job_api",
+        "type": "提交 AI 工作 · HTTPS"
+      },
+      {
+        "source": "gateway",
+        "target": "report_api",
+        "type": "查詢使用報表 · HTTPS"
+      },
+      {
+        "source": "web",
+        "target": "editor",
+        "type": "開啟專案文件 · UI"
+      },
+      {
+        "source": "editor",
+        "target": "document_service",
+        "type": "提交文件操作 · HTTPS"
+      },
+      {
+        "source": "editor",
+        "target": "websocket",
+        "type": "連線並接收增量 · WebSocket"
+      },
+      {
+        "source": "document_service",
+        "target": "project_api",
+        "type": "檢查文件成員權限 · RPC"
+      },
+      {
+        "source": "document_service",
+        "target": "doc_store",
+        "type": "保存文件修訂 · SQL"
+      },
+      {
+        "source": "document_service",
+        "target": "activity_bus",
+        "type": "發佈文件修訂 · Event"
+      },
+      {
+        "source": "project_api",
+        "target": "metadata_db",
+        "type": "保存專案與任務 · SQL"
+      },
+      {
+        "source": "project_api",
+        "target": "activity_bus",
+        "type": "發佈專案活動 · Event"
+      },
+      {
+        "source": "activity_bus",
+        "target": "sync_service",
+        "type": "分发文件與工作進度 · Event"
+      },
+      {
+        "source": "websocket",
+        "target": "sync_service",
+        "type": "續租連線與游標 · Redis"
+      },
+      {
+        "source": "sync_service",
+        "target": "websocket",
+        "type": "推送已接受的更新 · Stream"
+      },
+      {
+        "source": "websocket",
+        "target": "auth_broker",
+        "type": "驗證連線身分 · RPC"
+      },
+      {
+        "source": "job_api",
+        "target": "project_api",
+        "type": "確認工作與上下文歸屬 · RPC"
+      },
+      {
+        "source": "job_api",
+        "target": "policy_engine",
+        "type": "檢查提交權限 · RPC"
+      },
+      {
+        "source": "job_api",
+        "target": "job_queue",
+        "type": "加入待執行工作 · Queue"
+      },
+      {
+        "source": "job_api",
+        "target": "run_store",
+        "type": "建立工作記錄 · SQL"
+      },
+      {
+        "source": "job_queue",
+        "target": "scheduler",
+        "type": "交付待排工作 · Queue"
+      },
+      {
+        "source": "scheduler",
+        "target": "gateway",
+        "type": "取得租戶執行配額 · Redis"
+      },
+      {
+        "source": "scheduler",
+        "target": "agent_worker",
+        "type": "派送可執行工作 · RPC"
+      },
+      {
+        "source": "agent_worker",
+        "target": "policy_engine",
+        "type": "檢查每一步驟 · RPC"
+      },
+      {
+        "source": "agent_worker",
+        "target": "vector_index",
+        "type": "檢索授權知識 · Search"
+      },
+      {
+        "source": "agent_worker",
+        "target": "model_gateway",
+        "type": "請求模型推論與用量 · HTTPS"
+      },
+      {
+        "source": "agent_worker",
+        "target": "tool_gateway",
+        "type": "請求受控工具動作 · RPC"
+      },
+      {
+        "source": "tool_gateway",
+        "target": "policy_engine",
+        "type": "驗證工具範圍 · RPC"
+      },
+      {
+        "source": "tool_gateway",
+        "target": "project_api",
+        "type": "執行獲准任務操作 · HTTPS"
+      },
+      {
+        "source": "tool_gateway",
+        "target": "document_service",
+        "type": "讀取獲准文件修訂 · HTTPS"
+      },
+      {
+        "source": "policy_engine",
+        "target": "approval_service",
+        "type": "建立待審高風險動作 · HTTPS"
+      },
+      {
+        "source": "web",
+        "target": "approval_service",
+        "type": "提交明確審查決定 · HTTPS"
+      },
+      {
+        "source": "approval_service",
+        "target": "scheduler",
+        "type": "釋放核准工作步驟 · Event"
+      },
+      {
+        "source": "approval_service",
+        "target": "run_store",
+        "type": "關聯審查與工作證據 · SQL"
+      },
+      {
+        "source": "agent_worker",
+        "target": "run_store",
+        "type": "保存結果與真實用量 · SQL"
+      },
+      {
+        "source": "agent_worker",
+        "target": "activity_bus",
+        "type": "發佈工作進度 · Event"
+      },
+      {
+        "source": "activity_bus",
+        "target": "ingest",
+        "type": "通知已接受文件修訂 · Event"
+      },
+      {
+        "source": "ingest",
+        "target": "doc_store",
+        "type": "讀取指定文件版本 · SQL"
+      },
+      {
+        "source": "ingest",
+        "target": "doc_store",
+        "type": "保存或讀取附件 · S3"
+      },
+      {
+        "source": "ingest",
+        "target": "vector_index",
+        "type": "更新版本化知識索引 · Upsert"
+      },
+      {
+        "source": "tool_gateway",
+        "target": "doc_store",
+        "type": "讀取授權附件 · S3"
+      },
+      {
+        "source": "activity_bus",
+        "target": "stream_processor",
+        "type": "交付協作與工作事件 · Event"
+      },
+      {
+        "source": "stream_processor",
+        "target": "analytics_warehouse",
+        "type": "寫入去重彙總 · SQL"
+      },
+      {
+        "source": "report_api",
+        "target": "analytics_warehouse",
+        "type": "查詢租戶使用趨勢 · SQL"
+      },
+      {
+        "source": "stream_processor",
+        "target": "run_store",
+        "type": "對帳工作用量 · SQL"
+      },
+      {
+        "source": "gateway",
+        "target": "otel",
+        "type": "送出 API 追蹤 · OTLP"
+      },
+      {
+        "source": "sync_service",
+        "target": "otel",
+        "type": "送出同步延遲 · OTLP"
+      },
+      {
+        "source": "agent_worker",
+        "target": "otel",
+        "type": "送出工作耗時與用量 · OTLP"
+      },
+      {
+        "source": "scheduler",
+        "target": "otel",
+        "type": "送出排程水位 · OTLP"
+      },
+      {
+        "source": "otel",
+        "target": "metrics",
+        "type": "寫入服務時間序列 · Remote write"
+      },
+      {
+        "source": "otel",
+        "target": "metrics",
+        "type": "查詢異常門檻 · Query"
+      },
+      {
+        "source": "otel",
+        "target": "activity_bus",
+        "type": "發佈工作區營運告警 · Event"
+      },
+      {
+        "source": "auth_broker",
+        "target": "audit_writer",
+        "type": "記錄登入決策 · Event"
+      },
+      {
+        "source": "tool_gateway",
+        "target": "audit_writer",
+        "type": "記錄工具授權 · Event"
+      },
+      {
+        "source": "approval_service",
+        "target": "audit_writer",
+        "type": "記錄人工審查 · Event"
+      },
+      {
+        "source": "audit_writer",
+        "target": "audit_store",
+        "type": "追加不可覆寫記錄 · Append"
+      },
+      {
+        "source": "audit_writer",
+        "target": "key_store",
+        "type": "簽章稽核摘要 · KMS"
+      },
+      {
+        "source": "auth_broker",
+        "target": "key_store",
+        "type": "取得簽章能力 · KMS"
+      },
+      {
+        "source": "agent_worker",
+        "target": "key_store",
+        "type": "引用模型服務憑證 · KMS"
+      },
+      {
+        "source": "doc_store",
+        "target": "key_store",
+        "type": "執行附件加密 · KMS"
+      }
+    ],
+    "tasks": [
+      {
+        "title": "固定情境 1：企業登入後執行 AI 工作（代理可看見政策、知識、工具、用量保存與外部模型邊界）",
+        "component": "agent_worker"
+      },
+      {
+        "title": "固定情境 2：文件修訂到即時同步（同一修訂事件串起多人同步與知識擷取，資料庫責任清楚）",
+        "component": "document_service"
+      },
+      {
+        "title": "固定情境 3：高風險工具到人工審查（人類決定、待審工作與不可覆寫稽核有明確關聯）",
+        "component": "approval_service"
+      }
+    ],
+    "planning_trace": {
+      "system_map_root_ids": [
+        "entry",
+        "collaboration",
+        "ai",
+        "data",
+        "trust"
+      ],
+      "scope_evaluations": [
+        {
+          "scope_component_id": "entry",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "web",
+            "gateway",
+            "auth_broker",
+            "idp"
+          ]
+        },
+        {
+          "scope_component_id": "web",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工作區與登入前台的邊界是：呈現專案、協作文檔與 AI 工作狀態，透過共用閘道存取服務。 內含登入頁面：引導使用者選擇企業登入並接收登入完成或失敗結果。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "gateway",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "應用閘道與租戶配額的邊界是：驗證使用者工作階段、套用流量限制並路由至專案與 AI 服務。 內含租戶配額快取：保存每租戶的請求速率與工作配額計數，支援原子限流。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "auth_broker",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "身分整合服務的邊界是：處理登入往返、驗證身分宣告並建立租戶成員工作階段。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "idp",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "企業身分提供者的邊界是：驗證企業使用者與多因素條件，簽發可驗證身分宣告。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "collaboration",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "project",
+            "realtime"
+          ]
+        },
+        {
+          "scope_component_id": "project",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "project_api",
+            "metadata_db",
+            "activity_bus",
+            "editor",
+            "document_service",
+            "doc_store"
+          ]
+        },
+        {
+          "scope_component_id": "project_api",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "專案服務的邊界是：管理專案成員、任務與檔案索引，確認租戶資料隔離。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "metadata_db",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "專案資料庫的邊界是：保存專案、成員角色、任務與文件中繼資料的權威版本。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "activity_bus",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "協作活動匯流排的邊界是：依專案分流任務、文件與 AI 工作的狀態變更。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "editor",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "多人文件編輯器的邊界是：呈現文件、游標與修訂提示，提交編輯操作並接收遠端更新。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "document_service",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "文件服務的邊界是：驗證文件權限、合併操作並保存可追蹤的修訂版本。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "doc_store",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "文件修訂與附件庫的邊界是：保存文件快照與操作記錄，供重建、還原與知識索引使用。 內含附件物件庫：保存文件附件與擷取原檔，以專案授權控制讀取。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "realtime",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "sync_service",
+            "websocket"
+          ]
+        },
+        {
+          "scope_component_id": "sync_service",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "即時同步與在線狀態服務的邊界是：接收專案活動，依在線訂閱與文件版本分發增量更新。 內含在線狀態快取：保存使用者連線、游標與訂閱租約，到期自動移除。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "websocket",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "即時連線閘道的邊界是：維持已驗證的雙向連線，傳遞文件更新、游標及工作進度。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "ai",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "jobs",
+            "execution"
+          ]
+        },
+        {
+          "scope_component_id": "jobs",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "job_api",
+            "job_queue",
+            "scheduler",
+            "policy_engine",
+            "approval_service",
+            "run_store"
+          ]
+        },
+        {
+          "scope_component_id": "job_api",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "AI 工作 API的邊界是：接收使用者指令與明確上下文，建立工作識別並提供進度查詢。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "job_queue",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "AI 工作佇列的邊界是：可靠保存待執行工作、重試次數與取消訊號。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "scheduler",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工作排程器的邊界是：依配額、租戶與工作狀態安排執行，避免重複派工。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "policy_engine",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "執行政策服務的邊界是：依租戶、資料等級及動作風險判定允許、阻擋或需要審查。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "approval_service",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "人工審查服務的邊界是：保留待審建議，接收具身分的審查決定並解鎖核准步驟。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "run_store",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工作證據庫的邊界是：保存工作狀態、上下文版本、工具結果、模型用量及審查關聯。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "execution",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "agent_worker",
+            "tool_gateway",
+            "model_gateway"
+          ]
+        },
+        {
+          "scope_component_id": "agent_worker",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "代理執行器的邊界是：取得授權上下文後逐步執行工作，保存工具結果與模型用量。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "tool_gateway",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工具授權閘道的邊界是：驗證每次工具的範圍與許可，轉交文件或專案操作。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "model_gateway",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "外部模型端點的邊界是：接收已核准的提示內容並回傳模型輸出與真實用量。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "data",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "ingest",
+            "vector_index",
+            "stream_processor",
+            "analytics_warehouse",
+            "report_api"
+          ]
+        },
+        {
+          "scope_component_id": "ingest",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "知識擷取服務的邊界是：讀取已接受文件修訂，切分內容並同步檢索與原始附件。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "vector_index",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "知識向量索引的邊界是：依租戶、文件權限與版本保存可檢索內容及引用位置。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "stream_processor",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "活動分析處理器的邊界是：去重處理協作與工作事件，計算每租戶的彙總指標。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "analytics_warehouse",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "分析資料倉的邊界是：保存匿名化活動彙總、工作耗時與模型用量報表資料。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "report_api",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "分析報表 API的邊界是：依租戶與時間區間回傳使用趨勢、工作成功率及費用彙總。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "trust",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "otel",
+            "metrics",
+            "audit_writer",
+            "audit_store",
+            "key_store"
+          ]
+        },
+        {
+          "scope_component_id": "otel",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "服務遙測與告警的邊界是：接收閘道、同步與代理的追蹤及計量，遮蔽內容與身分敏感資料。 內含營運告警器：偵測服務水位與異常用量，將告警發佈至工作區活动。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "metrics",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "服務指標庫的邊界是：保存錯誤率、工作等待時間、同步延遲與模型用量指標。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "audit_writer",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "稽核寫入服務的邊界是：接收具請求關聯的登入、工具及審查事件，追加不可覆寫記錄。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "audit_store",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "不可覆寫稽核庫的邊界是：以保留政策保存租戶操作記錄、審查決定與完整性摘要。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "key_store",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "金鑰管理服務的邊界是：提供受權限與輪替政策管理的加密、簽章及外部服務憑證引用。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        }
+      ],
+      "reconciled": true
+    },
+    "reasoning": "ArchBro 固定參考樣本 v1。依版本化需求人工編寫責任邊界、分解與互動，不呼叫付費模型。箭頭表示標示動作的發起者到接收者；包含關係由階層表達。這是長期比較用的假想專案，不是正式业务系統或使用者專案的架構批准。"
+  }
+}
