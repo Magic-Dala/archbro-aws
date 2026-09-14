@@ -235,8 +235,6 @@ A concise end-to-end demonstration can follow this path:
 7. Accept or reject the proposal as the human reviewer.
 8. Show that an accepted decision becomes part of the next request's context.
 
-The repository also contains a focused recording script in [`docs/DEMO.md`](docs/DEMO.md).
-
 ## Optional WebMCP interoperability
 
 Archbro exposes semantic browser-native Site Tools through:
@@ -427,24 +425,9 @@ tests/                          Contract, regression, and golden-flow coverage
 qa/                             Browser and live WebMCP acceptance harnesses
 docs/OWNERSHIP.md               Ownership and dependency rules
 docs/WEBMCP.md                  WebMCP contract and governance invariants
-docs/DEMO.md                    Concise end-to-end demo script
 docs/DEVELOPMENT.md             Local development guide
 docs/INFRASTRUCTURE.md          Deployment architecture and recovery instructions
 ```
-
-## Deployment
-
-A production-oriented `Dockerfile` listens on `$PORT` with a default of `8080`. GitHub Actions builds and deploys protected branches as isolated Compose stacks, each with its own PostgreSQL database.
-
-- **Public live application:** https://archbro-dev2.magicdala.com/
-- **Main stack:** `/opt/archbro/main`
-- **Development stack:** `/opt/archbro/dev`
-
-The application is exposed through Cloudflare Tunnel; the instance does not publish an application HTTP port directly. Environment files are installed separately and are never written into images or deployment workflows.
-
-`/healthz` is the liveness endpoint. It deliberately verifies process availability without touching persistence, preventing a transient database issue from causing a restart storm.
-
-The development `docker-compose.yml` must not be used as a production deployment file. Production uses the dedicated stack configuration under [`deploy/`](deploy/).
 
 ## Technical reference
 
@@ -454,7 +437,6 @@ The development `docker-compose.yml` must not be used as a production deployment
 - [Ownership and dependency rules](docs/OWNERSHIP.md)
 - [Project repository binding](docs/PROJECT_REPOSITORY_BINDING.md)
 - [Architecture Canvas design](docs/ARCHITECTURE_CANVAS_V2.md)
-- [Demo script](docs/DEMO.md)
 
 ## License
 
