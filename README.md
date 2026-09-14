@@ -1,6 +1,35 @@
-<div align="center">
+<p align="center">
+  <img src="frontend/web/archbro-logo.svg" width="80" alt="Archbro logo" />
+</p>
 
-# Archbro
+<h1 align="center">Archbro</h1>
+
+<p align="center">
+  <a href="https://github.com/Magic-Dala/archbro-aws/actions/workflows/ci.yml">
+    <img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=flat-square&amp;logo=githubactions&amp;logoColor=white" alt="GitHub Actions CI" />
+  </a>
+  <a href="https://www.python.org/">
+    <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3.11 or newer" />
+  </a>
+  <a href="https://fastapi.tiangolo.com/">
+    <img src="https://img.shields.io/badge/FastAPI-0.116%2B-009688?style=flat-square&amp;logo=fastapi&amp;logoColor=white" alt="FastAPI 0.116 or newer" />
+  </a>
+  <a href="https://strandsagents.com/">
+    <img src="https://img.shields.io/badge/Strands_Agents-1.53%2B-7C3AED?style=flat-square" alt="Strands Agents 1.53 or newer" />
+  </a>
+  <a href="https://www.postgresql.org/">
+    <img src="https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&amp;logo=postgresql&amp;logoColor=white" alt="PostgreSQL" />
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-2ea44f?style=flat-square" alt="MIT License" />
+  </a>
+</p>
+
+<p align="center">
+  <img src="docs/img/archbro-thumbnail.png" width="960" alt="Archbro product overview showing Living Architecture, project context, integrations, and human review" />
+</p>
+
+<div align="center">
 
 ### Humans guide. Agents reason. One shared project truth.
 
@@ -9,9 +38,6 @@
 [Live Demo](https://archbro-dev2.magicdala.com/) · [Demo Flow](#demo-flow) · [Quick Start](#quick-start) · [Technical Reference](#technical-reference)
 
 Built for the [Agents for Humans Hackathon](https://agentsforhumans.devpost.com/) — **Professional Agents**
-
-[![CI](https://github.com/Magic-Dala/archbro-aws/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Magic-Dala/archbro-aws/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 </div>
 
