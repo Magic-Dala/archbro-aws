@@ -1,87 +1,279 @@
-# Archbro
+<p align="center">
+  <img src="frontend/web/archbro-logo.svg" width="80" alt="Archbro logo" />
+</p>
 
-Archbro is a human-guided agentic project workspace where humans and AI agents share one living architecture, execution state, and review boundary.
+<h1 align="center">Archbro</h1>
 
-Instead of letting an agent guess the UI or maintain a separate plan, Archbro exposes semantic browser-native WebMCP Site Tools. The host agent can read current project reality, reason about architecture drift, submit a reviewable recommendation, and continue execution after a human decision.
+<p align="center">
+  <a href="https://github.com/Magic-Dala/archbro-aws/actions/workflows/ci.yml">
+    <img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=flat-square&amp;logo=githubactions&amp;logoColor=white" alt="GitHub Actions CI" />
+  </a>
+  <a href="https://www.python.org/">
+    <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3.11 or newer" />
+  </a>
+  <a href="https://fastapi.tiangolo.com/">
+    <img src="https://img.shields.io/badge/FastAPI-0.116%2B-009688?style=flat-square&amp;logo=fastapi&amp;logoColor=white" alt="FastAPI 0.116 or newer" />
+  </a>
+  <a href="https://strandsagents.com/">
+    <img src="https://img.shields.io/badge/Strands_Agents-1.53%2B-7C3AED?style=flat-square" alt="Strands Agents 1.53 or newer" />
+  </a>
+  <a href="https://www.postgresql.org/">
+    <img src="https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&amp;logo=postgresql&amp;logoColor=white" alt="PostgreSQL" />
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-2ea44f?style=flat-square" alt="MIT License" />
+  </a>
+</p>
 
-## Product loop
+<p align="center">
+  <img src="docs/img/archbro-thumbnail.png" width="960" alt="Archbro product overview showing Living Architecture, project context, integrations, and human review" />
+</p>
+
+<div align="center">
+
+### Humans guide. Agents reason. One shared project truth.
+
+**Archbro is a human-governed Strands agent that keeps software architecture, execution work, and implementation evidence aligned as a project changes. It completes the repetitive project-reasoning loop for engineering teams and pauses only when a consequential architecture decision needs human approval.**
+
+[Live Demo](https://archbro-dev2.magicdala.com/) · [Demo Flow](#demo-flow) · [Quick Start](#quick-start) · [Technical Reference](#technical-reference)
+
+Built for the [Agents for Humans Hackathon](https://agentsforhumans.devpost.com/) — **Professional Agents**
+
+</div>
+
+> **Competition scope:** Archbro's primary competition agent is the built-in agent implemented with the **Strands Agents SDK**. Browser-native WebMCP is an optional interoperability layer that lets external agents enter the same governed workspace; it does not replace the built-in Strands agent.
+
+## The problem
+
+AI can produce code quickly, but software teams repeatedly lose time rebuilding the context around that code:
+
+- What is the project trying to achieve?
+- Which architecture was actually approved?
+- Which tasks are active, blocked, or already complete?
+- Does the implementation still match the design?
+- Is a suggested change routine execution, or a consequential architecture decision?
+
+Those questions are judgment-heavy and recur every time a new developer or coding agent joins the work. The usual result is a collection of separate plans, stale diagrams, disconnected task lists, and architecture changes that are difficult to review after the fact.
+
+Archbro gives humans and agents one governed project workspace instead of another isolated chat or plan.
+
+## Who Archbro is for
+
+Archbro is designed for software engineering teams, technical founders, makers, and small product teams that already use AI agents but still need a reliable way to preserve project intent and human control.
+
+It is especially useful when multiple people or agents work on the same codebase and repeatedly need to understand the same architecture, evidence, tasks, and prior decisions.
+
+## What Archbro takes off the team's plate
+
+| Repetitive professional work | What Archbro does |
+| --- | --- |
+| Reconstruct project context | Loads the accepted goal, Living Architecture, tasks, observations, and decision history |
+| Check whether an answer is grounded | Reads project-scoped evidence only when the request actually needs it |
+| Turn discussion into execution | Creates and advances normal tasks through deterministic backend boundaries |
+| Compare design with implementation | Keeps human-approved Living Architecture separate from revision-pinned Code Architecture evidence |
+| Detect architecture drift | Produces a reviewable recommendation instead of silently rewriting project truth |
+| Preserve continuity | Makes accepted decisions and durable evidence available to the next request |
+
+## How Archbro works
 
 ```text
-Goal
--> Living Architecture
--> Tasks
--> Human / Agent Execution
--> Project Signals & Evidence
--> Agent Evaluation
--> Update or Architecture Proposal
--> Human Review for Consequential Changes
--> Reconciled Execution
+User request
+    ↓
+Load accepted project context
+    ↓
+Built-in Strands agent reasons about the request
+    ↓
+Read project-scoped evidence only when needed
+    ↓
+Validate the result against governance rules
+    ├── Grounded answer
+    ├── Allowed task or observation update
+    └── Pending architecture proposal
+             ↓
+       Human accept / reject
+             ↓
+Accepted change becomes context for the next request
 ```
 
-## WebMCP integration
+The important distinction is not simply that Archbro can call tools. It understands three different outcomes:
 
-The WebMCP integration uses the imperative browser API:
+1. **Answer:** explain the current project using its accepted context and available evidence.
+2. **Work:** perform an allowed, routine project operation such as creating or advancing a task.
+3. **Proposal:** pause at the governance boundary when the requested result would materially change the accepted architecture.
+
+Routine work can continue. Consequential changes cannot become project truth without a human.
+
+## End-to-end example
+
+A user asks:
+
+> How should we handle user authentication?
+
+Archbro does not answer from a blank prompt and does not let a model rewrite the architecture directly.
+
+1. It loads the project's accepted goal, architecture, tasks, observations, and prior decisions.
+2. The built-in Strands agent determines whether the question can be answered from current project context or requires repository evidence.
+3. When evidence is necessary, Archbro exposes only approved, project-scoped, read-only tools.
+4. The agent explains the recommendation and its evidence.
+5. If the recommendation fits inside the accepted architecture, Archbro returns a grounded answer or creates normal work.
+6. If it requires a structural change, Archbro creates a `PENDING` proposal while the current architecture remains unchanged.
+7. A human accepts or rejects the proposal in the Archbro workspace.
+8. An accepted update becomes the new shared context for future people and agents.
+
+## Human governance is a product boundary
+
+| The agent can | Only a human can |
+| --- | --- |
+| Read accepted project context | Accept an architecture proposal |
+| Use approved evidence tools | Reject an architecture proposal |
+| Return answers with sources | Promote a proposal into shared project truth |
+| Create and advance routine tasks | Approve the next accepted architecture version |
+| Record project observations | Decide consequential design trade-offs |
+| Submit architecture recommendations |  |
+
+There is deliberately no agent-accessible architecture Accept or Reject tool. Backend governance validates every decision before state changes, and only explicit human acceptance increments the accepted architecture version.
+
+## One project truth, two architecture views
+
+Archbro separates design authority from implementation evidence:
+
+- **Living Architecture** is the human-approved canonical design intent. It uses stable component identities and changes only through the review boundary.
+- **Code Architecture** is revision-pinned implementation evidence derived from one exact repository commit. It can reveal implementation drift, but publishing it never mutates Living Architecture.
+
+This separation prevents a repository snapshot, model inference, or external agent from quietly becoming the new design authority.
+
+## Why this is a Professional Agent
+
+The [Professional Agents](https://agentsforhumans.devpost.com/) track asks for agents that make people dramatically better at work by handling repetitive, judgment-heavy tasks. Archbro addresses that directly:
+
+| Hackathon goal | Archbro evidence |
+| --- | --- |
+| Solve a real professional problem | Engineering teams repeatedly rebuild project context and reconcile architecture with implementation |
+| Handle work end to end | Context loading, reasoning, evidence retrieval, validation, delivery, and review all happen in one product loop |
+| Use Strands non-trivially | The built-in reasoning runtime, Gemini model adapter, and dynamically gated evidence tools are implemented with Strands |
+| Surface only real decisions | Routine answers and work continue; consequential architecture changes become human-reviewable proposals |
+| Deliver a coherent product | The live workspace combines project goals, architecture, tasks, evidence, agent conversations, and review |
+| Demonstrate a working system | A public live deployment and automated CI are included |
+
+## Strands Agents SDK implementation
+
+Strands is the runtime behind Archbro's built-in agent, not a presentation-only dependency.
+
+| Strands capability | How Archbro uses it | Implementation |
+| --- | --- | --- |
+| `strands.Agent` | Runs the built-in reasoning and tool-use loop | `src/archbro/backend/llm/gemini.py` |
+| `strands.models.gemini.GeminiModel` | Connects the agent to an invocation-scoped Gemini client | `src/archbro/backend/llm/gemini.py` |
+| `strands.types.tools.AgentTool` | Powers Archbro's JSON-schema-native `SchemaMcpTool` adapter for approved MCP evidence tools | `src/archbro/backend/mcp/strands_adapter.py` |
+| Dynamic tool selection | Exposes only the smallest approved tool set needed for the current message | `src/archbro/backend/mcp/agent_tools.py` |
+| Structured decision output | Feeds model results into Archbro validation and governance before mutation | `src/archbro/backend/` |
+
+The current default model is Gemini through the Strands Gemini adapter. Production can use Vertex AI with Application Default Credentials, while deterministic tests use the fake provider and require no paid model call.
+
+## Architecture at a glance
+
+| Layer | Responsibility | Technology |
+| --- | --- | --- |
+| Workspace | Ask, explore architecture, manage tasks, and review proposals | Browser UI + native WebMCP surface |
+| Identity | Authenticate users and issue verified identity tokens | Firebase Authentication |
+| Secure API | Enforce identity, project access, and API contracts | FastAPI |
+| Project state | Store goals, accepted architecture, tasks, evidence, and history | PostgreSQL |
+| Governance | Validate answers, work, recommendations, and human decisions | Archbro backend contracts |
+| Built-in agent | Understand the request, select evidence, reason, and explain | Strands Agents SDK + Gemini |
+| Evidence | Read project-scoped implementation and connected-source facts | GitHub MCP and optional connected providers |
+| Deployment | Build, test, deploy, and expose the live product securely | Docker, GitHub Actions, GCE, Cloudflare Tunnel |
+
+The primary product path is:
+
+```text
+Human
+  → Archbro Workspace
+  → Secure FastAPI backend
+  → Built-in Strands agent
+  → Approved project evidence
+  → Grounded answer or pending proposal
+  → Human review when required
+```
+
+An optional external agent may enter through Archbro's semantic WebMCP Site Tools, but it receives the same project-scoped context and remains subject to the same governance boundary.
+
+## What makes Archbro different
+
+### One shared project truth
+
+People, the built-in agent, and optional external agents operate on the same accepted goal, architecture, tasks, evidence, and decision history instead of maintaining separate plans.
+
+### Evidence is not authority
+
+GitHub, Code Architecture, observations, and connected providers contribute evidence. They do not automatically overwrite the human-approved Living Architecture.
+
+### Routine work and consequential change are different operations
+
+Creating a task, recording an observation, and explaining current state are not treated like accepting a new architecture. Each operation has its own deterministic boundary.
+
+### The agent is embedded in the project workflow
+
+Archbro does not stop at producing text. Its reasoning is connected to durable project state, task execution, evidence, and a human decision loop.
+
+### External agents do not bypass governance
+
+WebMCP gives external agents structured Site Tools instead of DOM guessing, but it does not give them an unsafe direct architecture-mutation path.
+
+## Demo flow
+
+Open the public deployment:
+
+**https://archbro-dev2.magicdala.com/**
+
+A concise end-to-end demonstration can follow this path:
+
+1. Open an existing project with an accepted Living Architecture and active tasks.
+2. Ask the built-in agent to explain one architecture area.
+3. Ask a repository-specific question so the agent must use approved GitHub evidence.
+4. Create or advance one normal task.
+5. Ask for a structural architecture change.
+6. Show that the recommendation becomes `PENDING` while the accepted architecture remains unchanged.
+7. Accept or reject the proposal as the human reviewer.
+8. Show that an accepted decision becomes part of the next request's context.
+
+## Optional WebMCP interoperability
+
+Archbro exposes semantic browser-native Site Tools through:
 
 ```js
 document.modelContext.registerTool(...)
 ```
 
-The production WebMCP implementation lives directly in this repository and has no runtime or build dependency on an external adapter repository.
+This lets a compatible external host agent read current project reality, perform allowed work, and submit reviewable recommendations without relying on DOM automation.
 
-Default semantic Site Tools (14 when no connected MCP gateway is configured):
+<details>
+<summary><strong>Default Archbro WebMCP Site Tools</strong></summary>
+
+When no connected MCP gateway is configured, Archbro exposes 14 semantic Site Tools:
 
 | Tool | Purpose |
 | --- | --- |
 | `archbro_ping` | Verify the native WebMCP connection without mutation or model invocation |
 | `archbro_get_agent_context` | Read compact project and connected-source context |
-| `archbro_get_architecture_diagram` | Read root/subsystem projections from the backend-authored Living Architecture graph |
-| `archbro_get_architecture_node_context` | Read bounded upstream/downstream dependency context for a stable Living Architecture node |
+| `archbro_get_architecture_diagram` | Read root or subsystem projections from the backend-authored Living Architecture graph |
+| `archbro_get_architecture_node_context` | Read bounded upstream and downstream context for a stable Living Architecture node |
 | `archbro_find_architecture_path` | Find a directed authored dependency path between architecture nodes |
-| `archbro_bootstrap_project` | Atomically commit a host-designed Architecture v1 only after SYSTEM_MAP → recursive per-scope evaluation → RECONCILE planning; every SYSTEM_MAP root must expand, and every component must be EXPANDED or a JUSTIFIED_LEAF and the trace is validated against the final hierarchy |
-| `archbro_expand_architecture_scope` | Propose an additive one-level decomposition under an existing component; human acceptance remains required |
-| `archbro_get_architecture_decision_context` | Read accepted Living Architecture, execution state, evidence, and governance rules |
-| `archbro_submit_architecture_recommendation` | Submit architecture-specific reasoning; changes become `PENDING` human review |
-| `archbro_publish_code_architecture` | Validate and persist revision-pinned Code Architecture evidence; accepted Living Architecture is unchanged |
-| `archbro_get_code_architecture` | Read the latest persisted Code Architecture implementation-evidence snapshot |
-| `archbro_create_task` | Create normal execution work inside the accepted Living Architecture without invoking the built-in model |
-| `archbro_update_task_status` | Start or complete an existing task through the deterministic task boundary without invoking the built-in model |
-| `archbro_record_project_observation` | Persist external evidence/project facts without pretending they are architecture recommendations |
+| `archbro_bootstrap_project` | Commit Architecture v1 only after validated hierarchical planning |
+| `archbro_expand_architecture_scope` | Submit an additive one-level decomposition proposal under an existing component |
+| `archbro_get_architecture_decision_context` | Read accepted architecture, execution state, evidence, and governance rules |
+| `archbro_submit_architecture_recommendation` | Submit an architecture recommendation as `PENDING` human review |
+| `archbro_publish_code_architecture` | Persist revision-pinned Code Architecture evidence without changing Living Architecture |
+| `archbro_get_code_architecture` | Read the latest persisted Code Architecture evidence snapshot |
+| `archbro_create_task` | Create normal execution work inside the accepted Living Architecture |
+| `archbro_update_task_status` | Start or complete a task through the deterministic task boundary |
+| `archbro_record_project_observation` | Persist external evidence or project facts without misrepresenting them as accepted architecture |
 
-If the deployment configures connected MCP servers, three gateway tools are added: `archbro_list_connected_mcp_servers`, `archbro_list_connected_mcp_tools`, and `archbro_call_connected_mcp_tool`, for 17 total. They are absent when no gateway is configured. The calling host agent owns reasoning. Archbro owns validation, state, governance, and deterministic execution. A WebMCP agent can recommend an architecture change but cannot approve it.
+When connected MCP servers are configured, Archbro can also expose gateway discovery and call tools. The calling external agent owns its reasoning; Archbro still owns validation, project state, governance, and deterministic execution.
 
-Connected provider access is principal-scoped and fail-closed. Public or tunneled provider routes require a verified per-user identity rather than the shared local-development principal. GitHub keeps the official MCP read-only mode and adds an Archbro-owned backstop: only tools explicitly advertising MCP `annotations.readOnlyHint=true` are exposed or callable, so missing, false, malformed, and unknown tool metadata are rejected before provider dispatch. Google Drive OAuth requests read-only Drive access. Microsoft Teams is read-only by default; write scopes and write tools appear only when `ARCHBRO_TEAMS_ENABLE_WRITE=true`. Reconnect flows force account selection for GitHub, Google Drive, and Microsoft Teams, while Slack keeps workspace selection under the user's control.
+See [`docs/WEBMCP.md`](docs/WEBMCP.md) for the complete contract and invariants.
 
-The Architecture workspace has two deliberately separate views. **Living** is the human-approved canonical design intent and keeps stable `node:<component_id>` identities. **Code** is derived implementation evidence at one exact GitHub commit and uses the separate `code-node:*` namespace. Publishing a Code Architecture snapshot does not mutate the accepted Living Architecture; implementation drift still requires a normal reviewable architecture proposal.
+</details>
 
-Architecture diagrams are positioned by the backend with deterministic topology-aware layout and routing. The diagram endpoint supports `MAP`, `READ`, and `FULL` reading modes: `MAP` may reduce redundant relationship edges for a clearer overview, while `READ` and `FULL` retain the complete authored relationship set. Node placement and relationship routing remain stable across reading modes so changing information density does not reshuffle the graph.
-
-See [`docs/WEBMCP.md`](docs/WEBMCP.md) for the complete contract and governance invariants.
-
-## Why WebMCP matters here
-
-```text
-External host agent
-      |
-      v
-Archbro Site Tools
-      |
-      +--> reads current project + evidence
-      +--> reasons about architecture drift
-      +--> submits reviewable recommendation
-      |
-      v
-Human Accept / Reject
-      |
-      v
-Architecture version + tasks reconciled
-      |
-      v
-Agent continues execution
-```
-
-The agent does not need DOM automation, and Archbro does not expose an unsafe direct architecture-mutation tool.
-
-## WebMCP acceptance mode
+### WebMCP acceptance mode
 
 Open:
 
@@ -89,82 +281,57 @@ Open:
 /?mode=webmcp
 ```
 
-This mode disables the human New Project flow, built-in architecture generation, built-in agent messaging, and manual task Start/Done controls so a WebMCP acceptance run cannot silently fall back to browser automation. Human architecture Accept/Reject remains enabled.
+This mode disables built-in architecture generation, built-in agent messaging, the human New Project flow, and manual task Start or Done controls so an external-agent acceptance run cannot silently fall back to browser automation. Human architecture Accept and Reject remain enabled.
 
-## Project layout
+## Security and evidence boundaries
 
-```text
-frontend/                       # Web UI + WebMCP browser integration
-src/archbro/backend/            # Core backend, agent, API, governance
-src/archbro/integrations/       # Firebase Auth / external integrations
-src/archbro/platform/           # PostgreSQL persistence / runtime composition
-tests/                          # contract + regression + golden WebMCP flow
-qa/                             # browser and WebMCP acceptance harnesses
-docs/OWNERSHIP.md               # ownership + dependency rules
-docs/WEBMCP.md                  # WebMCP contract and governance
-docs/DEMO.md                    # concise WebMCP demo script
-```
+Connected-provider access is principal-scoped and fail-closed.
 
-## Run the stack with Docker Compose
+- Public or tunneled routes require a verified per-user identity rather than a shared development principal.
+- GitHub uses the official MCP read-only mode plus an Archbro backstop: only tools explicitly advertising `annotations.readOnlyHint=true` are exposed or callable.
+- Missing, false, malformed, or unknown read-only metadata is rejected before provider dispatch.
+- Google Drive requests read-only Drive access.
+- Microsoft Teams is read-only by default; write scopes appear only when explicitly enabled.
+- Privileged project state stays behind FastAPI, Firebase Admin token verification, and project authorization.
+- Firebase is used for authentication only. Project data is stored in PostgreSQL, not Firestore.
 
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full development guide:
-startup, database access, troubleshooting, and working agreements.
+Tool output is treated as untrusted evidence. It cannot override the Project Goal, accepted Living Architecture, or approval rules.
 
-The recommended way to get a working environment. One command, and no Google
-Cloud credentials or Gemini API key are needed:
+## Quick start
+
+The recommended local development path needs no Google Cloud credentials or Gemini API key:
 
 ```bash
 docker compose up -d --wait
 ```
 
-Requires Docker Compose v2.24 or newer, which is when `env_file:` gained the
-long form that lets a missing `.env` be non-fatal.
+Requirements:
 
-That builds the app image, starts PostgreSQL, blocks until both containers
-report healthy, and serves the app on the Compose application port.
+- Docker Compose v2.24 or newer
+- Docker Desktop or another compatible Docker runtime
+
+The command builds the application, starts PostgreSQL, waits for healthy containers, and serves the local product surface.
 
 | Command | What it does |
 | --- | --- |
-| `docker compose up -d --wait` | Start everything, block until healthy |
-| `docker compose run --rm app python -m pytest` | Run the test suite in the container |
+| `docker compose up -d --wait` | Start the application and database, then wait until healthy |
+| `docker compose run --rm app python -m pytest` | Run the test suite inside the application image |
 | `docker compose logs -f app` | Follow application logs |
-| `docker compose down` | Stop the stack, keeping data |
-| `docker compose down -v` | Stop and delete the database volume |
+| `docker compose down` | Stop the stack and keep database data |
+| `docker compose down -v` | Stop the stack and delete the database volume |
 
-`src/`, `tests/`, and `frontend/` are bind-mounted and the app runs with
-`--reload`, so edits take effect without a rebuild. Rebuild only when
-dependencies change: `docker compose build app`.
+The default local configuration uses:
 
-The defaults are chosen so a new team member needs no secrets: authentication
-uses the local development principal (`ARCHBRO_AUTH_MODE=local`) and the model
-provider is the deterministic fake (`ARCHBRO_PROVIDER=fake`). To exercise real
-model calls, put `GEMINI_API_KEY` and `ARCHBRO_PROVIDER=gemini` in `.env`; the
-app container reads that file when it exists.
+```env
+ARCHBRO_ENV=local
+ARCHBRO_AUTH_MODE=local
+ARCHBRO_PROVIDER=fake
+ARCHBRO_PERSISTENCE=postgres
+```
 
-`/healthz` is the container liveness probe. It reports only that the process is
-serving and deliberately does not touch persistence, so a transient database
-outage cannot trigger a restart storm.
-
-The `db` service runs PostgreSQL 17 and is reachable inside the Compose network
-through the `db` service on port `5432`, using the `archbro` database. It is the
-only store Archbro has: `ARCHBRO_PERSISTENCE` accepts only `postgres` and the app
-refuses to start without `DATABASE_URL`. Compose builds that connection value
-from the `POSTGRES_*` settings.
-
-Both published ports bind to `127.0.0.1`, so the development database -- whose
-password really is `archbro` -- is not reachable from the rest of the network.
-
-`docker-compose.yml` is for development only and must never be deployed. Its
-`environment:` block outranks `env_file:`, pinning `ARCHBRO_ENV` and
-`ARCHBRO_AUTH_MODE` to `local`; a `.env` on a server cannot override them. A
-deployment using this file would serve real traffic on the local development
-principal, and the production guard in `create_app()` would stay silent because
-it only fires when `ARCHBRO_ENV` says `production`. Production gets its own
-compose file.
+The fake provider makes the deterministic development and acceptance paths available without a paid model call.
 
 ## Run locally without Docker
-
-Use a project-local virtual environment:
 
 ```powershell
 cd archbro
@@ -173,195 +340,104 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn archbro.main:app --host 127.0.0.1 --port 8011
 ```
 
-After starting Uvicorn on port `8011`, use the normal local product surface. Enable WebMCP mode when running the stricter acceptance flow.
+After Uvicorn starts, open the local product surface. Use `/?mode=webmcp` only for the stricter external-agent acceptance flow.
 
-## Environment
+## Use the real Strands + Gemini path
 
-`.env` is loaded automatically.
+Create a local `.env`:
 
 ```env
-# Vertex AI with Application Default Credentials:
-GOOGLE_GENAI_USE_VERTEXAI=true
-GOOGLE_CLOUD_PROJECT=your-google-cloud-project
-GOOGLE_CLOUD_LOCATION=global
-GEMINI_API_KEY=
-GOOGLE_API_KEY=
-GEMINI_MODEL=gemini-3.8-flash
-# Optional Developer-API-compatible gateway (Vertex AI must be false):
-# GEMINI_BASE_URL=http://127.0.0.1:8080/gemini
-# GEMINI_API_KEY=...
-# Optional measured planner override, otherwise GEMINI_MODEL is used:
-# GEMINI_SYSTEM_MAP_MODEL=gemini-3.8-flash-medium
 ARCHBRO_PROVIDER=gemini
 ARCHBRO_ENV=local
 ARCHBRO_AUTH_MODE=local
 ARCHBRO_PERSISTENCE=postgres
+
+GOOGLE_GENAI_USE_VERTEXAI=true
+GOOGLE_CLOUD_PROJECT=your-google-cloud-project
+GOOGLE_CLOUD_LOCATION=global
+GEMINI_MODEL=gemini-3.8-flash
+
 FIREBASE_PROJECT_ID=
 ARCHBRO_FIREBASE_API_KEY=
 ARCHBRO_FIREBASE_AUTH_DOMAIN=
 ARCHBRO_FIREBASE_APP_ID=
-ARCHBRO_GOAL_REQUEST_TIMEOUT_SECONDS=30
 ```
 
-With Vertex AI enabled, both the built-in Strands Agent and the hierarchical
-architecture planner receive invocation-scoped, preconfigured Google Gen AI
-clients backed by ADC. On GCE, grant the attached runtime service account
-`roles/aiplatform.user`; do not download a service-account key or set
-`GOOGLE_APPLICATION_CREDENTIALS`. For local ADC use `gcloud auth
-application-default login`. To retain Developer API or gateway mode, set
-`GOOGLE_GENAI_USE_VERTEXAI=false` and configure one of `GEMINI_API_KEY` or
-`GOOGLE_API_KEY`.
+With Vertex AI enabled, the built-in Strands agent receives an invocation-scoped Google Gen AI client backed by Application Default Credentials. On GCE, grant the runtime service account `roles/aiplatform.user`. For local ADC, run:
 
-Initial Architecture generation is shaped for shared Vertex capacity rather
-than sending an unbounded burst. The application admits one bootstrap plan at a
-time by default, uses a bounded Archbro-owned backoff loop for explicit `408`,
-`429`, and `5xx` provider rejections, and checkpoints every validated phase. A retry therefore
-resumes at the first unfinished phase; compatible completed phases from an older
-planner contract are revalidated and imported instead of regenerated. A real
-timeout or connection loss after dispatch remains `UNKNOWN` and still requires
-explicit human authorization because the upstream outcome cannot be proven.
-The Google SDK remains configured for one attempt so it cannot silently retry
-an ambiguous transport failure underneath that checkpoint boundary.
-
-The default planner budgets are deliberately phase-specific:
-
-```env
-GEMINI_SYSTEM_MAP_THINKING_LEVEL=low
-GEMINI_SCOPE_THINKING_LEVEL=low
-GEMINI_RECONCILE_THINKING_LEVEL=medium
-GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS=65536
-GEMINI_SYSTEM_MAP_MAX_OUTPUT_TOKENS=4096
-GEMINI_SCOPE_MAX_OUTPUT_TOKENS=8192
-GEMINI_RECONCILE_MAX_OUTPUT_TOKENS=16384
-GEMINI_ARCHITECTURE_RETRY_ATTEMPTS=5
-GEMINI_ARCHITECTURE_MAX_CONCURRENCY=1
+```bash
+gcloud auth application-default login
 ```
 
-The three phase values are starting budgets. An explicit `MAX_TOKENS` response
-is a known provider result, so Archbro checkpoints that exact phase and doubles
-only its output budget, bounded by the 65,536-token hard ceiling. It never parses
-or accepts a truncated JSON response and never regenerates completed phases.
-Planner-contract upgrades also carry a semantic hash of the confirmed Project
-Brief. A prior `UNKNOWN` dispatch for the same project, phase, and brief remains
-fenced even when a release changes the plan id; a new paid call requires explicit
-human authorization. A complete `RECONCILE` response that fails deterministic
-relationship validation receives one bounded `RECONCILE_REPAIR:1` attempt while
-the accepted topology phases remain checkpointed. If that repair also fails,
-another paid reconciliation attempt requires explicit authorization.
-See `.env.example` for the complete retry timing, queue timeout, and hard output
-ceiling. These values enter the public safe-configuration fingerprint, so a
-deployed runtime reports which reliability policy it is actually using without
-exposing credentials.
+Do not download a service-account key for the deployed runtime. To use the Gemini Developer API or a compatible gateway instead, set `GOOGLE_GENAI_USE_VERTEXAI=false` and configure `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
 
-The current user's GitHub MCP connection is optional evidence, not a project
-bootstrap dependency. Initial Architecture generation uses only the confirmed
-Goal / Project Brief and never discovers GitHub tools. After bootstrap, the
-built-in Agent exposes the user's approved read-only GitHub tools only when the
-message explicitly asks to inspect repository evidence such as a repo, README,
-branch, commit, pull request, issue, or source file. Ordinary task questions —
-including words such as `report` — do not make a GitHub connection mandatory.
+See [`.env.example`](.env.example) for the complete configuration surface.
 
-For deterministic WebMCP acceptance without built-in model calls:
+## Reliability and failure semantics
 
-```env
-ARCHBRO_PROVIDER=fake
-```
-
-Every deployed stack (`archbro-main`, `archbro-dev`, `archbro-dev2`) must set
-`ARCHBRO_ENV=production` and `ARCHBRO_AUTH_MODE=firebase`. Deployment validation
-fails closed if Firebase identity or its public browser config is missing; the
-local-development principal is valid only for direct local development and cannot
-be used by an externally reachable deployed stack.
-
-`qa/setup_archbro_identity_platform.ps1` provisions the complete browser login
-boundary directly through Google Cloud Identity Platform. It enables email/password,
-disables anonymous login, configures Google and GitHub, authorizes the requested
-hostnames, and creates a browser API key restricted to Identity Toolkit/Secure Token.
-The required `-AuthDomain` is written into the generated, gitignored
-`.archbro-firebase-public.json`; an empty popup-auth domain is never emitted.
-
-Before running the setup script, inject these setup-only values from the approved
-secret store into the PowerShell process environment:
+Initial architecture generation uses a bounded, checkpointed planning flow:
 
 ```text
-ARCHBRO_FIREBASE_GOOGLE_OAUTH_CLIENT_ID
-ARCHBRO_FIREBASE_GOOGLE_OAUTH_CLIENT_SECRET
-ARCHBRO_FIREBASE_GITHUB_OAUTH_CLIENT_ID
-ARCHBRO_FIREBASE_GITHUB_OAUTH_CLIENT_SECRET
+SYSTEM_MAP
+  → recursive per-scope evaluation
+  → RECONCILE
+  → deterministic validation
 ```
 
-Then run, for example:
+Archbro checkpoints every validated phase. Explicit provider rejections such as `408`, `429`, and `5xx` use an Archbro-owned bounded backoff policy. A timeout or connection loss after dispatch remains `UNKNOWN`; Archbro does not silently retry an ambiguous paid request underneath the governance boundary.
 
-```powershell
-.\qa\setup_archbro_identity_platform.ps1 `
-  -ProjectId "your-firebase-project" `
-  -AuthDomain "<firebase-auth-domain>" `
-  -PublicHost "<production-host>" `
-  -StagingHost "<development-host>"
-```
+A complete reconciliation response that fails deterministic relationship validation receives one bounded repair attempt while the accepted topology phases remain checkpointed. Truncated JSON is never parsed or accepted.
 
-Do not place the OAuth client secrets on the command line, in the generated public
-JSON, or in repository environment examples. The setup process sends them only to
-Identity Platform. This keeps auth independent from Firebase Hosting while remaining
-compatible with Firebase Admin ID-token verification.
-
-Privileged project state remains behind FastAPI + Firebase Admin ID-token
-verification + project authorization; the browser never reaches the database
-directly. Firebase is used for Authentication only -- Archbro stores no project
-state in Firestore, so there are no client-facing database rules to deploy.
-
-## Runtime composition
-
-```text
-Frontend / WebMCP
-    -> backend API
-        -> core / agent / governance contracts
-            -> ProjectRepositoryPort
-                -> PostgreSQL
-
-Firebase Auth / integrations
-    -> trusted identity + normalized evidence
-        -> backend / event pipeline
-            -> agent evaluation
-```
-
-## Architecture approval boundary
-
-Normal execution state can advance deterministically. Material architecture drift creates a pending proposal. Only explicit human acceptance increments the architecture version.
-
-When a component is replaced, unfinished work is re-scoped to the accepted replacement and becomes ready again. Work tied to a removed component remains blocked until it is redefined.
+This behavior is covered by the same public configuration fingerprint used by deployed runtimes, without exposing credentials.
 
 ## Tests
+
+Run the full deterministic suite:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The real Gemini smoke test runs when a Gemini API key is available. Deterministic tests do not require a model call.
+Run the containerized suite:
 
-The golden WebMCP governance loop is covered by `tests/test_webmcp_golden_flow.py`.
+```bash
+docker compose run --rm app python -m pytest
+```
 
-Browser-native local probes live under `qa/`, including `qa/probe_webmcp_live.py`.
+The repository includes contract, regression, governance, browser, and WebMCP acceptance coverage. Important examples include:
 
-Architecture generation and Canvas changes use the same three retained reference
-projects: commerce, collaborative AI workspace, and manufacturing supply chain.
-The [fixed reference corpus and comparison procedure](examples/reference-projects/README.md)
-contains frozen inputs, production project links, nine workflow checks, and the
-recorded visual baseline. Reuse those projects for comparisons instead of creating
-unrelated demonstrations or deleting them as acceptance fixtures.
+- `tests/test_webmcp_golden_flow.py`
+- `tests/test_code_architecture.py`
+- `qa/probe_webmcp_live.py`
+- `qa/test_architecture_canvas.mjs`
+- `qa/test_task_architecture_review.mjs`
 
-## Container deployment
+A real Gemini smoke test runs only when the required credentials are available. Deterministic tests do not require a model call.
 
-A production-oriented `Dockerfile` is included. The container listens on `$PORT` (default `8080`). Configure environment variables in the deployment platform rather than baking credentials into the image.
+## Project layout
 
-Two deployments exist.
+```text
+frontend/                       Browser workspace + WebMCP registration
+src/archbro/backend/            API, core contracts, agent, validation, governance
+src/archbro/integrations/       Firebase identity and external integrations
+src/archbro/platform/           PostgreSQL, runtime composition, deployment support
+tests/                          Contract, regression, and golden-flow coverage
+qa/                             Browser and live WebMCP acceptance harnesses
+docs/OWNERSHIP.md               Ownership and dependency rules
+docs/WEBMCP.md                  WebMCP contract and governance invariants
+docs/DEVELOPMENT.md             Local development guide
+docs/INFRASTRUCTURE.md          Deployment architecture and recovery instructions
+```
 
-**Current deployment.** `main` and `dev` run as two isolated Compose stacks on one GCE instance, each with its own PostgreSQL. GitHub Actions builds, pushes, and deploys on a push to either branch. [docs/INFRASTRUCTURE.md](docs/INFRASTRUCTURE.md) records every resource, why it is set up that way, and how to rebuild it; see also [`deploy/`](deploy/) and `.github/workflows/deploy.yml`. Both are reached only through separate Cloudflare Tunnels — the instance publishes no HTTP port at all — and `dev` additionally sits behind Cloudflare Access with an email allowlist. `.env` files are placed on the instance by hand and are never written by the workflow.
+## Technical reference
 
-**Development:** the `dev` stack is live through its dedicated tunnel.
-
-**Production:** the `main` stack remains reserved until production enablement; the current deployment does not use the retired Worker/Cloud Run challenge route.
+- [WebMCP contract and governance](docs/WEBMCP.md)
+- [Development guide](docs/DEVELOPMENT.md)
+- [Infrastructure and deployment](docs/INFRASTRUCTURE.md)
+- [Ownership and dependency rules](docs/OWNERSHIP.md)
+- [Project repository binding](docs/PROJECT_REPOSITORY_BINDING.md)
+- [Architecture Canvas design](docs/ARCHITECTURE_CANVAS_V2.md)
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+Archbro is released under the [MIT License](LICENSE).
