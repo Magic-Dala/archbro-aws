@@ -1,0 +1,171 @@
+# Builds an image and deploys it to one of two stacks on the same VM.
+#
+# main -> archbro-main -> /opt/archbro/main -> archbro.magicdala.com
+# dev  -> archbro-dev  -> /opt/archbro/dev  -> archbro-dev.magicdala.com
+# dev2 -> archbro-dev2 -> /opt/archbro/dev2 -> archbro-dev2.magicdala.com
+#
+# The stacks use separate Compose projects, containers, default networks, and
+# database volumes. They currently share only the external archbro-edge ingress
+# network used by their Cloudflare Tunnel connectors; that boundary is documented
+# explicitly rather than claiming the environments share nothing.
+#
+# Authentication uses Workload Identity Federation, so no long-lived Google
+# credential is stored in GitHub. Each deploy hands the VM a short-lived registry
+# access token over stdin; deploy-stack.sh stores it in a temporary Docker config
+# that is destroyed on every exit path.
+#
+# .env files are placed on the VM by hand and are never written by this
+# workflow. Main requires the complete production/Firebase contract. Dev may
+# remain explicit local/local staging until Firebase is actually provisioned;
+# mixed or incomplete runtime/auth configurations fail closed before recreation.
+name: Deploy
+
+on:
+  push:
+    branches: [main, dev, dev2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+  id-token: write
+
+concurrency:
+  # Never let two deploys of the same environment interleave.
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: magic-dala
+  GCE_INSTANCE: magicdala
+  GCE_ZONE: us-central1-a
+  REGISTRY: us-central1-docker.pkg.dev
+  IMAGE_REPO: us-central1-docker.pkg.dev/magic-dala/archbro/archbro
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # CI and Deploy are separate workflows, so both start on a branch push.
+      # This gate prevents Deploy from touching GCP until the CI workflow has
+      # completed successfully for this exact merge/squash SHA. A manual
+      # workflow_dispatch is an explicit operator action and skips this wait.
+      - name: Wait for CI gate on this exact commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 1 60); do
+            payload="$(gh api -H 'Accept: application/vnd.github+json' \
+              "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100")"
+            status="$(jq -r '[.check_runs[] | select(.name == "Python")] | sort_by(.started_at) | last | .status // ""' <<<"$payload")"
+            conclusion="$(jq -r '[.check_runs[] | select(.name == "Python")] | sort_by(.started_at) | last | .conclusion // ""' <<<"$payload")"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI gate passed for $GITHUB_SHA"
+                exit 0
+              fi
+              echo "::error::CI gate concluded $conclusion for $GITHUB_SHA"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for CI gate for $GITHUB_SHA"
+          exit 1
+
+      - name: Resolve the target environment
+        id: target
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          case "$REF_NAME" in
+            main) echo "stack=archbro-main" >> "$GITHUB_OUTPUT"
+                  echo "dir=/opt/archbro/main" >> "$GITHUB_OUTPUT"
+                  echo "host=archbro.magicdala.com" >> "$GITHUB_OUTPUT" ;;
+            dev)  echo "stack=archbro-dev" >> "$GITHUB_OUTPUT"
+                  echo "dir=/opt/archbro/dev" >> "$GITHUB_OUTPUT"
+                  echo "host=archbro-dev.magicdala.com" >> "$GITHUB_OUTPUT" ;;
+            dev2) echo "stack=archbro-dev2" >> "$GITHUB_OUTPUT"
+                  echo "dir=/opt/archbro/dev2" >> "$GITHUB_OUTPUT"
+                  echo "host=archbro-dev2.magicdala.com" >> "$GITHUB_OUTPUT" ;;
+            *)    echo "::error::refusing to deploy branch $REF_NAME"
+                  exit 1 ;;
+          esac
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        id: auth
+        with:
+          workload_identity_provider: projects/382990620621/locations/global/workloadIdentityPools/github/providers/github
+          service_account: archbro-deployer@magic-dala.iam.gserviceaccount.com
+          token_format: access_token
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+
+      - name: Build and push
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          gcloud auth configure-docker "$REGISTRY" --quiet
+          # Pinned rather than inferred: the VM is x86_64, and a runner that
+          # happened to be arm64 would produce an image it cannot execute.
+          docker build --platform linux/amd64 \
+            -t "$IMAGE_REPO:$REF_NAME" \
+            -t "$IMAGE_REPO:$REF_NAME-$GITHUB_SHA" .
+          docker push "$IMAGE_REPO:$REF_NAME"
+          docker push "$IMAGE_REPO:$REF_NAME-$GITHUB_SHA"
+
+      - name: Upload the compose file and the deploy script
+        env:
+          STACK: ${{ steps.target.outputs.stack }}
+        run: |
+          # Home directory, not /tmp. /tmp has the sticky bit, so a file left
+          # by one OS Login account cannot be overwritten by another, and the
+          # deploy account differs from any human who has run this by hand.
+          gcloud compute scp \
+            deploy/stack/docker-compose.prod.yml \
+            "${GCE_INSTANCE}:archbro-${STACK}.yml" \
+            --zone="$GCE_ZONE" --project="$GCP_PROJECT" --quiet
+          gcloud compute scp deploy/deploy-stack.sh \
+            "${GCE_INSTANCE}:deploy-stack.sh" \
+            --zone="$GCE_ZONE" --project="$GCP_PROJECT" --quiet
+
+      - name: Deploy
+        env:
+          # Short-lived, roughly an hour. Piped over stdin so it never lands in
+          # the VM's process list. The remote script uses an ephemeral Docker
+          # config and destroys it on every exit path.
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          STACK: ${{ steps.target.outputs.stack }}
+          DIR: ${{ steps.target.outputs.dir }}
+          IMAGE: ${{ env.IMAGE_REPO }}:${{ github.ref_name }}-${{ github.sha }}
+        run: |
+          printf '%s' "$ACCESS_TOKEN" | gcloud compute ssh "$GCE_INSTANCE" \
+            --zone="$GCE_ZONE" --project="$GCP_PROJECT" --quiet \
+            --command="bash \$HOME/deploy-stack.sh '$STACK' '$DIR' '$IMAGE' '$REGISTRY' 'oauth2accesstoken'"
+
+      - name: Verify the deployed stack answers internally
+        env:
+          STACK: ${{ steps.target.outputs.stack }}
+        run: |
+          gcloud compute ssh "$GCE_INSTANCE" \
+            --zone="$GCE_ZONE" --project="$GCP_PROJECT" --quiet \
+            --command="sudo docker run --rm --network archbro-edge curlimages/curl:latest \
+              --retry 30 --retry-delay 2 --retry-all-errors --fail --silent \
+              http://${STACK}-app:8080/healthz"
+
+      - name: Report
+        env:
+          STACK: ${{ steps.target.outputs.stack }}
+          HOST: ${{ steps.target.outputs.host }}
+          IMAGE: ${{ env.IMAGE_REPO }}:${{ github.ref_name }}-${{ github.sha }}
+        run: |
+          {
+            echo "### Deployed"
+            echo "- environment: \`$STACK\`"
+            echo "- host: https://$HOST"
+            echo "- image: \`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"

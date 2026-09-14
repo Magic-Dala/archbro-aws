@@ -1,0 +1,35 @@
+[project]
+name = "archbro"
+version = "0.1.0"
+description = "Human-guided agentic project architecture, execution, and drift management"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "uvicorn>=0.35,<1",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1.1,<2",
+  "firebase-admin>=7.5,<8",
+  "strands-agents[gemini]>=1.53.0,<2",
+  "mcp>=1.29.1,<2",
+  "jsonschema>=4.23,<5",
+  "httpx>=0.28,<1",
+  "psycopg[binary]>=3.2,<4",
+  "cryptography>=45,<51",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4,<9", "httpx>=0.28,<1"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"archbro.backend.core" = ["canvas_reference_en.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-q"

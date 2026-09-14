@@ -1,0 +1,849 @@
+{
+  "schema": "archbro.reference-project.v1",
+  "sample_id": "01-commerce",
+  "corpus_version": 1,
+  "source_requirement": "設計一個中型電商的訂單到交付平台。顧客從前台查詢商品庫存、確認結帳；系統完成風險檢查、庫存保留、訂單建立與外部付款。已付款訂單經倉庫揀貨與承運商交付，物流回呼更新訂單並通知顧客。所有核心交易向共同營運監控提供訊號。區分顧客體驗、訂單金流、履約及共用平台四個責任域，每域再拆兩層；明確表達請求、事件、資料存取與外部回呼，不保留無關孤島。",
+  "expected_node_count": 36,
+  "expected_relationship_count": 42,
+  "scenarios": [
+    {
+      "name": "顧客結帳與付款",
+      "focus": "checkout_api",
+      "path": [
+        "cart_ui",
+        "checkout_api",
+        "payment_router",
+        "psp"
+      ],
+      "acceptance": "可看見風險、庫存與付款三個下游，且外部付款有回呼"
+    },
+    {
+      "name": "出货到顧客通知",
+      "focus": "shipping_service",
+      "path": [
+        "shipping_service",
+        "carrier",
+        "delivery_events",
+        "event_bus",
+        "notification",
+        "email"
+      ],
+      "acceptance": "配送回呼透過事件更新顧客通知，沒有手動跳接"
+    },
+    {
+      "name": "付款異常到營運處理",
+      "focus": "telemetry",
+      "path": [
+        "payment_router",
+        "telemetry",
+        "metrics"
+      ],
+      "acceptance": "監控域與實際商務服務有標示的遙測連線，告警可讀指標"
+    }
+  ],
+  "payload": {
+    "name": "參考樣本 01｜電商訂單到交付 · v1",
+    "goal": "設計一個中型電商的訂單到交付平台。顧客從前台查詢商品庫存、確認結帳；系統完成風險檢查、庫存保留、訂單建立與外部付款。已付款訂單經倉庫揀貨與承運商交付，物流回呼更新訂單並通知顧客。所有核心交易向共同營運監控提供訊號。區分顧客體驗、訂單金流、履約及共用平台四個責任域，每域再拆兩層；明確表達請求、事件、資料存取與外部回呼，不保留無關孤島。",
+    "architecture_summary": "四個責任域經結帳、付款、商務事件與遙測互相連接。由顧客確認購買出發，可追至訂單、庫存、出貨、通知及營運告警。",
+    "components": [
+      {
+        "id": "experience",
+        "name": "顧客體驗",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "讓顧客瀏覽、維持購物狀態並安全提交結帳請求。",
+        "children": [
+          {
+            "id": "shopping",
+            "name": "瀏覽與工作階段",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "承接前台互動並保存顧客短期購物狀態。",
+            "children": [
+              {
+                "id": "storefront",
+                "name": "商店前台",
+                "type": "UI",
+                "kind": "UI",
+                "status": "PLANNED",
+                "responsibility": "呈現商品、購物車入口及訂單進度；向前台聚合 API 發送查詢。"
+              },
+              {
+                "id": "bff",
+                "name": "前台聚合 API",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "組合訂單與庫存資訊，驗證工作階段並轉交結帳請求。"
+              },
+              {
+                "id": "session",
+                "name": "工作階段快取",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "以有期限的記錄保存購物車識別與顧客工作階段，不保存付款卡號。"
+              }
+            ]
+          },
+          {
+            "id": "checkout",
+            "name": "結帳邊界",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "收集收件與付款選擇，完成庫存、風險與付款協調。",
+            "children": [
+              {
+                "id": "cart_ui",
+                "name": "結帳頁面",
+                "type": "UI",
+                "kind": "UI",
+                "status": "PLANNED",
+                "responsibility": "顯示購買明細與配送選項，經顧客確認後提交一次結帳請求。"
+              },
+              {
+                "id": "checkout_api",
+                "name": "結帳協調服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "驗證商品價格與風險，保留庫存並建立訂單及付款作業。"
+              },
+              {
+                "id": "fraud_rules",
+                "name": "交易風險規則",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "依交易金額、頻率與配送異常回傳允許、拒絕或人工檢查結果。"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "transactions",
+        "name": "訂單與金流",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "管理訂單生命週期及付款授權，將狀態轉換可靠地發佈給下游。",
+        "children": [
+          {
+            "id": "orders",
+            "name": "訂單領域",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "維護訂單事實及對外狀態事件。",
+            "children": [
+              {
+                "id": "order_service",
+                "name": "訂單服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "建立訂單，接收付款與交貨結果，檢查合法狀態轉換。"
+              },
+              {
+                "id": "order_db",
+                "name": "訂單資料庫",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "保存訂單、品項、收件資訊與狀態版本，支援冪等建立。"
+              },
+              {
+                "id": "order_outbox",
+                "name": "訂單事件寄件匣",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "讀取與訂單同交易寫入的事件，重試發送並記錄發送位置。"
+              }
+            ]
+          },
+          {
+            "id": "payments",
+            "name": "付款領域",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "隔離外部收單服務並保留授權與退款稽核。",
+            "children": [
+              {
+                "id": "payment_router",
+                "name": "付款路由服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "發起付款授權與退款，驗證回呼並回報訂單付款結果。"
+              },
+              {
+                "id": "payment_ledger",
+                "name": "付款流水帳",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "保存付款請求識別、授權結果、退款及對帳差異。"
+              },
+              {
+                "id": "psp",
+                "name": "外部收單平台",
+                "type": "EXTERNAL_SERVICE",
+                "kind": "EXTERNAL_SERVICE",
+                "status": "PLANNED",
+                "responsibility": "處理代碼化付款授權、請款與退款，發送簽章付款回呼。"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "fulfillment",
+        "name": "庫存與履約",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "把已付款訂單轉成可追蹤的揀貨、出貨與交付流程。",
+        "children": [
+          {
+            "id": "inventory",
+            "name": "庫存與揀貨",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "維護可售量及倉庫揀貨結果。",
+            "children": [
+              {
+                "id": "stock_service",
+                "name": "庫存服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "原子保留與釋放可售庫存，協調倉庫揀貨並回報缺貨。"
+              },
+              {
+                "id": "stock_db",
+                "name": "庫存帳本",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "記錄 SKU 數量、保留期限、盤點差異與扣帳版本。"
+              },
+              {
+                "id": "warehouse",
+                "name": "倉儲管理系統",
+                "type": "EXTERNAL_SERVICE",
+                "kind": "EXTERNAL_SERVICE",
+                "status": "PLANNED",
+                "responsibility": "接收揀貨單，回傳揀貨、包裝完成及實際出庫數量。"
+              }
+            ]
+          },
+          {
+            "id": "shipping",
+            "name": "配送協調",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "安排承運商並正規化物流進度。",
+            "children": [
+              {
+                "id": "shipping_service",
+                "name": "出貨服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "訂閱可履約訂單，取得揀貨結果後建立託運及追蹤號碼。"
+              },
+              {
+                "id": "carrier",
+                "name": "外部承運商",
+                "type": "EXTERNAL_SERVICE",
+                "kind": "EXTERNAL_SERVICE",
+                "status": "PLANNED",
+                "responsibility": "接收託運資料與交貨地址，回報取件、運送及簽收狀態。"
+              },
+              {
+                "id": "delivery_events",
+                "name": "配送回呼處理器",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "驗證承運商回呼並去重，產生標準配送狀態事件。"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "platform",
+        "name": "事件與營運",
+        "type": "SYSTEM",
+        "kind": "SYSTEM",
+        "status": "PLANNED",
+        "responsibility": "讓商務領域共享可靠事件、顧客通知與可觀測性。",
+        "children": [
+          {
+            "id": "messaging",
+            "name": "事件與通知",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "分發商務狀態變更並通知顧客。",
+            "children": [
+              {
+                "id": "event_bus",
+                "name": "商務事件匯流排",
+                "type": "INFRASTRUCTURE",
+                "kind": "INFRASTRUCTURE",
+                "status": "PLANNED",
+                "responsibility": "以訂單識別分區保存並分發付款、揀貨與配送事件。"
+              },
+              {
+                "id": "notification",
+                "name": "通知服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "依訂單狀態選擇訊息模板、去重並安排顧客通知。"
+              },
+              {
+                "id": "email",
+                "name": "外部郵件平台",
+                "type": "EXTERNAL_SERVICE",
+                "kind": "EXTERNAL_SERVICE",
+                "status": "PLANNED",
+                "responsibility": "寄送交易郵件並回報投遞或退信結果。"
+              }
+            ]
+          },
+          {
+            "id": "operations",
+            "name": "監控與告警",
+            "type": "SYSTEM",
+            "kind": "SYSTEM",
+            "status": "PLANNED",
+            "responsibility": "彙整跨服務訊號並指出付款與履約異常。",
+            "children": [
+              {
+                "id": "telemetry",
+                "name": "遙測收集器",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "接收結帳、付款與配送的追蹤及計量，移除敏感內容。"
+              },
+              {
+                "id": "metrics",
+                "name": "營運指標庫",
+                "type": "DATA_STORE",
+                "kind": "DATA_STORE",
+                "status": "PLANNED",
+                "responsibility": "保存成功率、付款延遲及履約積壓時間序列。"
+              },
+              {
+                "id": "alerts",
+                "name": "告警服務",
+                "type": "SERVICE",
+                "kind": "SERVICE",
+                "status": "PLANNED",
+                "responsibility": "查詢指標並將超時付款、缺貨與配送異常送交營運處理。"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "source": "storefront",
+        "target": "bff",
+        "type": "瀏覽與查詢訂單 · HTTPS"
+      },
+      {
+        "source": "storefront",
+        "target": "cart_ui",
+        "type": "開啟結帳 · UI"
+      },
+      {
+        "source": "bff",
+        "target": "session",
+        "type": "讀寫工作階段 · Redis"
+      },
+      {
+        "source": "bff",
+        "target": "stock_service",
+        "type": "查詢可售量 · HTTPS"
+      },
+      {
+        "source": "bff",
+        "target": "order_service",
+        "type": "查詢訂單進度 · HTTPS"
+      },
+      {
+        "source": "cart_ui",
+        "target": "checkout_api",
+        "type": "確認購買 · HTTPS"
+      },
+      {
+        "source": "bff",
+        "target": "checkout_api",
+        "type": "轉交結帳 · HTTPS"
+      },
+      {
+        "source": "checkout_api",
+        "target": "fraud_rules",
+        "type": "檢查交易風險 · RPC"
+      },
+      {
+        "source": "checkout_api",
+        "target": "stock_service",
+        "type": "保留庫存 · HTTPS"
+      },
+      {
+        "source": "checkout_api",
+        "target": "order_service",
+        "type": "建立待付款訂單 · HTTPS"
+      },
+      {
+        "source": "checkout_api",
+        "target": "payment_router",
+        "type": "請求付款授權 · HTTPS"
+      },
+      {
+        "source": "order_service",
+        "target": "order_db",
+        "type": "寫入訂單與 outbox · SQL"
+      },
+      {
+        "source": "order_outbox",
+        "target": "order_db",
+        "type": "讀取未發佈事件 · SQL"
+      },
+      {
+        "source": "order_outbox",
+        "target": "event_bus",
+        "type": "發佈訂單狀態 · Event"
+      },
+      {
+        "source": "payment_router",
+        "target": "psp",
+        "type": "授權或退款 · HTTPS"
+      },
+      {
+        "source": "psp",
+        "target": "payment_router",
+        "type": "付款結果 · Webhook"
+      },
+      {
+        "source": "payment_router",
+        "target": "payment_ledger",
+        "type": "追加付款流水 · SQL"
+      },
+      {
+        "source": "payment_router",
+        "target": "order_service",
+        "type": "確認付款結果 · HTTPS"
+      },
+      {
+        "source": "payment_router",
+        "target": "event_bus",
+        "type": "發佈付款結果 · Event"
+      },
+      {
+        "source": "stock_service",
+        "target": "stock_db",
+        "type": "保留或扣減數量 · SQL"
+      },
+      {
+        "source": "stock_service",
+        "target": "warehouse",
+        "type": "下發揀貨單 · HTTPS"
+      },
+      {
+        "source": "warehouse",
+        "target": "stock_service",
+        "type": "回報揀貨結果 · Webhook"
+      },
+      {
+        "source": "stock_service",
+        "target": "event_bus",
+        "type": "發佈揀貨或缺貨結果 · Event"
+      },
+      {
+        "source": "event_bus",
+        "target": "stock_service",
+        "type": "配送完成或取消 · Event"
+      },
+      {
+        "source": "event_bus",
+        "target": "shipping_service",
+        "type": "已付款與可出庫訂單 · Event"
+      },
+      {
+        "source": "shipping_service",
+        "target": "stock_service",
+        "type": "取得揀貨狀態 · HTTPS"
+      },
+      {
+        "source": "shipping_service",
+        "target": "carrier",
+        "type": "建立託運單 · HTTPS"
+      },
+      {
+        "source": "carrier",
+        "target": "delivery_events",
+        "type": "物流進度 · Webhook"
+      },
+      {
+        "source": "delivery_events",
+        "target": "event_bus",
+        "type": "發佈配送狀態 · Event"
+      },
+      {
+        "source": "event_bus",
+        "target": "order_service",
+        "type": "回填配送狀態 · Event"
+      },
+      {
+        "source": "event_bus",
+        "target": "notification",
+        "type": "觸發顧客通知 · Event"
+      },
+      {
+        "source": "notification",
+        "target": "email",
+        "type": "寄送交易郵件 · HTTPS"
+      },
+      {
+        "source": "email",
+        "target": "notification",
+        "type": "投遞或退信結果 · Webhook"
+      },
+      {
+        "source": "notification",
+        "target": "order_service",
+        "type": "讀取通知用訂單摘要 · HTTPS"
+      },
+      {
+        "source": "bff",
+        "target": "telemetry",
+        "type": "送出請求追蹤 · OTLP"
+      },
+      {
+        "source": "checkout_api",
+        "target": "telemetry",
+        "type": "送出結帳延遲 · OTLP"
+      },
+      {
+        "source": "payment_router",
+        "target": "telemetry",
+        "type": "送出授權指標 · OTLP"
+      },
+      {
+        "source": "shipping_service",
+        "target": "telemetry",
+        "type": "送出履約指標 · OTLP"
+      },
+      {
+        "source": "event_bus",
+        "target": "telemetry",
+        "type": "送出消費積壓指標 · OTLP"
+      },
+      {
+        "source": "telemetry",
+        "target": "metrics",
+        "type": "寫入時間序列 · Remote write"
+      },
+      {
+        "source": "alerts",
+        "target": "metrics",
+        "type": "查詢告警門檻 · Query"
+      },
+      {
+        "source": "alerts",
+        "target": "notification",
+        "type": "送交營運告警 · HTTPS"
+      }
+    ],
+    "tasks": [
+      {
+        "title": "固定情境 1：顧客結帳與付款（可看見風險、庫存與付款三個下游，且外部付款有回呼）",
+        "component": "checkout_api"
+      },
+      {
+        "title": "固定情境 2：出货到顧客通知（配送回呼透過事件更新顧客通知，沒有手動跳接）",
+        "component": "shipping_service"
+      },
+      {
+        "title": "固定情境 3：付款異常到營運處理（監控域與實際商務服務有標示的遙測連線，告警可讀指標）",
+        "component": "telemetry"
+      }
+    ],
+    "planning_trace": {
+      "system_map_root_ids": [
+        "experience",
+        "transactions",
+        "fulfillment",
+        "platform"
+      ],
+      "scope_evaluations": [
+        {
+          "scope_component_id": "experience",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "shopping",
+            "checkout"
+          ]
+        },
+        {
+          "scope_component_id": "shopping",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "storefront",
+            "bff",
+            "session"
+          ]
+        },
+        {
+          "scope_component_id": "storefront",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "商店前台的邊界是：呈現商品、購物車入口及訂單進度；向前台聚合 API 發送查詢。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "bff",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "前台聚合 API的邊界是：組合訂單與庫存資訊，驗證工作階段並轉交結帳請求。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "session",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "工作階段快取的邊界是：以有期限的記錄保存購物車識別與顧客工作階段，不保存付款卡號。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "checkout",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "cart_ui",
+            "checkout_api",
+            "fraud_rules"
+          ]
+        },
+        {
+          "scope_component_id": "cart_ui",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "結帳頁面的邊界是：顯示購買明細與配送選項，經顧客確認後提交一次結帳請求。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "checkout_api",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "結帳協調服務的邊界是：驗證商品價格與風險，保留庫存並建立訂單及付款作業。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "fraud_rules",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "交易風險規則的邊界是：依交易金額、頻率與配送異常回傳允許、拒絕或人工檢查結果。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "transactions",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "orders",
+            "payments"
+          ]
+        },
+        {
+          "scope_component_id": "orders",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "order_service",
+            "order_db",
+            "order_outbox"
+          ]
+        },
+        {
+          "scope_component_id": "order_service",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "訂單服務的邊界是：建立訂單，接收付款與交貨結果，檢查合法狀態轉換。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "order_db",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "訂單資料庫的邊界是：保存訂單、品項、收件資訊與狀態版本，支援冪等建立。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "order_outbox",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "訂單事件寄件匣的邊界是：讀取與訂單同交易寫入的事件，重試發送並記錄發送位置。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "payments",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "payment_router",
+            "payment_ledger",
+            "psp"
+          ]
+        },
+        {
+          "scope_component_id": "payment_router",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "付款路由服務的邊界是：發起付款授權與退款，驗證回呼並回報訂單付款結果。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "payment_ledger",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "付款流水帳的邊界是：保存付款請求識別、授權結果、退款及對帳差異。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "psp",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "外部收單平台的邊界是：處理代碼化付款授權、請款與退款，發送簽章付款回呼。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "fulfillment",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "inventory",
+            "shipping"
+          ]
+        },
+        {
+          "scope_component_id": "inventory",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "stock_service",
+            "stock_db",
+            "warehouse"
+          ]
+        },
+        {
+          "scope_component_id": "stock_service",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "庫存服務的邊界是：原子保留與釋放可售庫存，協調倉庫揀貨並回報缺貨。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "stock_db",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "庫存帳本的邊界是：記錄 SKU 數量、保留期限、盤點差異與扣帳版本。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "warehouse",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "倉儲管理系統的邊界是：接收揀貨單，回傳揀貨、包裝完成及實際出庫數量。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "shipping",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "shipping_service",
+            "carrier",
+            "delivery_events"
+          ]
+        },
+        {
+          "scope_component_id": "shipping_service",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "出貨服務的邊界是：訂閱可履約訂單，取得揀貨結果後建立託運及追蹤號碼。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "carrier",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "外部承運商的邊界是：接收託運資料與交貨地址，回報取件、運送及簽收狀態。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "delivery_events",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "配送回呼處理器的邊界是：驗證承運商回呼並去重，產生標準配送狀態事件。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "platform",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "messaging",
+            "operations"
+          ]
+        },
+        {
+          "scope_component_id": "messaging",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "event_bus",
+            "notification",
+            "email"
+          ]
+        },
+        {
+          "scope_component_id": "event_bus",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "商務事件匯流排的邊界是：以訂單識別分區保存並分發付款、揀貨與配送事件。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "notification",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "通知服務的邊界是：依訂單狀態選擇訊息模板、去重並安排顧客通知。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "email",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "外部郵件平台的邊界是：寄送交易郵件並回報投遞或退信結果。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "operations",
+          "decomposition": "EXPANDED",
+          "child_ids": [
+            "telemetry",
+            "metrics",
+            "alerts"
+          ]
+        },
+        {
+          "scope_component_id": "telemetry",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "遙測收集器的邊界是：接收結帳、付款與配送的追蹤及計量，移除敏感內容。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "metrics",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "營運指標庫的邊界是：保存成功率、付款延遲及履約積壓時間序列。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        },
+        {
+          "scope_component_id": "alerts",
+          "decomposition": "JUSTIFIED_LEAF",
+          "child_ids": [],
+          "leaf_reason": "告警服務的邊界是：查詢指標並將超時付款、缺貨與配送異常送交營運處理。。本比較版本將其視為可獨立驗收的最小責任單位，內部實作不再展開。"
+        }
+      ],
+      "reconciled": true
+    },
+    "reasoning": "ArchBro 固定參考樣本 v1。依版本化需求人工編寫責任邊界、分解與互動，不呼叫付費模型。箭頭表示標示動作的發起者到接收者；包含關係由階層表達。這是長期比較用的假想專案，不是正式业务系統或使用者專案的架構批准。"
+  }
+}

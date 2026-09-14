@@ -1,0 +1,543 @@
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+import unittest
+import uuid
+from urllib.parse import urlsplit, urlunsplit
+
+import psycopg
+from urllib.error import URLError
+from urllib.request import urlopen
+import webbrowser
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ART = ROOT / "qa" / "playwright_artifacts"
+SWEEP_REPORT = ART / "surface_sweep_report.json"
+UI_REPORT_DIR = ART / "ui-report"
+UI_REPORT_JSON = UI_REPORT_DIR / "report.json"
+UI_REPORT_HTML = UI_REPORT_DIR / "index.html"
+
+
+def _stage3_layout_fixture(size: int) -> dict:
+    nodes = []
+    edges = []
+    root_count = 4
+    for index in range(size):
+        node_id = f"node-{index:02d}"
+        parent_id = None if index < root_count else f"node-{index % root_count:02d}"
+        node = {
+            "id": node_id,
+            "semantic_kind": "SYSTEM" if parent_id is None else "SERVICE",
+            "semantic_type": "system" if parent_id is None else "service",
+        }
+        if parent_id is not None:
+            node["parent_id"] = parent_id
+        nodes.append(node)
+        if index:
+            edges.append(
+                {
+                    "id": f"edge-{index - 1:02d}-{index:02d}",
+                    "source": f"node-{index - 1:02d}",
+                    "target": node_id,
+                    "semantic_type": "DEPENDS_ON",
+                }
+            )
+    return {
+        "diagram_version": "archbro.diagram.v1",
+        "architecture_version": 1,
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def stage3_layout_probe(repeats: int = 5) -> dict:
+    """Record supported synthetic timing evidence without inventing a production SLO."""
+    from dataclasses import asdict
+
+    source_root = str(ROOT / "src")
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
+    from archbro.backend.core.diagram_layout import layout_canvas_diagram
+
+    results = {}
+    for size in (27, 40):
+        fixture = _stage3_layout_fixture(size)
+        samples_ms = []
+        rendered = None
+        for _ in range(repeats):
+            started = time.perf_counter()
+            rendered = layout_canvas_diagram(fixture)
+            samples_ms.append((time.perf_counter() - started) * 1000.0)
+        assert rendered is not None
+        encoded = json.dumps(asdict(rendered), sort_keys=True, separators=(",", ":"))
+        ordered = sorted(samples_ms)
+        results[str(size)] = {
+            "status": "PASS",
+            "fixture_nodes": size,
+            "repeats": repeats,
+            "median_ms": round(ordered[len(ordered) // 2], 3),
+            "max_ms": round(max(samples_ms), 3),
+            "payload_bytes": len(encoded.encode("utf-8")),
+            "asserted_slo": None,
+        }
+    return {
+        "status": "PASS",
+        "classification": "SYNTHETIC_LAYOUT_EVIDENCE",
+        "fixtures": results,
+        "production_slo_claimed": False,
+    }
+
+
+def _stage3_unavailable_reason(text: str) -> str | None:
+    lowered = text.lower()
+    markers = (
+        "no module named 'playwright'",
+        "executable doesn't exist",
+        "playwright install",
+        "browser executable",
+    )
+    return next((marker for marker in markers if marker in lowered), None)
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_for_health(process: subprocess.Popen[str], base_url: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    health_url = f"{base_url}healthz"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise RuntimeError(
+                f"Frontend acceptance server exited early with code {process.returncode}.\n"
+                f"{stdout[-2000:]}\n{stderr[-2000:]}"
+            )
+        try:
+            with urlopen(health_url, timeout=0.5) as response:
+                if response.status == 200:
+                    return
+        except (URLError, TimeoutError, ConnectionError):
+            pass
+        time.sleep(0.1)
+    raise TimeoutError(f"Frontend acceptance server did not become healthy: {health_url}")
+
+
+def issue_markup(issue: dict) -> str:
+    issue_type = html.escape(str(issue.get("type", "issue")))
+    message = html.escape(str(issue.get("message", "")))
+    details = {key: value for key, value in issue.items() if key not in {"type", "message"}}
+    detail_html = ""
+    if details:
+        detail_html = f"<pre>{html.escape(json.dumps(details, indent=2, ensure_ascii=False))}</pre>"
+    return f"<li><strong>{issue_type}</strong> — {message}{detail_html}</li>"
+
+
+def build_html(report: dict) -> str:
+    surfaces = report.get("surfaces", [])
+    failures = [surface for surface in surfaces if surface.get("status") == "FAIL"]
+    passes = [surface for surface in surfaces if surface.get("status") == "PASS"]
+    ordered = failures + passes
+    cards = []
+    for surface in ordered:
+        status = surface.get("status", "UNKNOWN")
+        name = html.escape(str(surface.get("name", "surface")))
+        viewport = surface.get("viewport", {})
+        viewport_text = f"{viewport.get('width', '?')}×{viewport.get('height', '?')}"
+        screenshot = html.escape(f"../{surface.get('screenshot', '')}")
+        issues = surface.get("issues", [])
+        issues_html = (
+            f"<ul class='issues'>{''.join(issue_markup(issue) for issue in issues)}</ul>"
+            if issues
+            else "<p class='clean'>No objective issues detected.</p>"
+        )
+        cards.append(
+            f"""
+            <article class="card {status.lower()}">
+              <header>
+                <div>
+                  <h2>{name}</h2>
+                  <p>{html.escape(viewport_text)}</p>
+                </div>
+                <span class="badge">{html.escape(status)}</span>
+              </header>
+              <a class="shot-link" href="{screenshot}" target="_blank" rel="noreferrer">
+                <img src="{screenshot}" alt="{name} screenshot" loading="lazy" />
+              </a>
+              {issues_html}
+            </article>
+            """
+        )
+
+    runtime = report.get("runtime", {})
+    runtime_issues = []
+    for message in runtime.get("console_errors", []):
+        runtime_issues.append({"type": "console-error", "message": message})
+    for message in runtime.get("page_errors", []):
+        runtime_issues.append({"type": "page-error", "message": message})
+    for item in runtime.get("http_errors", []):
+        runtime_issues.append(
+            {
+                "type": "http-error",
+                "message": f"{item.get('status')} {item.get('url')}",
+            }
+        )
+    fatal = report.get("fatal")
+    if fatal:
+        runtime_issues.append(
+            {
+                "type": "fatal",
+                "message": f"{fatal.get('type')}: {fatal.get('message')}",
+            }
+        )
+    runtime_markup = (
+        f"<ul class='issues'>{''.join(issue_markup(issue) for issue in runtime_issues)}</ul>"
+        if runtime_issues
+        else "<p class='clean'>Console, page, and HTTP error gates are clean.</p>"
+    )
+
+    result = html.escape(str(report.get("result", "UNKNOWN")))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ArchBro Core Frontend Surface Acceptance</title>
+<style>
+:root {{ color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background:#f6f7fb; color:#202124; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; }}
+main {{ width:min(1480px, calc(100% - 32px)); margin:0 auto; padding:32px 0 64px; }}
+.summary {{ display:flex; flex-wrap:wrap; gap:16px; align-items:center; justify-content:space-between; margin-bottom:24px; }}
+.summary h1 {{ margin:0 0 6px; font-size:30px; }}
+.summary p {{ margin:0; color:#667085; }}
+.result {{ padding:10px 14px; border-radius:999px; font-weight:800; background:#fff; border:1px solid #d9deea; }}
+.stats {{ display:flex; flex-wrap:wrap; gap:10px; margin:18px 0 26px; }}
+.stat {{ background:#fff; border:1px solid #e0e4ec; border-radius:12px; padding:10px 14px; }}
+.runtime {{ background:#fff; border:1px solid #e0e4ec; border-radius:16px; padding:18px; margin-bottom:22px; }}
+.runtime h2 {{ margin:0 0 10px; font-size:18px; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr)); gap:18px; }}
+.card {{ background:#fff; border:1px solid #e0e4ec; border-radius:16px; overflow:hidden; box-shadow:0 8px 28px rgba(21,27,38,.05); }}
+.card.fail {{ border-color:#e6a8a8; }}
+.card header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:16px 16px 12px; }}
+.card h2 {{ margin:0; font-size:17px; overflow-wrap:anywhere; }}
+.card header p {{ margin:5px 0 0; color:#667085; font-size:13px; }}
+.badge {{ font-size:12px; font-weight:850; border-radius:999px; padding:5px 9px; background:#eef2f6; }}
+.fail .badge {{ background:#fff0f0; color:#9f1d1d; }}
+.pass .badge {{ background:#ecf8f2; color:#176b45; }}
+.shot-link {{ display:block; background:#eef1f5; border-top:1px solid #edf0f5; border-bottom:1px solid #edf0f5; }}
+.shot-link img {{ width:100%; height:320px; object-fit:contain; display:block; background:#fff; }}
+.issues {{ margin:0; padding:14px 34px 18px; color:#7a2525; }}
+.issues li + li {{ margin-top:10px; }}
+.issues pre {{ overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:#f7f7f8; color:#353840; padding:9px; border-radius:8px; font-size:11px; }}
+.clean {{ margin:0; padding:14px 16px 18px; color:#357257; }}
+@media (max-width:640px) {{ main {{ width:min(100% - 20px,1480px); padding-top:20px; }} .shot-link img {{ height:240px; }} }}
+</style>
+</head>
+<body>
+<main>
+  <section class="summary">
+    <div>
+      <h1>ArchBro Core Frontend Surface Acceptance</h1>
+      <p>Core pages and important product states. This is intentionally not an exhaustive component catalogue.</p>
+    </div>
+    <div class="result">{result}</div>
+  </section>
+  <section class="stats">
+    <div class="stat"><strong>{len(surfaces)}</strong> surfaces</div>
+    <div class="stat"><strong>{len(failures)}</strong> failed</div>
+    <div class="stat"><strong>{len(passes)}</strong> passed</div>
+  </section>
+  <section class="runtime">
+    <h2>Runtime gates — {html.escape(str(runtime.get("status", "UNKNOWN")))}</h2>
+    {runtime_markup}
+  </section>
+  <section class="grid">
+    {''.join(cards)}
+  </section>
+</main>
+</body>
+</html>
+"""
+
+
+def generate_report(test_exit_code: int, stdout: str, stderr: str, hierarchy_drill: dict | None = None) -> dict:
+    if SWEEP_REPORT.exists():
+        sweep = json.loads(SWEEP_REPORT.read_text(encoding="utf-8"))
+    else:
+        sweep = {
+            "schema": "archbro.frontend_surface_sweep.v1",
+            "base_url": None,
+            "surfaces": [],
+            "runtime": {"status": "FAIL", "console_errors": [], "page_errors": [], "http_errors": []},
+            "fatal": {"type": "MissingReport", "message": "surface_sweep_report.json was not produced."},
+            "result": "FAIL",
+        }
+
+    combined = {
+        "schema": "archbro.frontend_acceptance_report.v1",
+        **sweep,
+        "test_exit_code": test_exit_code,
+        "runner_output": {
+            "stdout_tail": stdout[-4000:],
+            "stderr_tail": stderr[-4000:],
+        },
+        "legacy_hierarchy_drill": hierarchy_drill or {"status": "FAIL", "detail": "Hierarchy drill probe did not run."},
+        "hierarchy_drill_gate": "DIAGNOSTIC_ONLY_CANVAS_V2",
+    }
+    if test_exit_code != 0:
+        combined["result"] = "FAIL"
+
+    UI_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    UI_REPORT_JSON.write_text(json.dumps(combined, indent=2, ensure_ascii=False), encoding="utf-8")
+    UI_REPORT_HTML.write_text(build_html(combined), encoding="utf-8")
+    return combined
+
+
+def _redacted(dsn: str) -> str:
+    parts = urlsplit(dsn)
+    if not parts.password:
+        return dsn
+    netloc = parts.netloc.replace(f":{parts.password}@", ":***@")
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def _provision_schema() -> tuple[str, str]:
+    """Give this run its own PostgreSQL schema.
+
+    PostgreSQL is the only backend now, so acceptance needs a real database.
+    A private schema keeps the previous guarantee that this entry point cannot
+    disturb -- or be disturbed by -- whatever is already in the developer's
+    database, which is what the isolated-runtime contract was protecting.
+    """
+
+    base = (os.getenv("DATABASE_URL") or "postgresql://archbro:archbro@127.0.0.1:5432/archbro").strip()
+    schema = f"acceptance_{uuid.uuid4().hex}"
+    try:
+        with psycopg.connect(base, autocommit=True) as connection:
+            connection.execute(f'CREATE SCHEMA "{schema}"')
+    except Exception as exc:  # noqa: BLE001 - surfaced to the operator verbatim
+        raise SystemExit(
+            f"frontend acceptance needs PostgreSQL and could not reach "
+            f"{_redacted(base)}: {exc}\n"
+            f"Start one with:  docker compose up -d db\n"
+            f"Or point DATABASE_URL at an existing instance."
+        ) from exc
+    separator = "&" if "?" in base else "?"
+    return base, f"{base}{separator}options=-csearch_path%3D{schema}"
+
+
+def _drop_schema(base_dsn: str, run_dsn: str) -> None:
+    schema = run_dsn.rsplit("search_path%3D", 1)[-1]
+    try:
+        with psycopg.connect(base_dsn, autocommit=True) as connection:
+            connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    except Exception:  # noqa: BLE001 - cleanup must not mask the real result
+        pass
+
+
+def run(open_report: bool = False, stage3: bool = False) -> int:
+    ART.mkdir(parents=True, exist_ok=True)
+    SWEEP_REPORT.unlink(missing_ok=True)
+
+    port = free_port()
+    base_url = f"http://127.0.0.1:{port}/"
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    source_root = str(ROOT / "src")
+    env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env["ARCHBRO_PROVIDER"] = "fake"
+    env["ARCHBRO_AUTH_MODE"] = "local"
+    env["ARCHBRO_PERSISTENCE"] = "postgres"
+    try:
+        base_dsn, run_dsn = _provision_schema()
+    except SystemExit as exc:
+        if not stage3:
+            raise
+        UI_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        unavailable = {
+            "schema": "archbro.stage3_acceptance.v1",
+            "result": "UNAVAILABLE",
+            "reason": str(exc),
+            "hard_acceptance_passed": False,
+        }
+        UI_REPORT_JSON.write_text(json.dumps(unavailable, indent=2), encoding="utf-8")
+        print("STAGE3_ACCEPTANCE UNAVAILABLE", json.dumps({"reason": str(exc)}))
+        return 2
+    env["DATABASE_URL"] = run_dsn
+
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "archbro.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
+        ],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    test_exit_code = 1
+    test_stdout = ""
+    test_stderr = ""
+    hierarchy_drill: dict = {"status": "FAIL", "detail": "Hierarchy drill probe did not run."}
+    try:
+        wait_for_health(server, base_url)
+        test_env = env.copy()
+        test_env["ARCHBRO_BASE_URL"] = base_url
+        test_env["ARCHBRO_FINAL_FIX_CASES"] = "autonomous_surface_sweep,architecture_inspector_disclosure,architecture_canvas_interactions,canvas_committed_navigation,keyboard_and_mobile_layers,task_architecture_navigation"
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "qa" / "playwright_final_fix.py")],
+            cwd=ROOT,
+            env=test_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        test_exit_code = completed.returncode
+        test_stdout = completed.stdout
+        test_stderr = completed.stderr
+
+        drill_env = env.copy()
+        drill_env["ARCHBRO_BASE_URL"] = base_url
+        drill = subprocess.run(
+            [sys.executable, str(ROOT / "qa" / "probe_browser_hierarchy_drill.py")],
+            cwd=ROOT,
+            env=drill_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        test_stdout += f"\n\nHIERARCHY_DRILL_STDOUT\n{drill.stdout}"
+        test_stderr += f"\n\nHIERARCHY_DRILL_STDERR\n{drill.stderr}"
+        if drill.returncode == 0:
+            try:
+                hierarchy_drill = {"status": "PASS", **json.loads(drill.stdout)}
+            except json.JSONDecodeError as exc:
+                hierarchy_drill = {"status": "FAIL", "detail": f"Invalid hierarchy drill JSON: {exc}", "stdout": drill.stdout[-2000:]}
+        else:
+            hierarchy_drill = {
+                "status": "FAIL",
+                "detail": "Real browser hierarchy drill failed.",
+                "stdout_tail": drill.stdout[-2000:],
+                "stderr_tail": drill.stderr[-2000:],
+            }
+    except Exception as exc:
+        test_stderr = f"{type(exc).__name__}: {exc}"
+    finally:
+        server.terminate()
+        try:
+            server.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.communicate()
+        _drop_schema(base_dsn, run_dsn)
+
+    report = generate_report(test_exit_code, test_stdout, test_stderr, hierarchy_drill)
+    if stage3:
+        unavailable_reason = _stage3_unavailable_reason(test_stdout + "\n" + test_stderr)
+        if unavailable_reason:
+            report["result"] = "UNAVAILABLE"
+            report["stage3"] = {
+                "status": "UNAVAILABLE",
+                "reason": unavailable_reason,
+                "hard_acceptance_passed": False,
+            }
+        else:
+            try:
+                report["stage3"] = {
+                    "status": "PASS" if report.get("result") == "PASS" else "FAIL",
+                    "canvas_case": "architecture_canvas_interactions",
+                    "layout_probe": stage3_layout_probe(),
+                    "hard_acceptance_passed": report.get("result") == "PASS",
+                }
+            except Exception as exc:  # noqa: BLE001 - evidence is surfaced verbatim
+                report["stage3"] = {
+                    "status": "FAIL",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "hard_acceptance_passed": False,
+                }
+                report["result"] = "FAIL"
+        UI_REPORT_JSON.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    failures = [surface for surface in report.get("surfaces", []) if surface.get("status") == "FAIL"]
+    print(
+        "FRONTEND_ACCEPTANCE",
+        report.get("result"),
+        json.dumps(
+            {
+                "surfaces": len(report.get("surfaces", [])),
+                "failed": len(failures),
+                "runtime": report.get("runtime", {}).get("status"),
+            }
+        ),
+    )
+    print(f"HUMAN_REPORT {UI_REPORT_HTML}")
+    print(f"MACHINE_REPORT {UI_REPORT_JSON}")
+
+    if open_report:
+        webbrowser.open(UI_REPORT_HTML.resolve().as_uri())
+
+    if report.get("result") == "UNAVAILABLE":
+        return 2
+    return 0 if report.get("result") == "PASS" else 1
+
+
+class FrontendAcceptanceTest(unittest.TestCase):
+    """Threaden-safe deterministic test entry point for frontend acceptance."""
+
+    def test_frontend_acceptance(self) -> None:
+        self.assertEqual(run(open_report=False), 0)
+
+    def test_stage3_layout_probe_contract(self) -> None:
+        report = stage3_layout_probe(repeats=2)
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["classification"], "SYNTHETIC_LAYOUT_EVIDENCE")
+        self.assertFalse(report["production_slo_claimed"])
+        self.assertEqual(set(report["fixtures"]), {"27", "40"})
+        for size, evidence in report["fixtures"].items():
+            self.assertEqual(evidence["status"], "PASS")
+            self.assertEqual(evidence["fixture_nodes"], int(size))
+            self.assertGreater(evidence["payload_bytes"], 0)
+            self.assertIsNone(evidence["asserted_slo"])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run ArchBro autonomous frontend acceptance.")
+    parser.add_argument("--open", action="store_true", help="Open the generated HTML report in the default browser.")
+    parser.add_argument(
+        "--stage3",
+        action="store_true",
+        help="Run the Stage 3 Canvas coordinator and 27/40 synthetic layout evidence probe.",
+    )
+    args = parser.parse_args()
+    return run(open_report=args.open, stage3=args.stage3)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

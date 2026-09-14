@@ -1,0 +1,269 @@
+# Infrastructure
+
+What runs where, why it is set up this way, and how to rebuild it. Nothing here
+is a secret: provider tokens that are still required live in `.env` files on the
+VM (mode 600, root-owned) and in Cloudflare, never in this repository. The
+production Gemini target is Vertex AI through the VM's Application Default
+Credentials instead of a stored API key.
+
+## Overview
+
+```
+                     ┌─ production host ───── tunnel: archbro-main ─┐
+Cloudflare ──────────┤                                              ├── GCE VM "magicdala"
+                     ├─ development host                            │
+                     │    └─ Access (email allowlist) ─ archbro-dev  │
+                     └─ second development host                     │
+                          └─ Access (email allowlist) ─ archbro-dev2 ┘
+
+VM inbound: 80 closed · 443 closed · 22 open (deploys only)
+```
+
+Both environments are reached only through Cloudflare Tunnels. The VM publishes
+no HTTP port and carries no `http-server` tag, so nothing on the public internet
+can open a connection to the application except through Cloudflare.
+
+## Google Cloud — project `magic-dala`
+
+| Resource | Identifier | Purpose |
+| --- | --- | --- |
+| Compute instance | `magicdala`, zone `us-central1-a`, e2-medium | Runs every stack |
+| Artifact Registry | project deployment-image repository | Deployment images |
+| Workload Identity Pool | `github`, provider `github` | Lets GitHub Actions authenticate without a stored key |
+| Service account | deployment service account | The identity Actions assumes |
+| Runtime service account | attached to `magicdala` | ADC identity for Vertex AI and Firebase verification |
+
+**Deployer roles**, one per thing it actually does:
+
+- `artifactregistry.writer` — push images
+- `compute.osAdminLogin` — SSH to the VM to run the deploy
+- `iam.serviceAccountUser` — required to SSH to a VM that has a service account
+
+**Runtime role**:
+
+- `roles/aiplatform.user` — lets the VM's attached service account call Gemini
+  through Vertex AI without an API key or downloaded credential file
+
+The project must have `aiplatform.googleapis.com` enabled. Do not set
+`GOOGLE_APPLICATION_CREDENTIALS` on the VM; the container reaches the GCE
+metadata server and receives short-lived credentials for the attached identity.
+
+**The OIDC provider is restricted** to `assertion.repository_owner == 'Magic-Dala'`,
+and the service account can only be impersonated by `Magic-Dala/archbro`. Another
+repository presenting a GitHub token cannot use it.
+
+**The instance has `enable-oslogin=TRUE`.** Without it `gcloud compute ssh` falls
+back to instance metadata SSH keys, which requires `compute.instances.setMetadata`
+— far broader than `compute.osAdminLogin`. This cost a deploy cycle to discover.
+
+**Registry cleanup policy**: keep the last 10 versions, delete untagged after a
+day, delete anything after 30 days. Without it the registry grows past the free
+tier. The Dockerfile installs dependencies before copying source, so a deploy
+pushes roughly 600KB rather than 155MB.
+
+### Layout on the VM
+
+```
+/opt/archbro/                  # root-only, mode 750, because the .env files hold secrets
+├── main/          .env  docker-compose.yml
+├── dev/           .env  docker-compose.yml
+├── dev2/          .env  docker-compose.yml
+├── cloudflared-main/  .env(TUNNEL_TOKEN)  docker-compose.yml
+├── cloudflared-dev/   .env(TUNNEL_TOKEN)  docker-compose.yml
+└── cloudflared-dev2/  .env(TUNNEL_TOKEN)  docker-compose.yml
+```
+
+`.env` files are placed **by hand** and are never written by the deploy workflow.
+`archbro-main`, `archbro-dev` and `archbro-dev2` all fail closed unless they
+have the complete production/Firebase contract (`ARCHBRO_ENV=production`,
+`ARCHBRO_AUTH_MODE=firebase`, a Firebase project id,
+`ARCHBRO_FIREBASE_API_KEY`, and `ARCHBRO_FIREBASE_AUTH_DOMAIN`). The development
+stack is externally reachable too, so it cannot use the deterministic
+`local-demo` principal without collapsing provider OAuth sessions across users.
+Mixed or incomplete configurations are rejected before the app container is
+recreated.
+
+Every deployed stack should use the same keyless Gemini transport:
+
+```env
+GOOGLE_GENAI_USE_VERTEXAI=true
+GOOGLE_CLOUD_PROJECT=magic-dala
+GOOGLE_CLOUD_LOCATION=global
+GEMINI_API_KEY=
+GOOGLE_API_KEY=
+GEMINI_MODEL=gemini-3.8-flash
+```
+
+The shared Google Gen AI client factory applies this identity to both the
+Strands Agent and the hierarchical architecture planner. API-key mode remains
+available for local Developer API or custom-gateway testing, but is not the
+production credential path.
+Merging the source migration alone does not switch a running stack: activate it
+only after the runtime service account has the Vertex role and that stack's
+hand-managed `.env` contains the Vertex settings above.
+
+Each deployed stack should also pin the planner reliability policy in its
+hand-managed `.env` so the release fingerprint and operator intent agree:
+
+```env
+GEMINI_SYSTEM_MAP_THINKING_LEVEL=low
+GEMINI_SCOPE_THINKING_LEVEL=low
+GEMINI_RECONCILE_THINKING_LEVEL=medium
+GEMINI_ARCHITECTURE_MAX_OUTPUT_TOKENS=65536
+GEMINI_SYSTEM_MAP_MAX_OUTPUT_TOKENS=4096
+GEMINI_SCOPE_MAX_OUTPUT_TOKENS=8192
+GEMINI_RECONCILE_MAX_OUTPUT_TOKENS=16384
+GEMINI_ARCHITECTURE_RETRY_ATTEMPTS=5
+GEMINI_RETRY_INITIAL_DELAY_SECONDS=1
+GEMINI_RETRY_MAX_DELAY_SECONDS=8
+GEMINI_RETRY_EXP_BASE=2
+GEMINI_RETRY_JITTER=1
+GEMINI_ARCHITECTURE_MAX_CONCURRENCY=1
+GEMINI_ARCHITECTURE_QUEUE_TIMEOUT_SECONDS=120
+```
+
+Archbro performs the only same-model retry loop for explicit `408`, `429`, and
+`5xx` responses. The Google SDK remains at one attempt because it also retries
+transport timeouts/connect failures whose upstream outcome may be ambiguous.
+Archbro owns model fallback, admission, and durable phase checkpoints. Explicit
+provider rejection is recorded as `PROVIDER_REJECTED`
+(`RETRYABLE` for transient status codes); a transport timeout with no provable
+response remains `UNKNOWN` and cannot be replayed automatically. Validated
+phases are resumed independently, including compatible phases imported from an
+older planner contract, so a failed reconciliation does not regenerate the
+system map or scope expansions.
+
+The phase output values above are starting budgets, not hard truncation limits.
+When Vertex returns the explicit `MAX_TOKENS` finish reason, Archbro records the
+response as `TRUNCATED_RESPONSE`, refuses to parse its partial JSON, and retries
+only that phase with a doubled budget up to the 65,536-token hard ceiling. If the
+request deadline ends first, the larger budget is persisted for the next retry.
+
+Planner v6 prevents a release or generation-policy change from bypassing the
+paid-call fence. Checkpoints persist a semantic hash of the confirmed Project
+Brief, and a prior `UNKNOWN` outcome for the same logical phase blocks dispatch
+under a new plan id until a person explicitly authorizes another attempt. A
+complete reconciliation that parses successfully but fails deterministic graph
+validation is recorded as `REPAIR_REQUIRED`, not `UNKNOWN`. Archbro may issue one
+bounded `RECONCILE_REPAIR:1` call without regenerating SYSTEM_MAP or EXPAND_SCOPE;
+a second repair requires explicit paid-call authorization.
+
+Per-user GitHub MCP remains an optional, request-scoped evidence source for the
+built-in Agent. Initial Architecture generation never performs MCP discovery.
+Post-bootstrap discovery occurs only when the human message explicitly requests
+repository evidence; token-aware intent matching prevents ordinary terms such as
+`report` from being mistaken for `repo`. GitHub provider schemas are forwarded
+flat even when the Strands dynamic-tool adapter supplies an implementation-only
+`arguments` envelope, and required provider fields are validated before dispatch.
+
+First-party provider OAuth transient state is process-local. Deployed provider
+OAuth therefore runs as a single application worker. The runtime guard checks
+`WEB_CONCURRENCY`, `UVICORN_WORKERS`, Uvicorn `--workers N`, and `--workers=N`
+and fails closed when any configured worker count exceeds one.
+
+The `connectors` service reads the repositories named in
+`ARCHBRO_GITHUB_CONNECTORS_JSON` and delivers what changed to the Agent. It
+watches **operator-configured repositories only** — it is not driven by the
+per-user GitHub OAuth connection in the app, and people cannot point it at their
+own repositories. With the variable unset, which is the default, every pass is a
+no-op. It serves nothing, so it stays off the tunnel network even though it
+holds the repository credential.
+
+Each environment is a separate Compose project (`archbro-main`, `archbro-dev`,
+`archbro-dev2`), so containers, networks, and database volumes never overlap. The stacks join a
+shared external network, `archbro-edge`, which is how the tunnel connectors
+reach them without anything being published on the host.
+
+## Cloudflare routing
+
+| Resource | Identifier |
+| --- | --- |
+| Tunnel (main) | `archbro-main` |
+| Tunnel (dev) | `archbro-dev` |
+| Tunnel (dev2) | `archbro-dev2` |
+| Access application | `ArchBro dev`, `ArchBro dev2` |
+| Access policy | team email allowlist |
+| Login method | One-time PIN |
+
+A dev environment's Access application is what stands between its host and the
+open internet, so it is created **before** that environment's connector is
+started for the first time. A connector running ahead of its Access application
+serves the host to anyone who knows the name.
+
+Each environment uses a proxied CNAME that targets its Cloudflare Tunnel. Proxying is
+required: Access only applies to traffic that passes through Cloudflare.
+
+Routing lives in Cloudflare rather than a local config file — the tunnels were
+created with `config_src=cloudflare` — so it is changed through the API or the
+dashboard, not by editing a file on the VM.
+
+**Two tunnels rather than one**, so a connector failure in dev cannot take
+production down with it.
+
+### The bypass that has to stay closed
+
+Cloudflare only guards the path through Cloudflare. While a reverse proxy on the
+VM still exposed the development application directly, a direct-origin health check
+returned 200 and walked straight past Access.
+
+The fix was removing that route and closing 80/443 entirely. **Any future
+change that publishes a port on the VM reopens this hole.** Adding Access in
+front of a service is only half the job; the direct path has to disappear.
+
+## Deployment
+
+`main`, `dev` and `dev2` deploy on a push to the matching branch. Anything else
+is refused by the workflow.
+
+Two files decide different halves of that: `deploy.yml` maps a branch to a stack
+name, and `deploy-stack.sh` decides which stack names it serves. A branch added
+to one and not the other builds an image, pushes it, and only then refuses, on
+the VM, after the registry write -- so `tests/test_deploy_runtime_contract.py`
+holds the two in step.
+
+1. Authenticate to Google via Workload Identity Federation — no stored key
+2. Build for `linux/amd64` (pinned: the VM is x86_64) and push two tags
+3. Upload the compose file and `deploy-stack.sh` **to the home directory**
+4. SSH in and run the script, with a short-lived registry token on stdin
+5. Verify `/healthz` from inside `archbro-edge`
+
+Uploads go to the home directory rather than `/tmp` because `/tmp` has the
+sticky bit: a file left there by one OS Login account cannot be replaced by
+another, and the deploy account differs from any human's.
+
+The registry token is piped over stdin so it never appears in the VM's process
+list, and the script logs out afterwards. The VM's own service account scopes
+cannot reach Artifact Registry, which is why the token is handed over per
+deploy rather than held on the machine.
+
+## Rebuilding from nothing
+
+1. Create the GCE instance; set `enable-oslogin=TRUE`; install Docker and the
+   Compose plugin; `docker network create archbro-edge`; enable
+   `aiplatform.googleapis.com`; grant the attached runtime service account
+   `roles/aiplatform.user`
+2. Create the Artifact Registry repository and apply the cleanup policy
+3. Create the Workload Identity Pool and OIDC provider, restricted to the
+   repository owner; create the deployer service account with the three roles
+   above; bind `workloadIdentityUser` to `attribute.repository/Magic-Dala/archbro`
+4. Create one tunnel per environment with `config_src=cloudflare`; route each
+   hostname to the stack app's internal port `8080`; run a connector on
+   the VM with the tunnel token in its `.env`
+5. Point each hostname at its tunnel with a proxied CNAME
+6. For dev: create the Access application and policy, and enable One-time PIN
+7. Place `.env` in `/opt/archbro/main`, `/opt/archbro/dev`, and
+   `/opt/archbro/dev2` by hand
+8. Push to `main`, `dev`, or `dev2`
+
+## Firebase
+
+Token verification works on this VM with no service-account key. The container
+reaches the GCE metadata server, and verifying an ID token needs only Google's
+public certificates — not any IAM permission on the Firebase project. Measured
+on this instance, with the instance's default scopes.
+
+This is worth recording because the opposite is true off Google Cloud: in a
+container with no metadata server, `firebase_admin` raises
+`DefaultCredentialsError` on verification even though `initialize_app` succeeds.
+If deployment ever leaves GCE, token verification has to be reworked to fetch
+Google's JWKS directly.

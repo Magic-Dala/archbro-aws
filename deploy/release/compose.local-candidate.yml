@@ -1,0 +1,47 @@
+# Reuse existing local services. No database, credentials or image is created.
+services:
+  app:
+    image: ${ARCHBRO_IMAGE_REFERENCE:?set the inspected image reference pinned with @sha256}
+    pull_policy: never
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "127.0.0.1:${ARCHBRO_CANDIDATE_PORT:-8014}:8080"
+    volumes:
+      - type: volume
+        source: runtime-config
+        target: /run/archbro-config
+        read_only: true
+      - type: bind
+        source: ${ARCHBRO_ADC_FILE:?set the existing service ADC file path}
+        target: /run/google-adc/application_default_credentials.json
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      ARCHBRO_IMAGE_REFERENCE: ${ARCHBRO_IMAGE_REFERENCE:?required}
+      ARCHBRO_IMAGE_ID: ${ARCHBRO_IMAGE_ID:?set the observed Docker image ID}
+      ARCHBRO_IMAGE_MANIFEST_DIGEST: ${ARCHBRO_IMAGE_MANIFEST_DIGEST:?set the observed manifest digest}
+      ARCHBRO_ACCEPTANCE_TARGET_ORIGIN: ${ARCHBRO_ACCEPTANCE_TARGET_ORIGIN:?set the frozen acceptance origin}
+      ARCHBRO_DB_HOST: ${ARCHBRO_DB_HOST:-host.docker.internal}
+      ARCHBRO_DB_PORT: ${ARCHBRO_DB_PORT:-55432}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/google-adc/application_default_credentials.json
+      PORT: "8080"
+    command: ["python", "-B", "/app/deploy/release/local_entrypoint.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/internal/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  runtime-config:
+    external: true
+    name: ${ARCHBRO_CONFIG_VOLUME:-archbro-jim-config}

@@ -1,0 +1,43 @@
+{
+  "scope": "OFFLINE_CANVAS_READABILITY",
+  "base_head": "3b1ce7bc67397cfdb05a7eef29be132ecb5400ec",
+  "branch": "feat/canvas-readability-20260906",
+  "layout_version": "archbro.canvas-layout.v2",
+  "python": {
+    "passed": 36,
+    "failed": 0,
+    "files": [
+      "tests/test_diagram_layout.py",
+      "tests/test_canvas_api_unit.py",
+      "tests/test_canvas_readability.py"
+    ]
+  },
+  "node": {
+    "passed": 4,
+    "failed": 0
+  },
+  "provider": "NOT_RUN",
+  "real_auth": "NOT_RUN",
+  "deployment": "NOT_RUN",
+  "source_file_sha256": {
+    "src/archbro/backend/core/canvas_routing.py": "440a39c5e1ffd6787080b550160c333099013ff8a1cb53ee6dab8a3c2b996286",
+    "src/archbro/backend/core/canvas_reading.py": "83f30322fc296485b56a2f8a5c771b8bf0a20481fb0df15769c2db52d740eff8",
+    "src/archbro/backend/core/diagram_layout.py": "c8adaebf5e7b8311f9ea2dd23cd6cb5f3725bee293d83d16a154ebe05b85c955",
+    "src/archbro/backend/api/routes.py": "b98d34a462677acc971afbd12bfa220705a23b10bd42b392c8c5d38e5e4aba01",
+    "frontend/web/app.js": "687ef833c7b8a5fe7ad526e4c8558ab3f1b772f56a04972e3b92e6c66f1f0506",
+    "frontend/web/styles.css": "9676890933507eee3b3f66effc0166b70290234451136a8b69dd01fac06a7d86",
+    "frontend/web/index.html": "84ce6e955213cfb4706a9caf6beb3cdd507d9f1f0f0453e3790d5100610a4794",
+    "tests/test_canvas_readability.py": "b471c2904769a4636381a08f21e0587f0cad8a6249bf580bf38849c4a303d1eb",
+    "qa/canvas_readability_fixtures.py": "6873f38a041342acac4da41dec4f65f165b9d4c097464fb3aabfef664c783b3e",
+    "qa/canvas_readability_views.py": "ba60e7dc26edc40049a13d1ec51ecf282e9682db694a644e4efb6d7e73738f2d",
+    "docs/canvas-readability/CANVAS_RULEBOOK.md": "83fa98969da059655d1b6f56e5b986eab5f20cbc828c2fdbd240207aa223d246",
+    "docs/canvas-readability/DESIGN_DECISIONS.md": "8634d18eca01b05f257b368a8f9c247fb1989986de9b6f9e841684197d1b8613",
+    "docs/canvas-readability/REFERENCE_SYNTHESIS.md": "ab9bd07c48c1e4936b09efc6ff2bb4e7209cd8023a28feec2a3e659cf3201d30",
+    "qa/test_architecture_canvas.mjs": "76506b4d2807342c77793474027a375e97b21ab1cfe7ee5d90d79858dd63a7ef",
+    "tests/test_canvas_api_unit.py": "4aca20d576a0f02cbf6c9f2a301ed531feda0ddee07cdb2f4242e4a92fd090b6"
+  },
+  "prior_node_failure": {
+    "reason": "Stale pre-existing assertion required architecture-canvas-v2 string absent at base HEAD too. Replaced with actual asset SHA-256 checks.",
+    "focused_rerun": "PASS"
+  }
+}
